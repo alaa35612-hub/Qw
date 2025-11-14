@@ -42,6 +42,21 @@ LOOP_DELAY_SECONDS: float = 60.0
 TELEGRAM_TOKEN: str = ""
 TELEGRAM_CHAT_ID: str = ""
 TELEGRAM_REQUEST_TIMEOUT: int = 10
+ENABLE_ALERTS: bool = True
+ALERT_TOGGLES: Dict[str, bool] = {
+    "BuysideLiquidity": True,
+    "SellsideLiquidity": True,
+    "BuysideLiquidityTouch": True,
+    "SellsideLiquidityTouch": True,
+    "Bullish OB": True,
+    "Bearish OB": True,
+    "Bullish Break": True,
+    "Bearish Break": True,
+    "Bullish Break Confirmed": True,
+    "Bearish Break Confirmed": True,
+    "BullishOBTouch": True,
+    "BearishOBTouch": True,
+}
 
 ANSI_RESET = "\033[0m"
 EVENT_COLOR_MAP = {
@@ -208,10 +223,19 @@ def send_telegram_alert(message: str) -> None:
             _telegram_warning_logged = True
 
 
-def emit_alert(event_label: str, message: str) -> None:
+def alert_enabled(event_label: str) -> bool:
+    if not ENABLE_ALERTS:
+        return False
+    return ALERT_TOGGLES.get(event_label, True)
+
+
+def emit_alert(event_label: str, message: str) -> bool:
+    if not alert_enabled(event_label):
+        return False
     console_message = _colorize(message, event_label)
     print(console_message)
     send_telegram_alert(message)
+    return True
 
 
 def prune_history_for_symbol(
@@ -296,25 +320,37 @@ class SwingState:
     ) -> Tuple[SwingPoint, SwingPoint, int]:
         prev_os = self.os
         length = self.length
-        if length <= 0:
+        if (
+            length <= 0
+            or index < length
+            or index >= len(highs)
+            or index >= len(lows)
+        ):
             return self.top, self.bottom, prev_os
 
         reference_index = index - length
-        if reference_index < 0 or index >= len(highs) or index >= len(lows):
+        if reference_index < 0:
             return self.top, self.bottom, prev_os
 
         window_start = reference_index + 1
         window_end = index + 1
-        if window_start < 0:
-            window_start = 0
 
-        window_highs = highs[window_start:window_end]
-        window_lows = lows[window_start:window_end]
-        if not window_highs or not window_lows:
+        next_highs = [
+            value
+            for value in highs[window_start:window_end]
+            if not math.isnan(value)
+        ]
+        next_lows = [
+            value
+            for value in lows[window_start:window_end]
+            if not math.isnan(value)
+        ]
+
+        if not next_highs or not next_lows:
             return self.top, self.bottom, prev_os
 
-        upper = max(window_highs)
-        lower = min(window_lows)
+        upper = max(next_highs)
+        lower = min(next_lows)
 
         ref_high = highs[reference_index]
         ref_low = lows[reference_index]
@@ -445,7 +481,9 @@ def detect_liquidity_zones(
     for index, bar in enumerate(bars):
         atr_val = atr_values[index]
         span = atr_val / a_value if atr_val is not None else None
-        per = (last_index - index) <= present_window
+        per = True
+        if present_window is not None and present_window >= 0:
+            per = (last_index - index) <= present_window
 
         # Pivot highs --------------------------------------------------------
         ph_value, ph_index = pivot_high(highs, index, pivot_left, pivot_right)
@@ -490,7 +528,9 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
-                        box.line_end_index = index - 1
+                        if box.line_active:
+                            box.line_end_index = index - 1
+                        box.reference_price = start_price
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -561,7 +601,9 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
-                        box.line_end_index = index - 1
+                        if box.line_active:
+                            box.line_end_index = index - 1
+                        box.reference_price = start_price
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -593,8 +635,10 @@ def detect_liquidity_zones(
         for box in buyside_boxes:
             if box.broken:
                 continue
-            box.right_index = index + 3
-            box.line_end_index = index + 3
+            extension_index = index + 3
+            box.right_index = extension_index
+            if box.line_active:
+                box.line_end_index = extension_index
             if not box.broken_top and bar.close > box.price_top:
                 box.broken_top = True
             if not box.broken_bottom and bar.close > box.price_bottom:
@@ -612,8 +656,10 @@ def detect_liquidity_zones(
         for box in sellside_boxes:
             if box.broken:
                 continue
-            box.right_index = index + 3
-            box.line_end_index = index + 3
+            extension_index = index + 3
+            box.right_index = extension_index
+            if box.line_active:
+                box.line_end_index = extension_index
             if not box.broken_top and bar.close < box.price_top:
                 box.broken_top = True
             if not box.broken_bottom and bar.close < box.price_bottom:
@@ -667,7 +713,9 @@ def detect_order_blocks(
 
     for index, bar in enumerate(bars):
         top_swing, bottom_swing, _ = swing_state.update(highs, lows, closes, index)
-        per = (total_bars - 1 - index) <= present_window
+        per = True
+        if present_window is not None and present_window >= 0:
+            per = (total_bars - 1 - index) <= present_window
 
         if not (show_ob and per):
             continue
@@ -1019,6 +1067,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 continue
             box = event.box
             event_label = "BuysideLiquidity" if box.side == "buyside" else "SellsideLiquidity"
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event.event_type, box.start_index)
             if not should_emit(
                 LIQUIDITY_CREATION_ALERTS,
@@ -1033,13 +1083,15 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"PRICE_RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for box, touch_price in liquidity_touches:
             event_label = (
                 "BuysideLiquidityTouch" if box.side == "buyside" else "SellsideLiquidityTouch"
             )
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, box.start_index)
             if not should_emit(
                 LIQUIDITY_TOUCH_ALERTS,
@@ -1054,8 +1106,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for event in ob_events:
             if event.index != latest_index:
@@ -1079,6 +1131,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 history = ORDERBLOCK_CONFIRM_ALERTS
             else:
                 continue
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, block.origin_index, block.created_index)
             if not should_emit(
                 history,
@@ -1094,12 +1148,14 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"PRICE_RANGE={price_range}, EVENT_PRICE={price_value:.6f}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for event in ob_touch_events:
             block = event.block
             event_label = "BullishOBTouch" if block.side == "bullish" else "BearishOBTouch"
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, block.origin_index, block.created_index)
             if not should_emit(
                 ORDERBLOCK_TOUCH_ALERTS,
@@ -1115,8 +1171,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         if not alerts_emitted:
             print(f"[INFO] SYMBOL={symbol} produced no alerts on the latest bar.")
