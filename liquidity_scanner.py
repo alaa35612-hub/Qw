@@ -223,9 +223,10 @@ class SwingState:
 # Helper calculations
 # ---------------------------------------------------------------------------
 def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Optional[float]]:
-    """Compute the Average True Range using a simple moving average, as in Pine."""
+    """Replicate Pine Script's ``ta.atr`` (RMA based) calculation."""
+
     atr_values: List[Optional[float]] = [None] * len(bars)
-    tr_window: List[float] = []
+    prev_atr: Optional[float] = None
 
     for i, bar in enumerate(bars):
         if i == 0:
@@ -237,11 +238,15 @@ def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Opti
                 abs(bar.high - prev_close),
                 abs(bar.low - prev_close),
             )
-        tr_window.append(true_range)
-        if len(tr_window) > period:
-            del tr_window[0]
-        if len(tr_window) == period:
-            atr_values[i] = sum(tr_window) / period
+
+        if prev_atr is None:
+            prev_atr = true_range
+        else:
+            prev_atr = ((period - 1) * prev_atr + true_range) / period
+
+        if i >= period - 1:
+            atr_values[i] = prev_atr
+
     return atr_values
 
 
@@ -305,6 +310,7 @@ def detect_liquidity_zones(
     atr_period: int = ATR_PERIOD,
     pivot_left: int = PIVOT_LEFT,
     pivot_right: int = PIVOT_RIGHT,
+    present_window: int = PRESENT_LOOKBACK_BARS,
 ) -> Tuple[List[LiquidityBox], List[LiquidityBox]]:
     """Replicate the Pine Script liquidity box creation and maintenance logic."""
     if not bars:
@@ -320,9 +326,12 @@ def detect_liquidity_zones(
     highs = [bar.high for bar in bars]
     lows = [bar.low for bar in bars]
 
+    last_index = len(bars) - 1
+
     for index, bar in enumerate(bars):
         atr_val = atr_values[index]
         span = atr_val / a_value if atr_val is not None else None
+        per = (last_index - index) <= present_window
 
         # Pivot highs --------------------------------------------------------
         ph_value, ph_index = pivot_high(highs, index, pivot_left, pivot_right)
@@ -334,7 +343,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == 1 and pivot_price > zigzag.get_price(0):
                 zigzag.update_latest(ph_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -367,6 +376,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -396,7 +406,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == -1 and pivot_price < zigzag.get_price(0):
                 zigzag.update_latest(pl_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -429,6 +439,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -806,6 +817,7 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
             atr_period=ATR_PERIOD,
             pivot_left=PIVOT_LEFT,
             pivot_right=PIVOT_RIGHT,
+            present_window=PRESENT_LOOKBACK_BARS,
         )
         bullish_obs, bearish_obs, ob_events = detect_order_blocks(
             bars,
