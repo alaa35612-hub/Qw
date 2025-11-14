@@ -1,16 +1,26 @@
-"""ICT Concepts [LuxAlgo] strategy backtester.
+"""ICT Concepts [LuxAlgo] strategy backtester and live market scanner.
 
 This module ports the liquidity and order block logic from the TradingView
-"ICT Concepts [LuxAlgo]" indicator to Python and layers a rules-based
-strategy with risk management and backtesting utilities on top of the
-indicator state.
+"ICT Concepts [LuxAlgo]" indicator to Python, layers a rules-based strategy
+with risk management and backtesting utilities on top of the indicator state,
+and provides a Binance USDT-M futures scanner that highlights symbols printing
+new trade opportunities in real time.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:  # pragma: no cover - optional dependency when running backtests only
+    import ccxt  # type: ignore
+except ImportError as _err:  # pragma: no cover - allow importing module without ccxt
+    ccxt = None
+    _CCXT_IMPORT_ERROR: Optional[Exception] = _err
+else:  # pragma: no cover - ccxt import succeeded
+    _CCXT_IMPORT_ERROR = None
 
 # ---------------------------------------------------------------------------
 # Core data structures
@@ -178,6 +188,20 @@ class StrategyConfig:
     max_trades_per_day: int = 3
     max_daily_loss_pct: float = 0.02
     warmup_bars: int = 200
+
+
+@dataclass
+class ScannerConfig:
+    """Configuration for the live market scanner."""
+
+    strategy: StrategyConfig = field(default_factory=StrategyConfig)
+    timeframe: str = "15m"
+    limit: int = 1000
+    run_continuously: bool = True
+    loop_delay_seconds: float = 60.0
+    max_symbols: Optional[int] = None
+    symbols: Optional[Sequence[str]] = None
+    verbose: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -732,6 +756,10 @@ class Signal:
     time: int
     side: str  # "long" or "short"
     reason: str
+    order_block: Optional[OrderBlock] = None
+    entry_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
 
 def _find_nearest_zone_price(
@@ -751,6 +779,49 @@ def _find_nearest_zone_price(
             if candidate_price is None or zone_mid > candidate_price:
                 candidate_price = zone_mid
     return candidate_price
+
+
+def _compute_trade_levels(
+    side: str,
+    block: OrderBlock,
+    bar_close: float,
+    liquidity_snapshot: Optional[LiquiditySnapshot],
+    config: StrategyConfig,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Derive stop-loss and take-profit targets for a given setup."""
+
+    if side == "long":
+        stop_loss = block.price_bottom
+        if stop_loss >= bar_close:
+            return None, None
+        nearest_zone = None
+        if liquidity_snapshot is not None:
+            nearest_zone = _find_nearest_zone_price(
+                liquidity_snapshot.buyside,
+                bar_close,
+                "long",
+            )
+        if nearest_zone is not None and nearest_zone > bar_close:
+            take_profit = nearest_zone
+        else:
+            take_profit = bar_close + (bar_close - stop_loss) * config.reward_risk
+        return stop_loss, take_profit
+
+    stop_loss = block.price_top
+    if stop_loss <= bar_close:
+        return None, None
+    nearest_zone = None
+    if liquidity_snapshot is not None:
+        nearest_zone = _find_nearest_zone_price(
+            liquidity_snapshot.sellside,
+            bar_close,
+            "short",
+        )
+    if nearest_zone is not None and nearest_zone < bar_close:
+        take_profit = nearest_zone
+    else:
+        take_profit = bar_close - (stop_loss - bar_close) * config.reward_risk
+    return stop_loss, take_profit
 
 
 def _has_liquidity_sweep(
@@ -802,13 +873,51 @@ def generate_signals(
             block = bullish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
             if block.price_bottom <= bar.close <= block.price_top and bar.close >= block_mid:
-                signals.append(Signal(index=index, time=bar.time, side="long", reason="bullish_ob_retest"))
+                stop_loss, take_profit = _compute_trade_levels(
+                    "long",
+                    block,
+                    bar.close,
+                    liq_snapshot,
+                    config,
+                )
+                if stop_loss is not None and take_profit is not None:
+                    signals.append(
+                        Signal(
+                            index=index,
+                            time=bar.time,
+                            side="long",
+                            reason="bullish_ob_retest",
+                            order_block=block.clone(),
+                            entry_price=bar.close,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                        )
+                    )
 
         if bearish_blocks and _has_liquidity_sweep(index, bars, liquidity_history, "short", config.sweep_lookback):
             block = bearish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
             if block.price_bottom <= bar.close <= block.price_top and bar.close <= block_mid:
-                signals.append(Signal(index=index, time=bar.time, side="short", reason="bearish_ob_retest"))
+                stop_loss, take_profit = _compute_trade_levels(
+                    "short",
+                    block,
+                    bar.close,
+                    liq_snapshot,
+                    config,
+                )
+                if stop_loss is not None and take_profit is not None:
+                    signals.append(
+                        Signal(
+                            index=index,
+                            time=bar.time,
+                            side="short",
+                            reason="bearish_ob_retest",
+                            order_block=block.clone(),
+                            entry_price=bar.close,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                        )
+                    )
 
     return signals
 
@@ -910,15 +1019,14 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
             block = bullish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
             if block.price_bottom <= bar.close <= block.price_top and bar.close >= block_mid:
-                stop_loss = block.price_bottom
-                nearest_zone = _find_nearest_zone_price(liq_snapshot.buyside, bar.close, "long")
-                if nearest_zone is not None:
-                    take_profit = nearest_zone
-                    if take_profit <= bar.close:
-                        take_profit = bar.close + (bar.close - stop_loss) * config.reward_risk
-                else:
-                    take_profit = bar.close + (bar.close - stop_loss) * config.reward_risk
-                if stop_loss < bar.close:
+                stop_loss, take_profit = _compute_trade_levels(
+                    "long",
+                    block,
+                    bar.close,
+                    liq_snapshot,
+                    config,
+                )
+                if stop_loss is not None and take_profit is not None:
                     position_size = risk_amount / (bar.close - stop_loss)
                     trade = Trade(
                         entry_index=index,
@@ -939,15 +1047,14 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
             block = bearish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
             if block.price_bottom <= bar.close <= block.price_top and bar.close <= block_mid:
-                stop_loss = block.price_top
-                nearest_zone = _find_nearest_zone_price(liq_snapshot.sellside, bar.close, "short")
-                if nearest_zone is not None:
-                    take_profit = nearest_zone
-                    if take_profit >= bar.close:
-                        take_profit = bar.close - (stop_loss - bar.close) * config.reward_risk
-                else:
-                    take_profit = bar.close - (stop_loss - bar.close) * config.reward_risk
-                if stop_loss > bar.close:
+                stop_loss, take_profit = _compute_trade_levels(
+                    "short",
+                    block,
+                    bar.close,
+                    liq_snapshot,
+                    config,
+                )
+                if stop_loss is not None and take_profit is not None:
                     position_size = risk_amount / (stop_loss - bar.close)
                     trade = Trade(
                         entry_index=index,
@@ -976,6 +1083,177 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
     return trades
 
 
+def _ensure_ccxt_available() -> None:
+    """Raise an informative error if ccxt is required but missing."""
+
+    if ccxt is None:
+        raise ImportError(
+            "ccxt is required for live scanning. Install it via 'pip install ccxt'"
+        ) from _CCXT_IMPORT_ERROR
+
+
+def _build_exchange() -> "ccxt.Exchange":
+    _ensure_ccxt_available()
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})  # type: ignore[attr-defined]
+    exchange.load_markets()
+    return exchange
+
+
+def _convert_ohlcv(raw: Sequence[Sequence[float]]) -> List[OHLCVBar]:
+    return [
+        OHLCVBar(
+            time=int(item[0]),
+            open=float(item[1]),
+            high=float(item[2]),
+            low=float(item[3]),
+            close=float(item[4]),
+            volume=float(item[5]),
+        )
+        for item in raw
+    ]
+
+
+def fetch_ohlcv(
+    exchange: "ccxt.Exchange",
+    symbol: str,
+    timeframe: str,
+    limit: int,
+) -> List[OHLCVBar]:
+    """Fetch OHLCV data via ccxt and convert it to ``OHLCVBar`` records."""
+
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return _convert_ohlcv(raw)
+
+
+def _select_symbol_universe(
+    exchange: "ccxt.Exchange",
+    configured: Optional[Sequence[str]],
+    max_symbols: Optional[int],
+) -> List[str]:
+    if configured is not None:
+        return list(configured)
+    symbols: List[str] = []
+    for symbol, market in exchange.markets.items():
+        if market.get("quote") != "USDT":
+            continue
+        if market.get("info", {}).get("contractType") != "PERPETUAL":
+            continue
+        if market.get("darkpool", False):
+            continue
+        symbols.append(symbol)
+    symbols.sort()
+    if max_symbols is not None:
+        return symbols[:max_symbols]
+    return symbols
+
+
+def scan_symbols(
+    exchange: "ccxt.Exchange",
+    scanner_config: ScannerConfig,
+) -> Dict[str, List[Signal]]:
+    """Scan the Binance USDT-M futures universe for fresh trade setups."""
+
+    strategy_config = scanner_config.strategy
+    matches: Dict[str, List[Signal]] = {}
+    symbols = _select_symbol_universe(
+        exchange,
+        scanner_config.symbols,
+        scanner_config.max_symbols,
+    )
+
+    if scanner_config.verbose:
+        print(
+            f"[INFO] Scanning {len(symbols)} symbols on timeframe {scanner_config.timeframe}"
+        )
+
+    for symbol in symbols:
+        if scanner_config.verbose:
+            print(f"[SCAN] Fetching OHLCV for {symbol}...")
+        try:
+            bars = fetch_ohlcv(
+                exchange,
+                symbol,
+                timeframe=scanner_config.timeframe,
+                limit=scanner_config.limit,
+            )
+        except Exception as exc:  # pragma: no cover - network errors
+            print(f"[WARN] Failed to fetch OHLCV for {symbol}: {exc}")
+            rate_limit = getattr(exchange, "rateLimit", 0) or 0
+            if rate_limit:
+                time.sleep(rate_limit / 1000.0)
+            continue
+
+        if len(bars) <= strategy_config.warmup_bars:
+            if scanner_config.verbose:
+                print(
+                    f"[SKIP] SYMBOL={symbol} has insufficient history for warmup ({len(bars)} bars)."
+                )
+            rate_limit = getattr(exchange, "rateLimit", 0) or 0
+            if rate_limit:
+                time.sleep(rate_limit / 1000.0)
+            continue
+
+        liquidity_result = detect_liquidity_zones(bars, strategy_config)
+        order_block_result = detect_order_blocks(bars, strategy_config)
+        signals = generate_signals(bars, liquidity_result, order_block_result, strategy_config)
+        latest_index = len(bars) - 1
+        latest_signals = [signal for signal in signals if signal.index == latest_index]
+
+        if latest_signals:
+            matches[symbol] = latest_signals
+            latest_bar = bars[-1]
+            timestamp = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.gmtime(latest_bar.time / 1000),
+            )
+            for signal in latest_signals:
+                block = signal.order_block
+                block_range = (
+                    f"[{block.price_bottom:.6f}, {block.price_top:.6f}]"
+                    if block is not None
+                    else "[n/a]"
+                )
+                print(
+                    "[MATCH] SYMBOL={symbol} SIDE={side} ENTRY={entry:.6f} SL={sl:.6f} "
+                    "TP={tp:.6f} BLOCK={block_range} TIME={time_str}".format(
+                        symbol=symbol,
+                        side=signal.side.upper(),
+                        entry=(signal.entry_price or latest_bar.close),
+                        sl=(signal.stop_loss or latest_bar.close),
+                        tp=(signal.take_profit or latest_bar.close),
+                        block_range=block_range,
+                        time_str=timestamp,
+                    )
+                )
+        rate_limit = getattr(exchange, "rateLimit", 0) or 0
+        if rate_limit:
+            time.sleep(rate_limit / 1000.0)
+
+    if not matches:
+        print("[INFO] No qualifying setups detected on the latest bar.")
+
+    return matches
+
+
+def run_scanner(scanner_config: Optional[ScannerConfig] = None) -> None:
+    """Entry point that continuously scans Binance USDT-M futures via ccxt."""
+
+    config = scanner_config or ScannerConfig()
+    exchange = _build_exchange()
+
+    try:
+        while True:
+            scan_symbols(exchange, config)
+            if not config.run_continuously:
+                break
+            if config.verbose:
+                print(
+                    f"[INFO] Sleeping for {config.loop_delay_seconds:.1f} seconds before next scan."
+                )
+            time.sleep(max(0.0, config.loop_delay_seconds))
+    except KeyboardInterrupt:  # pragma: no cover - manual interruption
+        print("[INFO] Scanner interrupted by user. Exiting cleanly.")
+
 __all__ = [
     "OHLCVBar",
     "LiquidityZone",
@@ -988,9 +1266,17 @@ __all__ = [
     "OrderBlockSnapshot",
     "Trade",
     "StrategyConfig",
+    "ScannerConfig",
     "Signal",
     "detect_liquidity_zones",
     "detect_order_blocks",
     "generate_signals",
     "run_backtest",
+    "fetch_ohlcv",
+    "scan_symbols",
+    "run_scanner",
 ]
+
+
+if __name__ == "__main__":
+    run_scanner()
