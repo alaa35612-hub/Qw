@@ -296,25 +296,37 @@ class SwingState:
     ) -> Tuple[SwingPoint, SwingPoint, int]:
         prev_os = self.os
         length = self.length
-        if length <= 0:
+        if (
+            length <= 0
+            or index < length
+            or index >= len(highs)
+            or index >= len(lows)
+        ):
             return self.top, self.bottom, prev_os
 
         reference_index = index - length
-        if reference_index < 0 or index >= len(highs) or index >= len(lows):
+        if reference_index < 0:
             return self.top, self.bottom, prev_os
 
         window_start = reference_index + 1
         window_end = index + 1
-        if window_start < 0:
-            window_start = 0
 
-        window_highs = highs[window_start:window_end]
-        window_lows = lows[window_start:window_end]
-        if not window_highs or not window_lows:
+        next_highs = [
+            value
+            for value in highs[window_start:window_end]
+            if not math.isnan(value)
+        ]
+        next_lows = [
+            value
+            for value in lows[window_start:window_end]
+            if not math.isnan(value)
+        ]
+
+        if not next_highs or not next_lows:
             return self.top, self.bottom, prev_os
 
-        upper = max(window_highs)
-        lower = min(window_lows)
+        upper = max(next_highs)
+        lower = min(next_lows)
 
         ref_high = highs[reference_index]
         ref_low = lows[reference_index]
@@ -445,7 +457,9 @@ def detect_liquidity_zones(
     for index, bar in enumerate(bars):
         atr_val = atr_values[index]
         span = atr_val / a_value if atr_val is not None else None
-        per = (last_index - index) <= present_window
+        per = True
+        if present_window is not None and present_window >= 0:
+            per = (last_index - index) <= present_window
 
         # Pivot highs --------------------------------------------------------
         ph_value, ph_index = pivot_high(highs, index, pivot_left, pivot_right)
@@ -490,7 +504,9 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
-                        box.line_end_index = index - 1
+                        if box.line_active:
+                            box.line_end_index = index - 1
+                        box.reference_price = start_price
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -561,7 +577,9 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
-                        box.line_end_index = index - 1
+                        if box.line_active:
+                            box.line_end_index = index - 1
+                        box.reference_price = start_price
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -593,8 +611,10 @@ def detect_liquidity_zones(
         for box in buyside_boxes:
             if box.broken:
                 continue
-            box.right_index = index + 3
-            box.line_end_index = index + 3
+            extension_index = index + 3
+            box.right_index = extension_index
+            if box.line_active:
+                box.line_end_index = extension_index
             if not box.broken_top and bar.close > box.price_top:
                 box.broken_top = True
             if not box.broken_bottom and bar.close > box.price_bottom:
@@ -612,8 +632,10 @@ def detect_liquidity_zones(
         for box in sellside_boxes:
             if box.broken:
                 continue
-            box.right_index = index + 3
-            box.line_end_index = index + 3
+            extension_index = index + 3
+            box.right_index = extension_index
+            if box.line_active:
+                box.line_end_index = extension_index
             if not box.broken_top and bar.close < box.price_top:
                 box.broken_top = True
             if not box.broken_bottom and bar.close < box.price_bottom:
@@ -667,7 +689,9 @@ def detect_order_blocks(
 
     for index, bar in enumerate(bars):
         top_swing, bottom_swing, _ = swing_state.update(highs, lows, closes, index)
-        per = (total_bars - 1 - index) <= present_window
+        per = True
+        if present_window is not None and present_window >= 0:
+            per = (total_bars - 1 - index) <= present_window
 
         if not (show_ob and per):
             continue
