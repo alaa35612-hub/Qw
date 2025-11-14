@@ -194,27 +194,34 @@ class SwingState:
         index: int,
     ) -> Tuple[SwingPoint, SwingPoint, int]:
         start = max(0, index - self.length + 1)
-        window_closes = closes[start : index + 1]
-        if not window_closes:
+        window_highs = highs[start : index + 1]
+        window_lows = lows[start : index + 1]
+        if not window_highs or not window_lows:
             return self.top, self.bottom, self.os
 
-        upper = max(window_closes)
-        lower = min(window_closes)
+        upper = max(window_highs)
+        lower = min(window_lows)
         prev_os = self.os
 
         reference_index = index - self.length
-        if reference_index >= 0:
-            ref_high = highs[reference_index]
-            ref_low = lows[reference_index]
-            if ref_high > upper:
-                self.os = 0
-            elif ref_low < lower:
-                self.os = 1
+        if reference_index < 0:
+            return self.top, self.bottom, prev_os
 
-            if self.os == 0 and prev_os != 0:
-                self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
-            if self.os == 1 and prev_os != 1:
-                self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
+        ref_high = highs[reference_index]
+        ref_low = lows[reference_index]
+
+        new_os = self.os
+        if ref_high > upper:
+            new_os = 0
+        elif ref_low < lower:
+            new_os = 1
+
+        self.os = new_os
+
+        if self.os == 0 and prev_os != 0 and not math.isnan(ref_high):
+            self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
+        if self.os == 1 and prev_os != 1 and not math.isnan(ref_low):
+            self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
 
         return self.top, self.bottom, prev_os
 
@@ -472,9 +479,11 @@ def detect_liquidity_zones(
             if box.broken_bottom and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
         for box in sellside_boxes:
@@ -489,9 +498,11 @@ def detect_liquidity_zones(
             if box.broken_top and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
     return buyside_boxes, sellside_boxes
