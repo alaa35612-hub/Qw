@@ -194,27 +194,34 @@ class SwingState:
         index: int,
     ) -> Tuple[SwingPoint, SwingPoint, int]:
         start = max(0, index - self.length + 1)
-        window_closes = closes[start : index + 1]
-        if not window_closes:
+        window_highs = highs[start : index + 1]
+        window_lows = lows[start : index + 1]
+        if not window_highs or not window_lows:
             return self.top, self.bottom, self.os
 
-        upper = max(window_closes)
-        lower = min(window_closes)
+        upper = max(window_highs)
+        lower = min(window_lows)
         prev_os = self.os
 
         reference_index = index - self.length
-        if reference_index >= 0:
-            ref_high = highs[reference_index]
-            ref_low = lows[reference_index]
-            if ref_high > upper:
-                self.os = 0
-            elif ref_low < lower:
-                self.os = 1
+        if reference_index < 0:
+            return self.top, self.bottom, prev_os
 
-            if self.os == 0 and prev_os != 0:
-                self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
-            if self.os == 1 and prev_os != 1:
-                self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
+        ref_high = highs[reference_index]
+        ref_low = lows[reference_index]
+
+        new_os = self.os
+        if ref_high > upper:
+            new_os = 0
+        elif ref_low < lower:
+            new_os = 1
+
+        self.os = new_os
+
+        if self.os == 0 and prev_os != 0 and not math.isnan(ref_high):
+            self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
+        if self.os == 1 and prev_os != 1 and not math.isnan(ref_low):
+            self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
 
         return self.top, self.bottom, prev_os
 
@@ -223,9 +230,10 @@ class SwingState:
 # Helper calculations
 # ---------------------------------------------------------------------------
 def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Optional[float]]:
-    """Compute the Average True Range using a simple moving average, as in Pine."""
+    """Replicate Pine Script's ``ta.atr`` (RMA based) calculation."""
+
     atr_values: List[Optional[float]] = [None] * len(bars)
-    tr_window: List[float] = []
+    prev_atr: Optional[float] = None
 
     for i, bar in enumerate(bars):
         if i == 0:
@@ -237,11 +245,15 @@ def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Opti
                 abs(bar.high - prev_close),
                 abs(bar.low - prev_close),
             )
-        tr_window.append(true_range)
-        if len(tr_window) > period:
-            del tr_window[0]
-        if len(tr_window) == period:
-            atr_values[i] = sum(tr_window) / period
+
+        if prev_atr is None:
+            prev_atr = true_range
+        else:
+            prev_atr = ((period - 1) * prev_atr + true_range) / period
+
+        if i >= period - 1:
+            atr_values[i] = prev_atr
+
     return atr_values
 
 
@@ -305,6 +317,7 @@ def detect_liquidity_zones(
     atr_period: int = ATR_PERIOD,
     pivot_left: int = PIVOT_LEFT,
     pivot_right: int = PIVOT_RIGHT,
+    present_window: int = PRESENT_LOOKBACK_BARS,
 ) -> Tuple[List[LiquidityBox], List[LiquidityBox]]:
     """Replicate the Pine Script liquidity box creation and maintenance logic."""
     if not bars:
@@ -320,9 +333,12 @@ def detect_liquidity_zones(
     highs = [bar.high for bar in bars]
     lows = [bar.low for bar in bars]
 
+    last_index = len(bars) - 1
+
     for index, bar in enumerate(bars):
         atr_val = atr_values[index]
         span = atr_val / a_value if atr_val is not None else None
+        per = (last_index - index) <= present_window
 
         # Pivot highs --------------------------------------------------------
         ph_value, ph_index = pivot_high(highs, index, pivot_left, pivot_right)
@@ -334,7 +350,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == 1 and pivot_price > zigzag.get_price(0):
                 zigzag.update_latest(ph_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -367,6 +383,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -396,7 +413,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == -1 and pivot_price < zigzag.get_price(0):
                 zigzag.update_latest(pl_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -429,6 +446,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -461,9 +479,11 @@ def detect_liquidity_zones(
             if box.broken_bottom and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
         for box in sellside_boxes:
@@ -478,9 +498,11 @@ def detect_liquidity_zones(
             if box.broken_top and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
     return buyside_boxes, sellside_boxes
@@ -806,6 +828,7 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
             atr_period=ATR_PERIOD,
             pivot_left=PIVOT_LEFT,
             pivot_right=PIVOT_RIGHT,
+            present_window=PRESENT_LOOKBACK_BARS,
         )
         bullish_obs, bearish_obs, ob_events = detect_order_blocks(
             bars,
@@ -888,11 +911,16 @@ def run_scanner() -> None:
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     exchange.load_markets()
     markets = exchange.markets
-    symbols = [
-        symbol
-        for symbol, info in markets.items()
-        if info.get("quote") == "USDT" and info.get("contractType") == "PERPETUAL" and not info.get("darkpool", False)
-    ]
+    symbols = []
+    for symbol, market in markets.items():
+        if market.get("quote") != "USDT":
+            continue
+        contract_type = market.get("info", {}).get("contractType")
+        if contract_type != "PERPETUAL":
+            continue
+        if market.get("darkpool", False):
+            continue
+        symbols.append(symbol)
 
     if not symbols:
         print("[WARN] No Binance USDT-M futures symbols found to scan.")
