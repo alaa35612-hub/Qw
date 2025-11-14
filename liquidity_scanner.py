@@ -10,9 +10,13 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import ccxt
+try:
+    import requests
+except Exception:  # pragma: no cover - optional dependency for Telegram alerts
+    requests = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -35,6 +39,23 @@ USE_BODY_FOR_OB: bool = True
 PRESENT_LOOKBACK_BARS: int = 500
 RUN_CONTINUOUSLY: bool = False
 LOOP_DELAY_SECONDS: float = 60.0
+TELEGRAM_TOKEN: str = ""
+TELEGRAM_CHAT_ID: str = ""
+TELEGRAM_REQUEST_TIMEOUT: int = 10
+
+ANSI_RESET = "\033[0m"
+EVENT_COLOR_MAP = {
+    "BuysideLiquidity": "\033[96m",
+    "SellsideLiquidity": "\033[94m",
+    "BuysideLiquidityTouch": "\033[36m",
+    "SellsideLiquidityTouch": "\033[34m",
+    "Bullish OB": "\033[32m",
+    "Bearish OB": "\033[31m",
+    "Bullish Break": "\033[92m",
+    "Bearish Break": "\033[95m",
+    "BullishOBTouch": "\033[32m",
+    "BearishOBTouch": "\033[31m",
+}
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -89,6 +110,14 @@ class LiquidityBox:
 
 
 @dataclass
+class LiquidityEvent:
+    event_type: str
+    box: LiquidityBox
+    index: int
+    time: int
+
+
+@dataclass
 class SwingPoint:
     price: float = math.nan
     index: int = -1
@@ -133,6 +162,69 @@ class OrderBlockEvent:
     index: int
     time: int
     price: Optional[float] = None
+
+
+LIQUIDITY_CREATION_ALERTS: Dict[Tuple[str, str, int], int] = {}
+LIQUIDITY_TOUCH_ALERTS: Dict[Tuple[str, str, int], int] = {}
+ORDERBLOCK_CREATION_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
+ORDERBLOCK_BREAK_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
+ORDERBLOCK_TOUCH_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
+_telegram_warning_logged = False
+
+
+def _colorize(message: str, event_label: str) -> str:
+    color = EVENT_COLOR_MAP.get(event_label)
+    if not color:
+        return message
+    return f"{color}{message}{ANSI_RESET}"
+
+
+def send_telegram_alert(message: str) -> None:
+    global _telegram_warning_logged
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    if requests is None:
+        if not _telegram_warning_logged:
+            print("[WARN] requests library not available; Telegram alerts disabled.")
+            _telegram_warning_logged = True
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        response = requests.post(url, data=payload, timeout=TELEGRAM_REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except Exception as exc:  # pragma: no cover - best-effort notification
+        if not _telegram_warning_logged:
+            print(f"[WARN] Failed to send Telegram alert: {exc}")
+            _telegram_warning_logged = True
+
+
+def emit_alert(event_label: str, message: str) -> None:
+    console_message = _colorize(message, event_label)
+    print(console_message)
+    send_telegram_alert(message)
+
+
+def prune_history_for_symbol(
+    history: Dict[Tuple, int], symbol: str, latest_index: int, max_age: int
+) -> None:
+    stale_keys = [
+        key for key, idx in history.items() if key[0] == symbol and latest_index - idx > max_age
+    ]
+    for key in stale_keys:
+        del history[key]
+
+
+def should_emit(
+    history: Dict[Tuple, int], key: Tuple, event_index: int, latest_index: int, max_age: int
+) -> bool:
+    if latest_index - event_index > max_age:
+        return False
+    previous = history.get(key)
+    if previous is not None and previous == event_index:
+        return False
+    history[key] = event_index
+    return True
 
 
 class ZigZagState:
@@ -323,15 +415,16 @@ def detect_liquidity_zones(
     pivot_left: int = PIVOT_LEFT,
     pivot_right: int = PIVOT_RIGHT,
     present_window: int = PRESENT_LOOKBACK_BARS,
-) -> Tuple[List[LiquidityBox], List[LiquidityBox]]:
+) -> Tuple[List[LiquidityBox], List[LiquidityBox], List[LiquidityEvent]]:
     """Replicate the Pine Script liquidity box creation and maintenance logic."""
     if not bars:
-        return [], []
+        return [], [], []
 
     zigzag = ZigZagState(max_size=MAX_ZIGZAG_SIZE)
     atr_values = compute_atr(bars, period=atr_period)
     buyside_boxes: List[LiquidityBox] = []
     sellside_boxes: List[LiquidityBox] = []
+    liquidity_events: List[LiquidityEvent] = []
 
     a_value = 10.0 / margin
 
@@ -405,6 +498,14 @@ def detect_liquidity_zones(
                             last_updated_index=index,
                         )
                         buyside_boxes.insert(0, new_box)
+                        liquidity_events.append(
+                            LiquidityEvent(
+                                event_type="buyside_creation",
+                                box=new_box,
+                                index=index,
+                                time=bar.time,
+                            )
+                        )
                         if len(buyside_boxes) > max_visible:
                             buyside_boxes.pop()
 
@@ -468,6 +569,14 @@ def detect_liquidity_zones(
                             last_updated_index=index,
                         )
                         sellside_boxes.insert(0, new_box)
+                        liquidity_events.append(
+                            LiquidityEvent(
+                                event_type="sellside_creation",
+                                box=new_box,
+                                index=index,
+                                time=bar.time,
+                            )
+                        )
                         if len(sellside_boxes) > max_visible:
                             sellside_boxes.pop()
 
@@ -510,7 +619,7 @@ def detect_liquidity_zones(
                 box.line_end_index = index
             box.last_updated_index = index
 
-    return buyside_boxes, sellside_boxes
+    return buyside_boxes, sellside_boxes, liquidity_events
 
 
 def detect_order_blocks(
@@ -817,7 +926,7 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
             print(f"[WARN] SYMBOL={symbol} returned no candles; skipping.")
             continue
 
-        buyside, sellside = detect_liquidity_zones(
+        buyside, sellside, liquidity_events = detect_liquidity_zones(
             bars,
             margin=MARGIN,
             max_visible=VIS_LIQ,
@@ -855,45 +964,114 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(last_time / 1000))
         alerts_emitted = False
 
-        for box, touch_price in liquidity_touches:
-            side_label = "Buyside" if box.side == "buyside" else "Sellside"
+        prune_history_for_symbol(
+            LIQUIDITY_CREATION_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
+        prune_history_for_symbol(
+            LIQUIDITY_TOUCH_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
+        prune_history_for_symbol(
+            ORDERBLOCK_CREATION_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
+        prune_history_for_symbol(
+            ORDERBLOCK_BREAK_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
+        prune_history_for_symbol(
+            ORDERBLOCK_TOUCH_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
+
+        for event in liquidity_events:
+            if event.index != latest_index:
+                continue
+            box = event.box
+            event_label = "BuysideLiquidity" if box.side == "buyside" else "SellsideLiquidity"
+            history_key = (symbol, event.event_type, box.start_index)
+            if not should_emit(
+                LIQUIDITY_CREATION_ALERTS,
+                history_key,
+                event.index,
+                latest_index,
+                MAX_ALERT_AGE_BARS,
+            ):
+                continue
             price_range = f"[{box.price_bottom:.6f}, {box.price_top:.6f}]"
-            print(
-                f"[ALERT] SYMBOL={symbol}, EVENT=LiquidityTouch, SIDE={side_label}, TF={TIMEFRAME}, "
+            message = (
+                f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
+                f"PRICE_RANGE={price_range}, BAR_TIME={timestamp}"
+            )
+            emit_alert(event_label, message)
+            alerts_emitted = True
+
+        for box, touch_price in liquidity_touches:
+            event_label = (
+                "BuysideLiquidityTouch" if box.side == "buyside" else "SellsideLiquidityTouch"
+            )
+            history_key = (symbol, event_label, box.start_index)
+            if not should_emit(
+                LIQUIDITY_TOUCH_ALERTS,
+                history_key,
+                latest_index,
+                latest_index,
+                MAX_ALERT_AGE_BARS,
+            ):
+                continue
+            price_range = f"[{box.price_bottom:.6f}, {box.price_top:.6f}]"
+            message = (
+                f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
+            emit_alert(event_label, message)
             alerts_emitted = True
 
         for event in ob_events:
             if event.index != latest_index:
                 continue
             block = event.block
-            price_range = f"[{block.price_bottom:.6f}, {block.price_top:.6f}]"
-            side_label = "Bullish" if block.side == "bullish" else "Bearish"
             if event.event_type in {"bullish_creation", "bearish_creation"}:
-                event_name = "OrderBlockCreated"
-            elif event.event_type == "bullish_break":
-                event_name = "BullishBreak"
-            elif event.event_type == "bearish_break":
-                event_name = "BearishBreak"
+                event_label = "Bullish OB" if block.side == "bullish" else "Bearish OB"
+                history = ORDERBLOCK_CREATION_ALERTS
+            elif event.event_type in {"bullish_break", "bearish_break"}:
+                event_label = "Bullish Break" if block.side == "bullish" else "Bearish Break"
+                history = ORDERBLOCK_BREAK_ALERTS
             else:
-                event_name = event.event_type
+                continue
+            history_key = (symbol, event_label, block.origin_index, block.created_index)
+            if not should_emit(
+                history,
+                history_key,
+                event.index,
+                latest_index,
+                MAX_ALERT_AGE_BARS,
+            ):
+                continue
+            price_range = f"[{block.price_bottom:.6f}, {block.price_top:.6f}]"
             price_value = event.price if event.price is not None else bars[latest_index].close
-            print(
-                f"[ALERT] SYMBOL={symbol}, EVENT={event_name}, SIDE={side_label}, TF={TIMEFRAME}, "
+            message = (
+                f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"PRICE_RANGE={price_range}, EVENT_PRICE={price_value:.6f}, BAR_TIME={timestamp}"
             )
+            emit_alert(event_label, message)
             alerts_emitted = True
 
         for event in ob_touch_events:
             block = event.block
+            event_label = "BullishOBTouch" if block.side == "bullish" else "BearishOBTouch"
+            history_key = (symbol, event_label, block.origin_index, block.created_index)
+            if not should_emit(
+                ORDERBLOCK_TOUCH_ALERTS,
+                history_key,
+                event.index,
+                latest_index,
+                MAX_ALERT_AGE_BARS,
+            ):
+                continue
             price_range = f"[{block.price_bottom:.6f}, {block.price_top:.6f}]"
-            side_label = "Bullish" if block.side == "bullish" else "Bearish"
             touch_price = event.price if event.price is not None else bars[latest_index].close
-            print(
-                f"[ALERT] SYMBOL={symbol}, EVENT=OrderBlockTouch, SIDE={side_label}, TF={TIMEFRAME}, "
+            message = (
+                f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
+            emit_alert(event_label, message)
             alerts_emitted = True
 
         if not alerts_emitted:
