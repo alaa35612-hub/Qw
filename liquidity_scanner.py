@@ -193,28 +193,40 @@ class SwingState:
         closes: Sequence[float],
         index: int,
     ) -> Tuple[SwingPoint, SwingPoint, int]:
-        start = max(0, index - self.length + 1)
-        window_closes = closes[start : index + 1]
-        if not window_closes:
-            return self.top, self.bottom, self.os
-
-        upper = max(window_closes)
-        lower = min(window_closes)
         prev_os = self.os
+        length = self.length
+        if length <= 0:
+            return self.top, self.bottom, prev_os
 
-        reference_index = index - self.length
-        if reference_index >= 0:
-            ref_high = highs[reference_index]
-            ref_low = lows[reference_index]
-            if ref_high > upper:
-                self.os = 0
-            elif ref_low < lower:
-                self.os = 1
+        reference_index = index - length
+        if reference_index < 0 or index >= len(highs) or index >= len(lows):
+            return self.top, self.bottom, prev_os
 
-            if self.os == 0 and prev_os != 0:
-                self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
-            if self.os == 1 and prev_os != 1:
-                self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
+        window_start = reference_index + 1
+        window_end = index + 1
+        if window_start < 0:
+            window_start = 0
+
+        window_highs = highs[window_start:window_end]
+        window_lows = lows[window_start:window_end]
+        if not window_highs or not window_lows:
+            return self.top, self.bottom, prev_os
+
+        upper = max(window_highs)
+        lower = min(window_lows)
+
+        ref_high = highs[reference_index]
+        ref_low = lows[reference_index]
+
+        if not math.isnan(ref_high) and ref_high > upper:
+            self.os = 0
+        elif not math.isnan(ref_low) and ref_low < lower:
+            self.os = 1
+
+        if self.os == 0 and prev_os != 0 and not math.isnan(ref_high):
+            self.top = SwingPoint(price=ref_high, index=reference_index, crossed=False)
+        if self.os == 1 and prev_os != 1 and not math.isnan(ref_low):
+            self.bottom = SwingPoint(price=ref_low, index=reference_index, crossed=False)
 
         return self.top, self.bottom, prev_os
 
@@ -223,9 +235,10 @@ class SwingState:
 # Helper calculations
 # ---------------------------------------------------------------------------
 def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Optional[float]]:
-    """Compute the Average True Range using a simple moving average, as in Pine."""
+    """Replicate Pine Script's ``ta.atr`` (RMA based) calculation."""
+
     atr_values: List[Optional[float]] = [None] * len(bars)
-    tr_window: List[float] = []
+    prev_atr: Optional[float] = None
 
     for i, bar in enumerate(bars):
         if i == 0:
@@ -237,11 +250,15 @@ def compute_atr(bars: Sequence[OHLCVBar], period: int = ATR_PERIOD) -> List[Opti
                 abs(bar.high - prev_close),
                 abs(bar.low - prev_close),
             )
-        tr_window.append(true_range)
-        if len(tr_window) > period:
-            del tr_window[0]
-        if len(tr_window) == period:
-            atr_values[i] = sum(tr_window) / period
+
+        if prev_atr is None:
+            prev_atr = true_range
+        else:
+            prev_atr = ((period - 1) * prev_atr + true_range) / period
+
+        if i >= period - 1:
+            atr_values[i] = prev_atr
+
     return atr_values
 
 
@@ -305,6 +322,7 @@ def detect_liquidity_zones(
     atr_period: int = ATR_PERIOD,
     pivot_left: int = PIVOT_LEFT,
     pivot_right: int = PIVOT_RIGHT,
+    present_window: int = PRESENT_LOOKBACK_BARS,
 ) -> Tuple[List[LiquidityBox], List[LiquidityBox]]:
     """Replicate the Pine Script liquidity box creation and maintenance logic."""
     if not bars:
@@ -320,9 +338,12 @@ def detect_liquidity_zones(
     highs = [bar.high for bar in bars]
     lows = [bar.low for bar in bars]
 
+    last_index = len(bars) - 1
+
     for index, bar in enumerate(bars):
         atr_val = atr_values[index]
         span = atr_val / a_value if atr_val is not None else None
+        per = (last_index - index) <= present_window
 
         # Pivot highs --------------------------------------------------------
         ph_value, ph_index = pivot_high(highs, index, pivot_left, pivot_right)
@@ -334,7 +355,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == 1 and pivot_price > zigzag.get_price(0):
                 zigzag.update_latest(ph_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -367,6 +388,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -396,7 +418,7 @@ def detect_liquidity_zones(
             elif zigzag_direction == -1 and pivot_price < zigzag.get_price(0):
                 zigzag.update_latest(pl_index, pivot_price)
 
-            if show_liquidity and span is not None:
+            if show_liquidity and per and span is not None:
                 count = 0
                 start_index = None
                 start_price = None
@@ -429,6 +451,7 @@ def detect_liquidity_zones(
                         box.price_top = top
                         box.price_bottom = bottom
                         box.right_index = right_index
+                        box.line_end_index = index - 1
                         box.last_updated_index = index
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bars[index].time
@@ -461,9 +484,11 @@ def detect_liquidity_zones(
             if box.broken_bottom and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
         for box in sellside_boxes:
@@ -478,9 +503,11 @@ def detect_liquidity_zones(
             if box.broken_top and not box.filled:
                 box.filled = True
                 box.line_active = False
+                box.line_end_index = index
             if box.broken_top and box.broken_bottom:
                 box.broken = True
                 box.right_index = index
+                box.line_end_index = index
             box.last_updated_index = index
 
     return buyside_boxes, sellside_boxes
@@ -524,150 +551,142 @@ def detect_order_blocks(
         top_swing, bottom_swing, _ = swing_state.update(highs, lows, closes, index)
         per = (total_bars - 1 - index) <= present_window
 
-        bl_break_conf = 0
-        br_break_conf = 0
+        if not (show_ob and per):
+            continue
 
-        if show_ob and per:
-            if top_swing.is_valid() and not top_swing.crossed and bar.close > top_swing.price:
-                top_swing.crossed = True
-                if index >= 1:
-                    minima = max_series[index - 1]
-                    maxima = min_series[index - 1]
-                    loc_index = index - 1
-                    if top_swing.index >= 0:
-                        span = index - top_swing.index
-                        for offset in range(1, span):
-                            candidate_index = index - offset
-                            if candidate_index < 0:
-                                break
-                            candidate_min = min_series[candidate_index]
-                            new_min = min(minima, candidate_min)
-                            if candidate_min <= minima:
-                                minima = new_min
-                                maxima = max_series[candidate_index]
-                                loc_index = candidate_index
-                            else:
-                                minima = new_min
-                    if loc_index >= 0:
-                        block = OrderBlock(
-                            side="bullish",
-                            price_top=maxima,
-                            price_bottom=minima,
-                            origin_index=loc_index,
-                            origin_time=times[loc_index],
-                            created_index=index,
-                            created_time=bar.time,
-                        )
-                        bullish_blocks.insert(0, block)
+        if top_swing.is_valid() and not top_swing.crossed and bar.close > top_swing.price:
+            top_swing.crossed = True
+            if index >= 1:
+                minima = max_series[index - 1]
+                maxima = min_series[index - 1]
+                loc_index = index - 1
+                if top_swing.index >= 0:
+                    span = index - top_swing.index
+                    for offset in range(1, span):
+                        candidate_index = index - offset
+                        if candidate_index < 0:
+                            break
+                        candidate_min = min_series[candidate_index]
+                        updated_min = min(minima, candidate_min)
+                        if updated_min == candidate_min:
+                            maxima = max_series[candidate_index]
+                            loc_index = candidate_index
+                        minima = updated_min
+                block = OrderBlock(
+                    side="bullish",
+                    price_top=maxima,
+                    price_bottom=minima,
+                    origin_index=loc_index,
+                    origin_time=times[loc_index],
+                    created_index=index,
+                    created_time=bar.time,
+                )
+                bullish_blocks.insert(0, block)
+                events.append(
+                    OrderBlockEvent(
+                        event_type="bullish_creation",
+                        block=block,
+                        index=index,
+                        time=bar.time,
+                        price=bar.close,
+                    )
+                )
+
+        if bullish_blocks:
+            for blk_index in range(len(bullish_blocks) - 1, -1, -1):
+                block = bullish_blocks[blk_index]
+                if not block.breaker:
+                    if min(bar.close, bar.open) < block.price_bottom:
+                        block.breaker = True
+                        block.break_index = index
+                        block.break_time = bar.time
                         events.append(
                             OrderBlockEvent(
-                                event_type="bullish_creation",
+                                event_type="bullish_break",
                                 block=block,
                                 index=index,
                                 time=bar.time,
                                 price=bar.close,
                             )
                         )
+                else:
+                    if bar.close > block.price_top:
+                        bullish_blocks.pop(blk_index)
+                        continue
+                    if (
+                        blk_index < show_bull
+                        and top_swing.is_valid()
+                        and block.price_bottom < top_swing.price < block.price_top
+                    ):
+                        # Break confirmation flag retained for parity with Pine logic.
+                        pass
 
-            if bullish_blocks:
-                for blk_index in range(len(bullish_blocks) - 1, -1, -1):
-                    block = bullish_blocks[blk_index]
-                    if not block.breaker:
-                        if min(bar.close, bar.open) < block.price_bottom:
-                            block.breaker = True
-                            block.break_index = index
-                            block.break_time = bar.time
-                            events.append(
-                                OrderBlockEvent(
-                                    event_type="bullish_break",
-                                    block=block,
-                                    index=index,
-                                    time=bar.time,
-                                    price=bar.close,
-                                )
-                            )
-                    else:
-                        if bar.close > block.price_top:
-                            bullish_blocks.pop(blk_index)
-                            continue
-                        if (
-                            blk_index < show_bull
-                            and top_swing.is_valid()
-                            and top_swing.price < block.price_top
-                            and top_swing.price > block.price_bottom
-                        ):
-                            bl_break_conf = 1
+        if bottom_swing.is_valid() and not bottom_swing.crossed and bar.close < bottom_swing.price:
+            bottom_swing.crossed = True
+            if index >= 1:
+                maxima = max_series[index - 1]
+                minima = min_series[index - 1]
+                loc_index = index - 1
+                if bottom_swing.index >= 0:
+                    span = index - bottom_swing.index
+                    for offset in range(1, span):
+                        candidate_index = index - offset
+                        if candidate_index < 0:
+                            break
+                        candidate_max = max_series[candidate_index]
+                        updated_max = max(maxima, candidate_max)
+                        if updated_max == candidate_max:
+                            minima = min_series[candidate_index]
+                            loc_index = candidate_index
+                        maxima = updated_max
+                block = OrderBlock(
+                    side="bearish",
+                    price_top=maxima,
+                    price_bottom=minima,
+                    origin_index=loc_index,
+                    origin_time=times[loc_index],
+                    created_index=index,
+                    created_time=bar.time,
+                )
+                bearish_blocks.insert(0, block)
+                events.append(
+                    OrderBlockEvent(
+                        event_type="bearish_creation",
+                        block=block,
+                        index=index,
+                        time=bar.time,
+                        price=bar.close,
+                    )
+                )
 
-        if show_ob and per:
-            if bottom_swing.is_valid() and not bottom_swing.crossed and bar.close < bottom_swing.price:
-                bottom_swing.crossed = True
-                if index >= 1:
-                    maxima = max_series[index - 1]
-                    minima = min_series[index - 1]
-                    loc_index = index - 1
-                    if bottom_swing.index >= 0:
-                        span = index - bottom_swing.index
-                        for offset in range(1, span):
-                            candidate_index = index - offset
-                            if candidate_index < 0:
-                                break
-                            candidate_max = max_series[candidate_index]
-                            new_max = max(maxima, candidate_max)
-                            if candidate_max >= maxima:
-                                maxima = new_max
-                                minima = min_series[candidate_index]
-                                loc_index = candidate_index
-                            else:
-                                maxima = new_max
-                    if loc_index >= 0:
-                        block = OrderBlock(
-                            side="bearish",
-                            price_top=maxima,
-                            price_bottom=minima,
-                            origin_index=loc_index,
-                            origin_time=times[loc_index],
-                            created_index=index,
-                            created_time=bar.time,
-                        )
-                        bearish_blocks.insert(0, block)
+        if bearish_blocks:
+            for blk_index in range(len(bearish_blocks) - 1, -1, -1):
+                block = bearish_blocks[blk_index]
+                if not block.breaker:
+                    if max(bar.close, bar.open) > block.price_top:
+                        block.breaker = True
+                        block.break_index = index
+                        block.break_time = bar.time
                         events.append(
                             OrderBlockEvent(
-                                event_type="bearish_creation",
+                                event_type="bearish_break",
                                 block=block,
                                 index=index,
                                 time=bar.time,
                                 price=bar.close,
                             )
                         )
-
-            if bearish_blocks:
-                for blk_index in range(len(bearish_blocks) - 1, -1, -1):
-                    block = bearish_blocks[blk_index]
-                    if not block.breaker:
-                        if max(bar.close, bar.open) > block.price_top:
-                            block.breaker = True
-                            block.break_index = index
-                            block.break_time = bar.time
-                            events.append(
-                                OrderBlockEvent(
-                                    event_type="bearish_break",
-                                    block=block,
-                                    index=index,
-                                    time=bar.time,
-                                    price=bar.close,
-                                )
-                            )
-                    else:
-                        if bar.close < block.price_bottom:
-                            bearish_blocks.pop(blk_index)
-                            continue
-                        if (
-                            blk_index < show_bear
-                            and bottom_swing.is_valid()
-                            and bottom_swing.price > block.price_bottom
-                            and bottom_swing.price < block.price_top
-                        ):
-                            br_break_conf = 1
+                else:
+                    if bar.close < block.price_bottom:
+                        bearish_blocks.pop(blk_index)
+                        continue
+                    if (
+                        blk_index < show_bear
+                        and bottom_swing.is_valid()
+                        and block.price_bottom < bottom_swing.price < block.price_top
+                    ):
+                        # Break confirmation flag retained for parity with Pine logic.
+                        pass
 
     return bullish_blocks, bearish_blocks, events
 
@@ -806,6 +825,7 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
             atr_period=ATR_PERIOD,
             pivot_left=PIVOT_LEFT,
             pivot_right=PIVOT_RIGHT,
+            present_window=PRESENT_LOOKBACK_BARS,
         )
         bullish_obs, bearish_obs, ob_events = detect_order_blocks(
             bars,
@@ -888,11 +908,16 @@ def run_scanner() -> None:
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     exchange.load_markets()
     markets = exchange.markets
-    symbols = [
-        symbol
-        for symbol, info in markets.items()
-        if info.get("quote") == "USDT" and info.get("contractType") == "PERPETUAL" and not info.get("darkpool", False)
-    ]
+    symbols = []
+    for symbol, market in markets.items():
+        if market.get("quote") != "USDT":
+            continue
+        contract_type = market.get("info", {}).get("contractType")
+        if contract_type != "PERPETUAL":
+            continue
+        if market.get("darkpool", False):
+            continue
+        symbols.append(symbol)
 
     if not symbols:
         print("[WARN] No Binance USDT-M futures symbols found to scan.")
