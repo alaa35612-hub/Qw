@@ -42,6 +42,21 @@ LOOP_DELAY_SECONDS: float = 60.0
 TELEGRAM_TOKEN: str = ""
 TELEGRAM_CHAT_ID: str = ""
 TELEGRAM_REQUEST_TIMEOUT: int = 10
+ENABLE_ALERTS: bool = True
+ALERT_TOGGLES: Dict[str, bool] = {
+    "BuysideLiquidity": True,
+    "SellsideLiquidity": True,
+    "BuysideLiquidityTouch": True,
+    "SellsideLiquidityTouch": True,
+    "Bullish OB": True,
+    "Bearish OB": True,
+    "Bullish Break": True,
+    "Bearish Break": True,
+    "Bullish Break Confirmed": True,
+    "Bearish Break Confirmed": True,
+    "BullishOBTouch": True,
+    "BearishOBTouch": True,
+}
 
 ANSI_RESET = "\033[0m"
 EVENT_COLOR_MAP = {
@@ -208,10 +223,19 @@ def send_telegram_alert(message: str) -> None:
             _telegram_warning_logged = True
 
 
-def emit_alert(event_label: str, message: str) -> None:
+def alert_enabled(event_label: str) -> bool:
+    if not ENABLE_ALERTS:
+        return False
+    return ALERT_TOGGLES.get(event_label, True)
+
+
+def emit_alert(event_label: str, message: str) -> bool:
+    if not alert_enabled(event_label):
+        return False
     console_message = _colorize(message, event_label)
     print(console_message)
     send_telegram_alert(message)
+    return True
 
 
 def prune_history_for_symbol(
@@ -1043,6 +1067,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 continue
             box = event.box
             event_label = "BuysideLiquidity" if box.side == "buyside" else "SellsideLiquidity"
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event.event_type, box.start_index)
             if not should_emit(
                 LIQUIDITY_CREATION_ALERTS,
@@ -1057,13 +1083,15 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"PRICE_RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for box, touch_price in liquidity_touches:
             event_label = (
                 "BuysideLiquidityTouch" if box.side == "buyside" else "SellsideLiquidityTouch"
             )
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, box.start_index)
             if not should_emit(
                 LIQUIDITY_TOUCH_ALERTS,
@@ -1078,8 +1106,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for event in ob_events:
             if event.index != latest_index:
@@ -1103,6 +1131,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 history = ORDERBLOCK_CONFIRM_ALERTS
             else:
                 continue
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, block.origin_index, block.created_index)
             if not should_emit(
                 history,
@@ -1118,12 +1148,14 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"PRICE_RANGE={price_range}, EVENT_PRICE={price_value:.6f}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         for event in ob_touch_events:
             block = event.block
             event_label = "BullishOBTouch" if block.side == "bullish" else "BearishOBTouch"
+            if not alert_enabled(event_label):
+                continue
             history_key = (symbol, event_label, block.origin_index, block.created_index)
             if not should_emit(
                 ORDERBLOCK_TOUCH_ALERTS,
@@ -1139,8 +1171,8 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
                 f"[ALERT] SYMBOL={symbol}, EVENT={event_label}, TF={TIMEFRAME}, "
                 f"TOUCH_PRICE={touch_price:.6f}, RANGE={price_range}, BAR_TIME={timestamp}"
             )
-            emit_alert(event_label, message)
-            alerts_emitted = True
+            if emit_alert(event_label, message):
+                alerts_emitted = True
 
         if not alerts_emitted:
             print(f"[INFO] SYMBOL={symbol} produced no alerts on the latest bar.")
