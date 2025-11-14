@@ -888,11 +888,16 @@ def run_scanner() -> None:
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
     exchange.load_markets()
     markets = exchange.markets
-    symbols = [
-        symbol
-        for symbol, info in markets.items()
-        if info.get("quote") == "USDT" and info.get("contractType") == "PERPETUAL" and not info.get("darkpool", False)
-    ]
+    symbols = []
+    for symbol, market in markets.items():
+        if market.get("quote") != "USDT":
+            continue
+        contract_type = market.get("info", {}).get("contractType")
+        if contract_type != "PERPETUAL":
+            continue
+        if market.get("darkpool", False):
+            continue
+        symbols.append(symbol)
 
     if not symbols:
         print("[WARN] No Binance USDT-M futures symbols found to scan.")
