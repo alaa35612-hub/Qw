@@ -53,6 +53,8 @@ EVENT_COLOR_MAP = {
     "Bearish OB": "\033[31m",
     "Bullish Break": "\033[92m",
     "Bearish Break": "\033[95m",
+    "Bullish Break Confirmed": "\033[92m",
+    "Bearish Break Confirmed": "\033[95m",
     "BullishOBTouch": "\033[32m",
     "BearishOBTouch": "\033[31m",
 }
@@ -139,6 +141,9 @@ class OrderBlock:
     breaker: bool = False
     break_index: Optional[int] = None
     break_time: Optional[int] = None
+    breaker_confirmed: bool = False
+    confirmation_index: Optional[int] = None
+    confirmation_time: Optional[int] = None
 
     def as_dict(self) -> dict:
         return {
@@ -152,6 +157,9 @@ class OrderBlock:
             "breaker": self.breaker,
             "break_index": self.break_index,
             "break_time": self.break_time,
+            "breaker_confirmed": self.breaker_confirmed,
+            "confirmation_index": self.confirmation_index,
+            "confirmation_time": self.confirmation_time,
         }
 
 
@@ -169,6 +177,7 @@ LIQUIDITY_TOUCH_ALERTS: Dict[Tuple[str, str, int], int] = {}
 ORDERBLOCK_CREATION_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
 ORDERBLOCK_BREAK_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
 ORDERBLOCK_TOUCH_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
+ORDERBLOCK_CONFIRM_ALERTS: Dict[Tuple[str, str, int, int], int] = {}
 _telegram_warning_logged = False
 
 
@@ -726,9 +735,20 @@ def detect_order_blocks(
                         blk_index < show_bull
                         and top_swing.is_valid()
                         and block.price_bottom < top_swing.price < block.price_top
+                        and not block.breaker_confirmed
                     ):
-                        # Break confirmation flag retained for parity with Pine logic.
-                        pass
+                        block.breaker_confirmed = True
+                        block.confirmation_index = index
+                        block.confirmation_time = bar.time
+                        events.append(
+                            OrderBlockEvent(
+                                event_type="bullish_break_confirmation",
+                                block=block,
+                                index=index,
+                                time=bar.time,
+                                price=bar.close,
+                            )
+                        )
 
         if bottom_swing.is_valid() and not bottom_swing.crossed and bar.close < bottom_swing.price:
             bottom_swing.crossed = True
@@ -793,9 +813,20 @@ def detect_order_blocks(
                         blk_index < show_bear
                         and bottom_swing.is_valid()
                         and block.price_bottom < bottom_swing.price < block.price_top
+                        and not block.breaker_confirmed
                     ):
-                        # Break confirmation flag retained for parity with Pine logic.
-                        pass
+                        block.breaker_confirmed = True
+                        block.confirmation_index = index
+                        block.confirmation_time = bar.time
+                        events.append(
+                            OrderBlockEvent(
+                                event_type="bearish_break_confirmation",
+                                block=block,
+                                index=index,
+                                time=bar.time,
+                                price=bar.close,
+                            )
+                        )
 
     return bullish_blocks, bearish_blocks, events
 
@@ -979,6 +1010,9 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
         prune_history_for_symbol(
             ORDERBLOCK_TOUCH_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
         )
+        prune_history_for_symbol(
+            ORDERBLOCK_CONFIRM_ALERTS, symbol, latest_index, MAX_ALERT_AGE_BARS
+        )
 
         for event in liquidity_events:
             if event.index != latest_index:
@@ -1033,6 +1067,16 @@ def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
             elif event.event_type in {"bullish_break", "bearish_break"}:
                 event_label = "Bullish Break" if block.side == "bullish" else "Bearish Break"
                 history = ORDERBLOCK_BREAK_ALERTS
+            elif event.event_type in {
+                "bullish_break_confirmation",
+                "bearish_break_confirmation",
+            }:
+                event_label = (
+                    "Bullish Break Confirmed"
+                    if block.side == "bullish"
+                    else "Bearish Break Confirmed"
+                )
+                history = ORDERBLOCK_CONFIRM_ALERTS
             else:
                 continue
             history_key = (symbol, event_label, block.origin_index, block.created_index)
