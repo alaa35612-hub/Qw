@@ -33,6 +33,8 @@ SHOW_LAST_BULLISH_OB: int = 1
 SHOW_LAST_BEARISH_OB: int = 1
 USE_BODY_FOR_OB: bool = True
 PRESENT_LOOKBACK_BARS: int = 500
+RUN_CONTINUOUSLY: bool = False
+LOOP_DELAY_SECONDS: float = 60.0
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -772,26 +774,28 @@ def find_liquidity_touches(
     return touches
 
 
-def run_scanner() -> None:
-    """Main entry point: scan Binance USDT-M futures and emit alerts."""
-    exchange = ccxt.binanceusdm()
-    exchange.load_markets()
-    markets = exchange.markets
-    symbols = [
-        symbol
-        for symbol, info in markets.items()
-        if info.get("quote") == "USDT" and info.get("contractType") == "PERPETUAL" and not info.get("darkpool", False)
-    ]
+def run_single_scan(exchange: ccxt.Exchange, symbols: Sequence[str]) -> None:
+    """Scan the provided symbols once and print informational messages."""
+
+    print(
+        f"[INFO] Scanning {len(symbols)} Binance USDT-M futures symbols on timeframe {TIMEFRAME}"
+    )
 
     for symbol in symbols:
-        market = markets[symbol]
+        market = exchange.markets[symbol]
         if not market.get("active", True):
+            print(f"[SKIP] SYMBOL={symbol} is inactive; skipping.")
             continue
+        print(f"[INFO] Fetching OHLCV for {symbol}...")
         try:
             bars = fetch_ohlcv(exchange, symbol, timeframe=TIMEFRAME, limit=MAX_BARS_LOOKBACK)
         except Exception as exc:  # noqa: BLE001 - log and continue scanning
             print(f"[ERROR] Failed to fetch OHLCV for {symbol}: {exc}")
             time.sleep(exchange.rateLimit / 1000.0)
+            continue
+
+        if not bars:
+            print(f"[WARN] SYMBOL={symbol} returned no candles; skipping.")
             continue
 
         buyside, sellside = detect_liquidity_zones(
@@ -824,6 +828,7 @@ def run_scanner() -> None:
 
         latest_index = len(bars) - 1
         if latest_index < 0:
+            print(f"[WARN] SYMBOL={symbol} has insufficient data; skipping.")
             continue
 
         last_time = bars[latest_index].time
@@ -872,8 +877,40 @@ def run_scanner() -> None:
             alerts_emitted = True
 
         if not alerts_emitted:
-            continue
+            print(f"[INFO] SYMBOL={symbol} produced no alerts on the latest bar.")
+
         time.sleep(exchange.rateLimit / 1000.0)
+
+
+def run_scanner() -> None:
+    """Main entry point: optionally run the scanner continuously."""
+
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    exchange.load_markets()
+    markets = exchange.markets
+    symbols = [
+        symbol
+        for symbol, info in markets.items()
+        if info.get("quote") == "USDT" and info.get("contractType") == "PERPETUAL" and not info.get("darkpool", False)
+    ]
+
+    if not symbols:
+        print("[WARN] No Binance USDT-M futures symbols found to scan.")
+        return
+
+    try:
+        if RUN_CONTINUOUSLY:
+            print("[INFO] Continuous scanning enabled. Press Ctrl+C to stop.")
+            while True:
+                run_single_scan(exchange, symbols)
+                print(
+                    f"[INFO] Sleeping for {LOOP_DELAY_SECONDS} seconds before the next scan cycle."
+                )
+                time.sleep(max(0.0, LOOP_DELAY_SECONDS))
+        else:
+            run_single_scan(exchange, symbols)
+    except KeyboardInterrupt:
+        print("[INFO] Scanner interrupted by user. Exiting cleanly.")
 
 
 if __name__ == "__main__":
