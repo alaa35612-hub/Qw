@@ -296,25 +296,37 @@ class SwingState:
     ) -> Tuple[SwingPoint, SwingPoint, int]:
         prev_os = self.os
         length = self.length
-        if length <= 0:
+        if (
+            length <= 0
+            or index < length
+            or index >= len(highs)
+            or index >= len(lows)
+        ):
             return self.top, self.bottom, prev_os
 
         reference_index = index - length
-        if reference_index < 0 or index >= len(highs) or index >= len(lows):
+        if reference_index < 0:
             return self.top, self.bottom, prev_os
 
         window_start = reference_index + 1
         window_end = index + 1
-        if window_start < 0:
-            window_start = 0
 
-        window_highs = highs[window_start:window_end]
-        window_lows = lows[window_start:window_end]
-        if not window_highs or not window_lows:
+        next_highs = [
+            value
+            for value in highs[window_start:window_end]
+            if not math.isnan(value)
+        ]
+        next_lows = [
+            value
+            for value in lows[window_start:window_end]
+            if not math.isnan(value)
+        ]
+
+        if not next_highs or not next_lows:
             return self.top, self.bottom, prev_os
 
-        upper = max(window_highs)
-        lower = min(window_lows)
+        upper = max(next_highs)
+        lower = min(next_lows)
 
         ref_high = highs[reference_index]
         ref_low = lows[reference_index]
