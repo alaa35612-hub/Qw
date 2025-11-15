@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:  # pragma: no cover - optional dependency when running backtests only
@@ -54,6 +54,8 @@ class LiquidityZone:
     filled: bool = False
     line_active: bool = True
     last_updated_index: int = 0
+    purged: bool = False
+    buffer: float = 0.0
 
     def clone(self) -> "LiquidityZone":
         return LiquidityZone(
@@ -72,6 +74,8 @@ class LiquidityZone:
             filled=self.filled,
             line_active=self.line_active,
             last_updated_index=self.last_updated_index,
+            purged=self.purged,
+            buffer=self.buffer,
         )
 
 
@@ -88,6 +92,14 @@ class LiquiditySnapshot:
     index: int
     buyside: List[LiquidityZone]
     sellside: List[LiquidityZone]
+
+
+@dataclass
+class HigherTimeframeLiquidityLevel:
+    side: str  # "buyside" or "sellside"
+    price: float
+    timeframe: str
+    reference_time: int
 
 
 @dataclass
@@ -115,6 +127,7 @@ class OrderBlock:
     breaker_confirmed: bool = False
     confirmation_index: Optional[int] = None
     confirmation_time: Optional[int] = None
+    block_type: str = "standard"  # "standard" or "mitigation"
 
     def clone(self) -> "OrderBlock":
         return OrderBlock(
@@ -131,6 +144,7 @@ class OrderBlock:
             breaker_confirmed=self.breaker_confirmed,
             confirmation_index=self.confirmation_index,
             confirmation_time=self.confirmation_time,
+            block_type=self.block_type,
         )
 
 
@@ -180,6 +194,12 @@ class StrategyConfig:
     show_bear: int = 1
     use_body_for_ob: bool = True
     present_window: int = 500
+    liquidity_buffer: float = 10.0
+    liquidity_buffer_mode: str = "absolute"  # "absolute" points or "percent"
+    include_htf_levels: bool = False
+    htf_timeframes: Tuple[str, ...] = ("1D", "1W")
+    dynamic_timeframe_adjustment: bool = True
+    timeframe: Optional[str] = "15m"
     # Strategy configuration
     initial_equity: float = 100_000.0
     risk_per_trade: float = 0.01
@@ -188,6 +208,31 @@ class StrategyConfig:
     max_trades_per_day: int = 3
     max_daily_loss_pct: float = 0.02
     warmup_bars: int = 200
+
+    def resolved_for_timeframe(self, timeframe: Optional[str]) -> "StrategyConfig":
+        """Return a config copy optionally scaled for the provided timeframe."""
+
+        if timeframe is None:
+            return self
+        if not self.dynamic_timeframe_adjustment:
+            return replace(self, timeframe=timeframe)
+
+        minutes = timeframe_to_minutes(timeframe)
+        base_tf = self.timeframe or "15m"
+        base_minutes = timeframe_to_minutes(base_tf)
+        if minutes is None or base_minutes is None or base_minutes == 0:
+            return replace(self, timeframe=timeframe)
+
+        scale = max(1.0, minutes / base_minutes)
+        scaled = replace(self)
+        scaled.timeframe = timeframe
+        scaled.pivot_left = max(2, int(round(self.pivot_left * math.sqrt(scale))))
+        scaled.pivot_right = max(1, int(round(self.pivot_right * math.sqrt(scale))))
+        scaled.order_block_length = max(5, int(round(self.order_block_length * math.sqrt(scale))))
+        scaled.present_window = max(self.present_window, int(round(self.present_window * scale)))
+        scaled.sweep_lookback = max(10, int(round(self.sweep_lookback * math.sqrt(scale))))
+        scaled.warmup_bars = max(self.warmup_bars, int(round(self.warmup_bars * scale)))
+        return scaled
 
 
 @dataclass
@@ -202,6 +247,7 @@ class ScannerConfig:
     max_symbols: Optional[int] = None
     symbols: Optional[Sequence[str]] = None
     verbose: bool = True
+    dynamic_history_scaling: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +276,99 @@ def compute_atr(bars: Sequence[OHLCVBar], period: int) -> List[Optional[float]]:
         if i >= period - 1:
             atr_values[i] = prev_atr
     return atr_values
+
+
+def timeframe_to_minutes(timeframe: str) -> Optional[int]:
+    """Convert a timeframe string (e.g. '15m', '1h', '1D') to minutes."""
+
+    if not timeframe:
+        return None
+
+    timeframe = timeframe.strip().lower()
+    unit = timeframe[-1]
+    try:
+        value = float(timeframe[:-1])
+    except ValueError:
+        return None
+
+    if unit == "m":
+        return int(value)
+    if unit == "h":
+        return int(value * 60)
+    if unit == "d":
+        return int(value * 1440)
+    if unit == "w":
+        return int(value * 10080)
+    return None
+
+
+def _liquidity_buffer_value(config: StrategyConfig, reference_price: float) -> float:
+    if config.liquidity_buffer_mode == "percent":
+        return abs(reference_price) * config.liquidity_buffer
+    return config.liquidity_buffer
+
+
+def _period_key_from_timestamp(timestamp: int, timeframe: str) -> Optional[Tuple[int, int, int]]:
+    struct = time.gmtime(timestamp / 1000)
+    if timeframe.upper() == "1D":
+        return struct.tm_year, struct.tm_yday, 0
+    if timeframe.upper() == "1W":
+        return struct.tm_year, struct.tm_yday // 7, 0
+    return None
+
+
+def _extract_htf_levels(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[HigherTimeframeLiquidityLevel]:
+    levels: List[HigherTimeframeLiquidityLevel] = []
+    if not config.include_htf_levels or not config.htf_timeframes:
+        return levels
+    if not bars:
+        return levels
+
+    by_tf: Dict[str, Dict[Tuple[int, int, int], Dict[str, float]]] = {}
+    for timeframe in config.htf_timeframes:
+        by_tf[timeframe] = {}
+
+    for bar in bars:
+        for timeframe in config.htf_timeframes:
+            key = _period_key_from_timestamp(bar.time, timeframe)
+            if key is None:
+                continue
+            stats = by_tf[timeframe].setdefault(
+                key,
+                {"high": -math.inf, "low": math.inf, "end": bar.time},
+            )
+            stats["high"] = max(stats["high"], bar.high)
+            stats["low"] = min(stats["low"], bar.low)
+            stats["end"] = max(stats["end"], bar.time)
+
+    latest_time = bars[-1].time
+    for timeframe, groups in by_tf.items():
+        if not groups:
+            continue
+        latest_key = _period_key_from_timestamp(latest_time, timeframe)
+        completed_keys = [key for key in sorted(groups) if key != latest_key]
+        if not completed_keys:
+            continue
+        reference_key = completed_keys[-1]
+        stats = groups[reference_key]
+        levels.append(
+            HigherTimeframeLiquidityLevel(
+                side="buyside",
+                price=stats["high"],
+                timeframe=timeframe,
+                reference_time=stats["end"],
+            )
+        )
+        levels.append(
+            HigherTimeframeLiquidityLevel(
+                side="sellside",
+                price=stats["low"],
+                timeframe=timeframe,
+                reference_time=stats["end"],
+            )
+        )
+
+    return levels
 
 
 def _pivot_extreme(
@@ -368,6 +507,7 @@ class LiquidityDetectionResult:
     sellside_zones: List[LiquidityZone]
     events: List[LiquidityEvent]
     history: List[LiquiditySnapshot]
+    htf_levels: List[HigherTimeframeLiquidityLevel]
 
 
 def detect_liquidity_zones(
@@ -375,7 +515,7 @@ def detect_liquidity_zones(
     config: StrategyConfig,
 ) -> LiquidityDetectionResult:
     if not bars:
-        return LiquidityDetectionResult([], [], [], [])
+        return LiquidityDetectionResult([], [], [], [], [])
 
     zigzag = ZigZagState(max_size=50)
     atr_values = compute_atr(bars, config.atr_period)
@@ -405,8 +545,8 @@ def detect_liquidity_zones(
                 count = 0
                 start_index = None
                 start_price = None
-                min_price = 0.0
-                max_price = 10e6
+                min_price = math.inf
+                max_price = -math.inf
                 size_limit = min(zigzag.size(), 50)
                 for offset in range(size_limit):
                     if zigzag.get_direction(offset) != 1:
@@ -420,16 +560,17 @@ def detect_liquidity_zones(
                         count += 1
                         start_index = zigzag.get_index(offset)
                         start_price = price
-                        if price > min_price:
-                            min_price = price
-                        if price < max_price:
-                            max_price = price
-                if count > 2 and start_index is not None and start_price is not None:
+                        min_price = min(min_price, price)
+                        max_price = max(max_price, price)
+                if count >= 2 and start_index is not None and start_price is not None:
                     # Ported from ICT Concepts [LuxAlgo]: buyside liquidity box creation
-                    midpoint = (min_price + max_price) / 2.0
-                    top = midpoint + span
-                    bottom = midpoint - span
+                    cluster_low = min_price if min_price != math.inf else pivot_price
+                    cluster_high = max_price if max_price != -math.inf else pivot_price
+                    buffer_val = _liquidity_buffer_value(config, cluster_high)
+                    top = cluster_high + buffer_val
+                    bottom = cluster_low
                     right_index = index + 10
+                    reference_price = cluster_high
                     if buyside and buyside[0].start_index == start_index:
                         zone = buyside[0]
                         zone.price_top = top
@@ -437,6 +578,8 @@ def detect_liquidity_zones(
                         zone.right_index = right_index
                         zone.line_end_index = index - 1
                         zone.last_updated_index = index
+                        zone.buffer = buffer_val
+                        zone.reference_price = reference_price
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bar.time
                         new_zone = LiquidityZone(
@@ -448,8 +591,9 @@ def detect_liquidity_zones(
                             right_index=right_index,
                             line_start_index=start_index,
                             line_end_index=index - 1,
-                            reference_price=start_price,
+                            reference_price=reference_price,
                             last_updated_index=index,
+                            buffer=buffer_val,
                         )
                         buyside.insert(0, new_zone)
                         events.append(LiquidityEvent("buyside_creation", new_zone, index, bar.time))
@@ -468,8 +612,8 @@ def detect_liquidity_zones(
                 count = 0
                 start_index = None
                 start_price = None
-                min_price = 0.0
-                max_price = 10e6
+                min_price = math.inf
+                max_price = -math.inf
                 size_limit = min(zigzag.size(), 50)
                 for offset in range(size_limit):
                     if zigzag.get_direction(offset) != -1:
@@ -483,16 +627,17 @@ def detect_liquidity_zones(
                         count += 1
                         start_index = zigzag.get_index(offset)
                         start_price = price
-                        if price > min_price:
-                            min_price = price
-                        if price < max_price:
-                            max_price = price
-                if count > 2 and start_index is not None and start_price is not None:
+                        min_price = min(min_price, price)
+                        max_price = max(max_price, price)
+                if count >= 2 and start_index is not None and start_price is not None:
                     # Ported from ICT Concepts [LuxAlgo]: sellside liquidity box creation
-                    midpoint = (min_price + max_price) / 2.0
-                    top = midpoint + span
-                    bottom = midpoint - span
+                    cluster_low = min_price if min_price != math.inf else pivot_price
+                    cluster_high = max_price if max_price != -math.inf else pivot_price
+                    buffer_val = _liquidity_buffer_value(config, cluster_low)
+                    top = cluster_high
+                    bottom = cluster_low - buffer_val
                     right_index = index + 10
+                    reference_price = cluster_low
                     if sellside and sellside[0].start_index == start_index:
                         zone = sellside[0]
                         zone.price_top = top
@@ -500,6 +645,8 @@ def detect_liquidity_zones(
                         zone.right_index = right_index
                         zone.line_end_index = index - 1
                         zone.last_updated_index = index
+                        zone.buffer = buffer_val
+                        zone.reference_price = reference_price
                     else:
                         start_time = bars[start_index].time if 0 <= start_index < len(bars) else bar.time
                         new_zone = LiquidityZone(
@@ -511,8 +658,9 @@ def detect_liquidity_zones(
                             right_index=right_index,
                             line_start_index=start_index,
                             line_end_index=index - 1,
-                            reference_price=start_price,
+                            reference_price=reference_price,
                             last_updated_index=index,
+                            buffer=buffer_val,
                         )
                         sellside.insert(0, new_zone)
                         events.append(LiquidityEvent("sellside_creation", new_zone, index, bar.time))
@@ -522,39 +670,53 @@ def detect_liquidity_zones(
         for zone in buyside:
             if zone.broken:
                 continue
-            zone.right_index = index + 3
-            zone.line_end_index = index + 3
-            if not zone.broken_top and bar.close > zone.price_top:
-                zone.broken_top = True
-            if not zone.broken_bottom and bar.close > zone.price_bottom:
-                zone.broken_bottom = True
-            if zone.broken_bottom and not zone.filled:
+            if zone.line_active:
+                zone.right_index = index + 3
+                zone.line_end_index = index + 3
+            wick_purge = bar.high >= zone.price_top
+            close_break_top = bar.close >= zone.price_top
+            close_through_bottom = bar.close >= zone.price_bottom
+            if wick_purge and not zone.filled:
                 zone.filled = True
+                zone.purged = True
                 zone.line_active = False
                 zone.line_end_index = index
-            if zone.broken_top and zone.broken_bottom:
+            if close_through_bottom:
+                zone.broken_bottom = True
+            if close_break_top:
+                zone.broken_top = True
                 zone.broken = True
-                zone.right_index = index
+                zone.filled = True
+                zone.purged = True
+                zone.line_active = False
                 zone.line_end_index = index
+                zone.right_index = index
             zone.last_updated_index = index
 
         for zone in sellside:
             if zone.broken:
                 continue
-            zone.right_index = index + 3
-            zone.line_end_index = index + 3
-            if not zone.broken_top and bar.close < zone.price_top:
-                zone.broken_top = True
-            if not zone.broken_bottom and bar.close < zone.price_bottom:
-                zone.broken_bottom = True
-            if zone.broken_top and not zone.filled:
+            if zone.line_active:
+                zone.right_index = index + 3
+                zone.line_end_index = index + 3
+            wick_purge = bar.low <= zone.price_bottom
+            close_break_bottom = bar.close <= zone.price_bottom
+            close_through_top = bar.close <= zone.price_top
+            if wick_purge and not zone.filled:
                 zone.filled = True
+                zone.purged = True
                 zone.line_active = False
                 zone.line_end_index = index
-            if zone.broken_top and zone.broken_bottom:
+            if close_through_top:
+                zone.broken_top = True
+            if close_break_bottom:
+                zone.broken_bottom = True
                 zone.broken = True
-                zone.right_index = index
+                zone.filled = True
+                zone.purged = True
+                zone.line_active = False
                 zone.line_end_index = index
+                zone.right_index = index
             zone.last_updated_index = index
 
         history.append(
@@ -565,7 +727,9 @@ def detect_liquidity_zones(
             )
         )
 
-    return LiquidityDetectionResult(buyside, sellside, events, history)
+    htf_levels = _extract_htf_levels(bars, config)
+
+    return LiquidityDetectionResult(buyside, sellside, events, history, htf_levels)
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +772,8 @@ def detect_order_blocks(
 
     swing_state = SwingState(length=config.order_block_length)
     total_bars = len(bars)
+    last_top_break_price: Optional[float] = None
+    last_bottom_break_price: Optional[float] = None
 
     for index, bar in enumerate(bars):
         top_swing, bottom_swing, _ = swing_state.update(highs, lows, closes, index)
@@ -641,6 +807,12 @@ def detect_order_blocks(
                             loc_index = candidate_index
                         minima = updated_min
                 # Ported from ICT Concepts [LuxAlgo]: bullish order block creation
+                # ICT Concepts: classify order blocks formed after a liquidity raid (breaker)
+                # versus mitigation blocks that form without taking external liquidity.
+                if last_top_break_price is None or top_swing.price > last_top_break_price:
+                    block_type = "standard"
+                else:
+                    block_type = "mitigation"
                 block = OrderBlock(
                     side="bullish",
                     price_top=maxima,
@@ -649,7 +821,9 @@ def detect_order_blocks(
                     origin_time=times[loc_index],
                     created_index=index,
                     created_time=bar.time,
+                    block_type=block_type,
                 )
+                last_top_break_price = max(top_swing.price, last_top_break_price or -math.inf)
                 bullish_blocks.insert(0, block)
                 events.append(OrderBlockEvent("bullish_creation", block, index, bar.time, bar.close))
 
@@ -697,6 +871,10 @@ def detect_order_blocks(
                             loc_index = candidate_index
                         maxima = updated_max
                 # Ported from ICT Concepts [LuxAlgo]: bearish order block creation
+                if last_bottom_break_price is None or bottom_swing.price < last_bottom_break_price:
+                    block_type = "standard"
+                else:
+                    block_type = "mitigation"
                 block = OrderBlock(
                     side="bearish",
                     price_top=maxima,
@@ -705,7 +883,9 @@ def detect_order_blocks(
                     origin_time=times[loc_index],
                     created_index=index,
                     created_time=bar.time,
+                    block_type=block_type,
                 )
+                last_bottom_break_price = min(bottom_swing.price, last_bottom_break_price or math.inf)
                 bearish_blocks.insert(0, block)
                 events.append(OrderBlockEvent("bearish_creation", block, index, bar.time, bar.close))
 
@@ -769,7 +949,7 @@ def _find_nearest_zone_price(
 ) -> Optional[float]:
     candidate_price: Optional[float] = None
     for zone in zones:
-        if zone.broken:
+        if zone.broken or zone.filled:
             continue
         zone_mid = (zone.price_top + zone.price_bottom) / 2.0
         if side == "long" and zone_mid > reference_price:
@@ -842,10 +1022,10 @@ def _has_liquidity_sweep(
             if zone.broken:
                 continue
             if side == "long":
-                if bar.low < zone.price_bottom and bar.close > zone.price_bottom:
+                if bar.low <= zone.price_bottom and bar.close > zone.price_bottom:
                     return True
             else:
-                if bar.high > zone.price_top and bar.close < zone.price_top:
+                if bar.high >= zone.price_top and bar.close < zone.price_top:
                     return True
     return False
 
@@ -923,24 +1103,25 @@ def generate_signals(
 
 
 def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade]:
-    if len(bars) <= config.warmup_bars:
+    strategy_config = config.resolved_for_timeframe(config.timeframe or "15m")
+    if len(bars) <= strategy_config.warmup_bars:
         return []
 
-    liquidity_result = detect_liquidity_zones(bars, config)
-    order_block_result = detect_order_blocks(bars, config)
+    liquidity_result = detect_liquidity_zones(bars, strategy_config)
+    order_block_result = detect_order_blocks(bars, strategy_config)
     liquidity_history = {snap.index: snap for snap in liquidity_result.history}
     order_block_history = {snap.index: snap for snap in order_block_result.history}
 
     trades: List[Trade] = []
     open_trades: List[Trade] = []
-    equity = config.initial_equity
+    equity = strategy_config.initial_equity
     daily_trade_counts: Dict[int, int] = {}
     daily_pnl: Dict[int, float] = {}
 
     def current_day(timestamp: int) -> int:
         return timestamp // 86_400_000
 
-    for index in range(config.warmup_bars, len(bars)):
+    for index in range(strategy_config.warmup_bars, len(bars)):
         bar = bars[index]
         liq_snapshot = liquidity_history.get(index)
         ob_snapshot = order_block_history.get(index)
@@ -1002,19 +1183,19 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
                     daily_pnl[day] += trade.pnl
                     continue
 
-        if daily_trade_counts[day] >= config.max_trades_per_day:
+        if daily_trade_counts[day] >= strategy_config.max_trades_per_day:
             continue
-        if abs(daily_pnl[day]) >= config.initial_equity * config.max_daily_loss_pct:
+        if abs(daily_pnl[day]) >= strategy_config.initial_equity * strategy_config.max_daily_loss_pct:
             continue
 
         bullish_blocks = [block for block in ob_snapshot.bullish if not block.breaker]
         bearish_blocks = [block for block in ob_snapshot.bearish if not block.breaker]
 
-        risk_amount = equity * config.risk_per_trade
+        risk_amount = equity * strategy_config.risk_per_trade
 
         if (
             bullish_blocks
-            and _has_liquidity_sweep(index, bars, liquidity_history, "long", config.sweep_lookback)
+            and _has_liquidity_sweep(index, bars, liquidity_history, "long", strategy_config.sweep_lookback)
         ):
             block = bullish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
@@ -1024,7 +1205,7 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
                     block,
                     bar.close,
                     liq_snapshot,
-                    config,
+                    strategy_config,
                 )
                 if stop_loss is not None and take_profit is not None:
                     position_size = risk_amount / (bar.close - stop_loss)
@@ -1042,7 +1223,7 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
 
         if (
             bearish_blocks
-            and _has_liquidity_sweep(index, bars, liquidity_history, "short", config.sweep_lookback)
+            and _has_liquidity_sweep(index, bars, liquidity_history, "short", strategy_config.sweep_lookback)
         ):
             block = bearish_blocks[0]
             block_mid = (block.price_top + block.price_bottom) / 2.0
@@ -1052,7 +1233,7 @@ def run_backtest(bars: Sequence[OHLCVBar], config: StrategyConfig) -> List[Trade
                     block,
                     bar.close,
                     liq_snapshot,
-                    config,
+                    strategy_config,
                 )
                 if stop_loss is not None and take_profit is not None:
                     position_size = risk_amount / (stop_loss - bar.close)
@@ -1153,7 +1334,8 @@ def scan_symbols(
 ) -> Dict[str, List[Signal]]:
     """Scan the Binance USDT-M futures universe for fresh trade setups."""
 
-    strategy_config = scanner_config.strategy
+    base_strategy_config = scanner_config.strategy
+    strategy_config = base_strategy_config.resolved_for_timeframe(scanner_config.timeframe)
     matches: Dict[str, List[Signal]] = {}
     symbols = _select_symbol_universe(
         exchange,
@@ -1169,12 +1351,24 @@ def scan_symbols(
     for symbol in symbols:
         if scanner_config.verbose:
             print(f"[SCAN] Fetching OHLCV for {symbol}...")
+        history_limit = scanner_config.limit
+        if scanner_config.dynamic_history_scaling:
+            tf_minutes = timeframe_to_minutes(scanner_config.timeframe)
+            base_minutes = timeframe_to_minutes(base_strategy_config.timeframe or "15m")
+            if tf_minutes and base_minutes and base_minutes > 0:
+                history_limit = int(max(history_limit, history_limit * (tf_minutes / base_minutes)))
+        minimum_required = max(
+            strategy_config.warmup_bars + 5,
+            strategy_config.present_window + strategy_config.order_block_length + 10,
+        )
+        history_limit = max(history_limit, minimum_required)
+
         try:
             bars = fetch_ohlcv(
                 exchange,
                 symbol,
                 timeframe=scanner_config.timeframe,
-                limit=scanner_config.limit,
+                limit=history_limit,
             )
         except Exception as exc:  # pragma: no cover - network errors
             print(f"[WARN] Failed to fetch OHLCV for {symbol}: {exc}")
@@ -1213,15 +1407,17 @@ def scan_symbols(
                     if block is not None
                     else "[n/a]"
                 )
+                block_type = block.block_type.upper() if block is not None else "N/A"
                 print(
                     "[MATCH] SYMBOL={symbol} SIDE={side} ENTRY={entry:.6f} SL={sl:.6f} "
-                    "TP={tp:.6f} BLOCK={block_range} TIME={time_str}".format(
+                    "TP={tp:.6f} BLOCK={block_range} BLOCK_TYPE={block_type} TIME={time_str}".format(
                         symbol=symbol,
                         side=signal.side.upper(),
                         entry=(signal.entry_price or latest_bar.close),
                         sl=(signal.stop_loss or latest_bar.close),
                         tp=(signal.take_profit or latest_bar.close),
                         block_range=block_range,
+                        block_type=block_type,
                         time_str=timestamp,
                     )
                 )
@@ -1260,6 +1456,7 @@ __all__ = [
     "LiquidityEvent",
     "LiquidityDetectionResult",
     "LiquiditySnapshot",
+    "HigherTimeframeLiquidityLevel",
     "OrderBlock",
     "OrderBlockEvent",
     "OrderBlockDetectionResult",
