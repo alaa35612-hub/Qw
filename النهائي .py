@@ -107,6 +107,33 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+class _OptionalBoolAction(argparse.Action):
+    """Argparse action that accepts optional true/false payloads."""
+
+    _TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+    _FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+
+    def __init__(self, option_strings, dest, **kwargs):  # type: ignore[override]
+        if "nargs" in kwargs:
+            raise ValueError("_OptionalBoolAction لا يدعم تحديد nargs خارجيًا")
+        super().__init__(option_strings, dest, nargs="?", **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
+        if values is None:
+            value = True
+        else:
+            token = str(values).strip().lower()
+            if token in self._TRUE_VALUES:
+                value = True
+            elif token in self._FALSE_VALUES:
+                value = False
+            else:
+                parser.error(
+                    f"قيمة منطقية غير صالحة '{values}' للخيار {option_string or self.option_strings}"
+                )
+        setattr(namespace, self.dest, value)
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
     timeframe: str = "1m"
@@ -9275,25 +9302,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def __router_main__():
     if len(sys.argv) == 1:
         defaults = EDITOR_AUTORUN_DEFAULTS
-        sys.argv += [
-            "-t", defaults.timeframe,
-            "-l", str(defaults.candle_limit),
-            "--max-symbols", str(defaults.max_symbols),
-            "--recent", str(defaults.recent_bars),
-            "--verbose",
+        autorun_args = [
+            "--timeframe",
+            defaults.timeframe,
+            "--lookback",
+            str(defaults.candle_limit),
+            "--max-age-bars",
+            str(max(1, defaults.recent_bars)),
         ]
-        if defaults.height_threshold is not None:
-            sys.argv += ["--min-change", str(defaults.height_threshold)]
-        if defaults.height_candle_window is not None:
-            sys.argv += ["--height-candles", str(defaults.height_candle_window)]
-        if defaults.height_scope:
-            sys.argv += ["--height-scope", str(defaults.height_scope)]
-        if defaults.height_metric:
-            sys.argv += ["--height-metric", str(defaults.height_metric)]
         if defaults.continuous_scan:
-            sys.argv.append("--continuous")
+            autorun_args.append("--continuous-scan=true")
         if defaults.scan_interval > 0:
-            sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
+            autorun_args += ["--scan-interval", str(defaults.scan_interval)]
+        return main(autorun_args)
     return main()
 
 
