@@ -1338,6 +1338,7 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         self._event_emission_guard: Dict[str, Dict[Any, int]] = defaultdict(dict)
         self._golden_zone_meta: Dict[int, Dict[str, Any]] = {}
+        self._circle_alert_state: Dict[str, Optional[int]] = {"bull": None, "bear": None}
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1756,6 +1757,39 @@ class SmartMoneyAlgoProE5:
             title = "New IDM OB Created" if key == "IDM_OB" else "New EXT OB Created"
             message = f"{{ticker}} {box.text} Created, Range: {price_range}"
             self.alertcondition(True, title, message, _new_logic=True)
+
+    def _prune_circle_alert_state(self) -> None:
+        for color_key, ts in list(self._circle_alert_state.items()):
+            if ts is None:
+                continue
+            if not self._console_event_within_age(ts):
+                self._circle_alert_state[color_key] = None
+
+    def _handle_circle_label_alert(self, label: Label) -> None:
+        if label.style != "label.style_circle":
+            return
+        bull_color = self.inputs.structure.bull
+        bear_color = self.inputs.structure.bear
+        event_time = label.x if isinstance(label.x, int) else self.series.get_time()
+        self._prune_circle_alert_state()
+        if label.color == bull_color:
+            if self._circle_alert_state.get("bear") is not None and self._should_emit_new_event(
+                "circle_green_with_red", id(label), event_time
+            ):
+                message = (
+                    f"{{ticker}} دائرة خضراء جديدة عند {format_price(label.y)} مع وجود دائرة حمراء سابقة"
+                )
+                self.alertcondition(True, "Green Circle with Previous Red", message, _new_logic=True)
+            self._circle_alert_state["bull"] = event_time
+        elif label.color == bear_color:
+            if self._circle_alert_state.get("bull") is not None and self._should_emit_new_event(
+                "circle_red_with_green", id(label), event_time
+            ):
+                message = (
+                    f"{{ticker}} دائرة حمراء جديدة عند {format_price(label.y)} مع وجود دائرة خضراء سابقة"
+                )
+                self.alertcondition(True, "Red Circle with Previous Green", message, _new_logic=True)
+            self._circle_alert_state["bear"] = event_time
 
     def _destroy_golden_zone(self) -> None:
         zone = getattr(self, "bxf", None)
@@ -6594,6 +6628,7 @@ class SmartMoneyAlgoProE5:
                 self.inputs.structure.bull if trend else self.inputs.structure.bear,
             )
             self.arrHLCircle.push(lbl)
+            self._handle_circle_label_alert(lbl)
         return y
 
     # ------------------------------------------------------------------
@@ -9259,7 +9294,7 @@ def __router_main__():
             sys.argv.append("--continuous")
         if defaults.scan_interval > 0:
             sys.argv += ["--continuous-interval", str(defaults.scan_interval)]
-    return _android_cli_entry()
+    return main()
 
 
 # ---------- Main ----------
