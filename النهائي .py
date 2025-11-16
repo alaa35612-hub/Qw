@@ -898,6 +898,7 @@ class StructureInputs:
     ote2: float = 0.61
     oteclr: str = "#ff95002b"
     sizGd: str = "size.normal"
+    enable_alert_ote_touch: bool = True
     showPdh: bool = False
     lengPdh: int = 40
     showPdl: bool = False
@@ -1381,6 +1382,12 @@ class SmartMoneyAlgoProE5:
         "retest": "إعادة اختبار",
         "archived": "محفوظة تاريخياً",
     }
+    ALERT_WHITELIST = {
+        "Golden Zone Created",
+        "Golden Zone First Touch",
+        "IDM OB Zone Created",
+        "EXT OB Zone Created",
+    }
 
     def label_new(
         self,
@@ -1434,17 +1441,20 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        if condition:
-            timestamp = self.series.get_time(0)
-            text = title if message is None else f"{title} :: {message}"
-            self.alerts.append((timestamp, text))
-            self._trace(
-                "alertcondition",
-                "trigger",
-                timestamp=timestamp,
-                title=title,
-                alert_message=message,
-            )
+        if not condition:
+            return
+        if title not in self.ALERT_WHITELIST:
+            return
+        timestamp = self.series.get_time(0)
+        text = title if message is None else f"{title} :: {message}"
+        self.alerts.append((timestamp, text))
+        self._trace(
+            "alertcondition",
+            "trigger",
+            timestamp=timestamp,
+            title=title,
+            alert_message=message,
+        )
 
     def _eval_condition(
         self,
@@ -2409,6 +2419,7 @@ class SmartMoneyAlgoProE5:
         self.bxf: Optional[Box] = None
         self.bxty = 0
         self.prev_oi1: float = NA
+        self.bxf_touched: bool = False
 
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
@@ -6151,6 +6162,111 @@ class SmartMoneyAlgoProE5:
         return val, valiIdx, idDirUP
 
     # ------------------------------------------------------------------
+    # Golden zone helpers
+    # ------------------------------------------------------------------
+    def _clear_golden_zone(self) -> None:
+        if isinstance(self.bxf, Box) and self.bxf in self.boxes:
+            self.boxes.remove(self.bxf)
+        self.bxf = None
+        self.bxty = 0
+        self.bxf_touched = False
+
+    def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
+        if not isinstance(self.bxf, Box):
+            return None
+        top = self.bxf.get_top()
+        bottom = self.bxf.get_bottom()
+        if math.isnan(top) or math.isnan(bottom):
+            return None
+        lower = min(top, bottom)
+        upper = max(top, bottom)
+        return lower, upper
+
+    def _spawn_golden_zone(
+        self,
+        left: float,
+        right: int,
+        ot: float,
+        ob: float,
+        dir_up: bool,
+    ) -> None:
+        self._clear_golden_zone()
+        top_val = ot if ot is not None and not math.isnan(ot) else self.series.get("high")
+        bottom_val = ob if ob is not None and not math.isnan(ob) else self.series.get("low")
+        if math.isnan(top_val) or math.isnan(bottom_val):
+            return
+        color = self.inputs.structure_util.oteclr
+        left_coord = int(left)
+        self.bxf = self.box_new(
+            left_coord,
+            right,
+            top_val,
+            bottom_val,
+            color,
+            text="Golden zone",
+            text_color=color,
+        )
+        if hasattr(self.bxf, "set_text_size"):
+            self.bxf.set_text_size(self.inputs.structure_util.sizGd)
+        self.bxf_touched = False
+        self.bxty = 1 if dir_up else -1
+
+    def _check_golden_zone_first_touch(
+        self,
+        high: float,
+        low: float,
+        zone_min: float,
+        zone_max: float,
+    ) -> None:
+        if not isinstance(self.bxf, Box) or self.bxf_touched:
+            return
+        if math.isnan(high) or math.isnan(low):
+            return
+        if low <= zone_max and high >= zone_min:
+            self.bxf_touched = True
+            self._register_box_event(self.bxf, status="touched", event_time=self.series.get_time(0))
+            if getattr(self.inputs.structure_util, "enable_alert_ote_touch", True):
+                price_range = f"{format_price(zone_min)} → {format_price(zone_max)}"
+                close_text = format_price(self.series.get("close"))
+                message = f"{{ticker}} Golden Zone First Touch, Range: {price_range}, Close: {close_text}"
+                self.alertcondition(True, "Golden Zone First Touch", message)
+
+    def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
+        prev_oi1 = None if is_na(self.prev_oi1) else float(self.prev_oi1)
+        bounds = self._golden_zone_bounds()
+        if self.bxf is not None:
+            self.bxf.set_right(time_val)
+            if bounds:
+                minb, maxb = bounds
+                invalidated = False
+                if self.bxty == 1 and low < minb:
+                    invalidated = True
+                elif self.bxty == -1 and high > maxb:
+                    invalidated = True
+                if invalidated:
+                    self._clear_golden_zone()
+                    bounds = None
+                else:
+                    self._check_golden_zone_first_touch(high, low, minb, maxb)
+        ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
+        ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
+        oi1_value: Optional[float] = None
+        if oi1 is not None and not math.isnan(oi1):
+            oi1_value = float(oi1)
+        if oi1_value is not None:
+            create_zone = False
+            if self.bxty == 0:
+                create_zone = prev_oi1 is None or oi1_value != prev_oi1
+            else:
+                create_zone = True
+            if create_zone:
+                self._spawn_golden_zone(oi1_value, time_val, ot, ob, dir_up)
+                bounds = self._golden_zone_bounds()
+                if bounds:
+                    self._check_golden_zone_first_touch(high, low, bounds[0], bounds[1])
+            self.prev_oi1 = oi1_value
+
+    # ------------------------------------------------------------------
     # High level drawing helpers
     # ------------------------------------------------------------------
     def drawIDM(self, trend: bool) -> Optional[Box]:
@@ -7208,21 +7324,9 @@ class SmartMoneyAlgoProE5:
         self.drawPrevStrc(self.inputs.structure_util.showMid, self.MID_TEXT, "mid_label", "mid_line", 0.0)
 
         if self.inputs.structure_util.isOTE:
-            if self.bxf is not None:
-                self.bxf.set_right(time_val)
-            ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
-            ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
-            if oi1 is not None:
-                if self.bxf and self.bxf in self.boxes:
-                    self.boxes.remove(self.bxf)
-                top_val = ot if not math.isnan(ot) else self.series.get("high")
-                bot_val = ob if not math.isnan(ob) else self.series.get("low")
-                self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
-                self.bxf.set_text("Golden zone")
-                self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
-                self.bxty = 1 if dir_up else -1
-                self.prev_oi1 = float(oi1)
+            self._update_golden_zone(time_val, high, low)
+        else:
+            self._clear_golden_zone()
 
         self._sync_state_mirrors()
 
@@ -9595,7 +9699,11 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
     ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)  # canonicalized inside
     ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=not args.no_ote, markX=not args.no_mark_x)
+    utils = StructureInputs(
+        isOTE=not args.no_ote,
+        markX=not args.no_mark_x,
+        enable_alert_ote_touch=not args.no_ote_alert,
+    )
 
     inputs = IndicatorInputs(
         pullback=pullback,
@@ -10321,7 +10429,11 @@ def _android_cli_entry() -> int:
     liq = LiquidityInputs(currentTF=cfg.show_liquidity, displayLimit=int(cfg.liquidity_display_limit))
     ds = DemandSupplyInputs(mittigation_filt=cfg.ob_test_mode)
     ob = OrderBlockInputs(poi_type=cfg.zone_type)
-    utils = StructureInputs(isOTE=cfg.show_ote, markX=cfg.show_mark_x)
+    utils = StructureInputs(
+        isOTE=cfg.show_ote,
+        markX=cfg.show_mark_x,
+        enable_alert_ote_touch=getattr(cfg, "enable_alert_ote_touch", True),
+    )
     ict = ICTMarketStructureInputs(swingSize=int(cfg.swing_size))
 
     inputs = IndicatorInputs(
