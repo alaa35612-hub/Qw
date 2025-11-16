@@ -1336,6 +1336,8 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self._event_emission_guard: Dict[str, Dict[Any, int]] = defaultdict(dict)
+        self._golden_zone_meta: Dict[int, Dict[str, Any]] = {}
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1419,7 +1421,7 @@ class SmartMoneyAlgoProE5:
     ) -> Box:
         bx = Box(left, right, top, bottom, color, color, text=text, text_color=text_color)
         self.boxes.append(bx)
-        self._register_box_event(bx, status="new")
+        self._register_box_event(bx, status="new", event_time=self.series.get_time())
         self._trace("box.new", "create", timestamp=right, left=left, right=right, top=top, bottom=bottom, color=color, text=text)
         return bx
 
@@ -1433,7 +1435,16 @@ class SmartMoneyAlgoProE5:
         self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
-    def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
+    def alertcondition(
+        self,
+        condition: bool,
+        title: str,
+        message: Optional[str] = None,
+        *,
+        _new_logic: bool = False,
+    ) -> None:
+        if not _new_logic:
+            return
         if condition:
             timestamp = self.series.get_time(0)
             text = title if message is None else f"{title} :: {message}"
@@ -1659,17 +1670,108 @@ class SmartMoneyAlgoProE5:
                 bottom=box.bottom,
                 status=status,
             )
+            self._handle_box_alerts(key, status_key, box, ts)
+
+    def _format_box_range(self, box: Box) -> str:
+        lower, upper = self._zone_bounds(box)
+        if math.isnan(lower) or math.isnan(upper):
+            return f"{format_price(box.bottom)} → {format_price(box.top)}"
+        return f"{format_price(lower)} → {format_price(upper)}"
+
+    def _zone_bounds(self, box: Box) -> Tuple[float, float]:
+        top = float(box.top)
+        bottom = float(box.bottom)
+        if math.isnan(top) or math.isnan(bottom):
+            return bottom, top
+        upper = max(top, bottom)
+        lower = min(top, bottom)
+        return lower, upper
+
+    def _box_contains_price(self, box: Box, high: float, low: float) -> bool:
+        if math.isnan(high) or math.isnan(low):
+            return False
+        lower, upper = self._zone_bounds(box)
+        if math.isnan(lower) or math.isnan(upper):
+            return False
+        return low <= upper and high >= lower
+
+    def _zone_touched_within_bars(self, box: Box, bars: int) -> bool:
+        if bars <= 0:
+            return False
+        available = min(bars, self.series.length())
+        for offset in range(available):
+            high = self.series.get("high", offset)
+            low = self.series.get("low", offset)
+            if self._box_contains_price(box, high, low):
+                return True
+        return False
+
+    def _should_emit_new_event(self, bucket: str, identifier: Any, event_time: Optional[int]) -> bool:
+        if isinstance(event_time, (int, float)):
+            ts = int(event_time)
+        else:
+            ts = self.series.get_time()
+        if not self._console_event_within_age(ts):
+            return False
+        bucket_map = self._event_emission_guard[bucket]
+        if identifier in bucket_map:
+            return False
+        bucket_map[identifier] = ts
+        return True
+
+    def _handle_box_alerts(self, key: Optional[str], status_key: str, box: Box, event_time: int) -> None:
+        if key is None:
+            return
+        identifier = id(box)
+        price_range = self._format_box_range(box)
+        if key == "GOLDEN_ZONE":
             if status_key == "new":
-                alert_titles = {
-                    "IDM_OB": "IDM OB Zone Created",
-                    "EXT_OB": "EXT OB Zone Created",
-                    "GOLDEN_ZONE": "Golden Zone Created",
-                }
-                alert_title = alert_titles.get(key)
-                if alert_title:
-                    price_range = f"{format_price(box.bottom)} → {format_price(box.top)}"
-                    message = f"{{ticker}} {box.text} Created, Range: {price_range}"
-                    self.alertcondition(True, alert_title, message)
+                if self._zone_touched_within_bars(box, self.console_max_age_bars):
+                    return
+                if self._should_emit_new_event("golden_zone_new", identifier, event_time):
+                    message = f"{{ticker}} Golden zone ready, Range: {price_range}"
+                    self.alertcondition(
+                        True,
+                        "New Untouched Golden Zone",
+                        message,
+                        _new_logic=True,
+                    )
+            elif status_key == "touched":
+                if self._should_emit_new_event("golden_zone_touch", identifier, event_time):
+                    message = (
+                        f"{{ticker}} Golden zone first touch at {format_timestamp(event_time)}; "
+                        f"Range: {price_range}"
+                    )
+                    self.alertcondition(
+                        True,
+                        "Golden Zone First Touch",
+                        message,
+                        _new_logic=True,
+                    )
+            return
+        if status_key == "new" and key in {"IDM_OB", "EXT_OB"}:
+            bucket = f"{key.lower()}_new"
+            if not self._should_emit_new_event(bucket, identifier, event_time):
+                return
+            title = "New IDM OB Created" if key == "IDM_OB" else "New EXT OB Created"
+            message = f"{{ticker}} {box.text} Created, Range: {price_range}"
+            self.alertcondition(True, title, message, _new_logic=True)
+
+    def _check_golden_zone_first_touch(self) -> None:
+        zone = getattr(self, "bxf", None)
+        if not isinstance(zone, Box):
+            return
+        zone_meta = self._golden_zone_meta.get(id(zone))
+        if zone_meta is None or zone_meta.get("touched"):
+            return
+        high = self.series.get("high")
+        low = self.series.get("low")
+        if not self._box_contains_price(zone, high, low):
+            return
+        touch_time = self.series.get_time()
+        zone_meta["touched"] = True
+        zone_meta["touch_time"] = touch_time
+        self._register_box_event(zone, status="touched", event_time=touch_time)
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
@@ -6177,7 +6279,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", event_time=self.series.get_time())
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6203,7 +6305,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", event_time=self.series.get_time())
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6260,7 +6362,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", event_time=self.series.get_time())
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6286,7 +6388,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", event_time=self.series.get_time())
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -7213,17 +7315,28 @@ class SmartMoneyAlgoProE5:
             ot, oi1, dir_up = self.drawPrevStrc(True, "", "mid_label1", "mid_line1", self.inputs.structure_util.ote1)
             ob, _, _ = self.drawPrevStrc(True, "", "mid_label2", "mid_line2", self.inputs.structure_util.ote2)
             if oi1 is not None:
-                if self.bxf and self.bxf in self.boxes:
-                    self.boxes.remove(self.bxf)
+                if self.bxf is not None:
+                    self._golden_zone_meta.pop(id(self.bxf), None)
+                    if self.bxf in self.boxes:
+                        self.boxes.remove(self.bxf)
                 top_val = ot if not math.isnan(ot) else self.series.get("high")
                 bot_val = ob if not math.isnan(ob) else self.series.get("low")
                 self.bxf = self.box_new(int(oi1), time_val, top_val, bot_val, self.inputs.structure_util.oteclr)
                 self.bxf.set_text("Golden zone")
                 self.bxf.set_text_color(self.inputs.structure_util.oteclr)
-                self._register_box_event(self.bxf, status="new")
+                self._register_box_event(
+                    self.bxf,
+                    status="new",
+                    event_time=self.series.get_time(),
+                )
+                self._golden_zone_meta[id(self.bxf)] = {
+                    "created": self.series.get_time(),
+                    "touched": False,
+                }
                 self.bxty = 1 if dir_up else -1
                 self.prev_oi1 = float(oi1)
 
+        self._check_golden_zone_first_touch()
         self._sync_state_mirrors()
 
 
