@@ -133,6 +133,33 @@ EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
 
 
 @dataclass(frozen=True)
+class AlertToggleConfig:
+    bearish_external_ob: bool = True
+    bullish_external_ob: bool = True
+    bearish_internal_ob: bool = True
+    bullish_internal_ob: bool = True
+    bullish_ob_break: bool = True
+    bearish_ob_break: bool = True
+    bullish_sweep: bool = True
+    bearish_sweep: bool = True
+    bullish_fvg: bool = True
+    bearish_fvg: bool = True
+    bullish_fvg_break: bool = True
+    bearish_fvg_break: bool = True
+    high_liquidity_level: bool = True
+    low_liquidity_level: bool = True
+    high_liquidity_level_break: bool = True
+    low_liquidity_level_break: bool = True
+    golden_zone_created: bool = True
+    golden_zone_first_touch: bool = True
+    idm_ob_created: bool = True
+    ext_ob_created: bool = True
+
+
+DEFAULT_ALERT_TOGGLES = AlertToggleConfig()
+
+
+@dataclass(frozen=True)
 class BinanceSymbolSelectorConfig:
     """User-facing switches controlling Binance symbol prioritisation."""
 
@@ -1106,6 +1133,7 @@ class IndicatorInputs:
     swing_detection: SwingDetectionInputs = field(default_factory=SwingDetectionInputs)
     zigzag: ZigZagInputs = field(default_factory=ZigZagInputs)
     support_resistance: SupportResistanceInputs = field(default_factory=SupportResistanceInputs)
+    alert_toggles: AlertToggleConfig = field(default_factory=lambda: DEFAULT_ALERT_TOGGLES)
 
 
 @dataclass
@@ -1346,6 +1374,7 @@ class SmartMoneyAlgoProE5:
             except (TypeError, ValueError):
                 max_age = 1
         self.console_max_age_bars = max(1, max_age)
+        self.alert_toggles: AlertToggleConfig = getattr(self.inputs, "alert_toggles", DEFAULT_ALERT_TOGGLES)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1384,9 +1413,49 @@ class SmartMoneyAlgoProE5:
     }
     ALERT_WHITELIST = {
         "Golden Zone Created",
+        "Golden Zone Created (Untouched)",
         "Golden Zone First Touch",
         "IDM OB Zone Created",
         "EXT OB Zone Created",
+        "Bearish External OB",
+        "Bullish External OB",
+        "Bearish Internal OB",
+        "Bullish Internal OB",
+        "Bullish OB Break",
+        "Bearish OB Break",
+        "Bullish Sweep",
+        "Bearish Sweep",
+        "Bullish FVG",
+        "Bearish FVG",
+        "Bullish FVG Break",
+        "Bearish FVG Break",
+        "High Liquidity Level",
+        "Low Liquidity Level",
+        "High Liquidity Level Break",
+        "Low Liquidity Level Break",
+    }
+    ALERT_TITLE_TOGGLE_MAP = {
+        "Golden Zone Created": "golden_zone_created",
+        "Golden Zone Created (Untouched)": "golden_zone_created",
+        "Golden Zone First Touch": "golden_zone_first_touch",
+        "IDM OB Zone Created": "idm_ob_created",
+        "EXT OB Zone Created": "ext_ob_created",
+        "Bearish External OB": "bearish_external_ob",
+        "Bullish External OB": "bullish_external_ob",
+        "Bearish Internal OB": "bearish_internal_ob",
+        "Bullish Internal OB": "bullish_internal_ob",
+        "Bullish OB Break": "bullish_ob_break",
+        "Bearish OB Break": "bearish_ob_break",
+        "Bullish Sweep": "bullish_sweep",
+        "Bearish Sweep": "bearish_sweep",
+        "Bullish FVG": "bullish_fvg",
+        "Bearish FVG": "bearish_fvg",
+        "Bullish FVG Break": "bullish_fvg_break",
+        "Bearish FVG Break": "bearish_fvg_break",
+        "High Liquidity Level": "high_liquidity_level",
+        "Low Liquidity Level": "low_liquidity_level",
+        "High Liquidity Level Break": "high_liquidity_level_break",
+        "Low Liquidity Level Break": "low_liquidity_level_break",
     }
 
     def label_new(
@@ -1444,6 +1513,10 @@ class SmartMoneyAlgoProE5:
         if not condition:
             return
         if title not in self.ALERT_WHITELIST:
+            return
+        toggle_key = self.ALERT_TITLE_TOGGLE_MAP.get(title)
+        toggles = getattr(self, "alert_toggles", None)
+        if toggle_key and toggles is not None and not getattr(toggles, toggle_key, True):
             return
         timestamp = self.series.get_time(0)
         text = title if message is None else f"{title} :: {message}"
