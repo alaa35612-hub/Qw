@@ -1521,6 +1521,24 @@ class SmartMoneyAlgoProE5:
         timestamp = self.series.get_time(0)
         text = title if message is None else f"{title} :: {message}"
         self.alerts.append((timestamp, text))
+        price_value = self.series.get("close")
+        if isinstance(price_value, (int, float)) and not math.isnan(price_value):
+            price_display = format_price(price_value)
+        else:
+            price_display = "N/A"
+        key = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_").upper()
+        key = f"ALERT_{key}" if key else "ALERT_GENERIC"
+        display = f"{title} @ {price_display}"
+        if message:
+            display = f"{display} :: {message}"
+        self.console_event_log[key] = {
+            "text": title,
+            "price": price_value,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": display,
+            "message": message or "",
+        }
         self._trace(
             "alertcondition",
             "trigger",
