@@ -9039,6 +9039,7 @@ def scan_binance(
             continue
         candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
+        runtime.console_max_age_bars = max(runtime.console_max_age_bars, window)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
         latest_events = metrics.get("latest_events") or {}
@@ -9087,6 +9088,7 @@ def scan_binance(
             primary_runtime = runtime
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
+        primary_runtime.console_max_age_bars = max(primary_runtime.console_max_age_bars, window)
         primary_runtime.process([])
     return primary_runtime, summaries
 
@@ -9868,6 +9870,7 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             if cfg.drop_last_incomplete and candles:
                 candles = candles[:-1]
             runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
+            runtime.console_max_age_bars = max(runtime.console_max_age_bars, recent_window)
             runtime._bos_break_source = cfg.bos_confirmation
             runtime._strict_close_for_break = cfg.strict_close_for_break
             runtime.process(candles)
@@ -9897,7 +9900,8 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
             recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
 
         summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
+        summary_keys = [key for key, _ in EVENT_DISPLAY_ORDER]
+        for key in summary_keys:
             if key in latest:
                 evt = latest[key]
                 disp = evt.get("display", "")
