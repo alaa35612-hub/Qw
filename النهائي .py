@@ -1493,26 +1493,43 @@ class SmartMoneyAlgoProE5:
         toggles = getattr(self, "alert_toggles", None)
         if toggle_key and toggles is not None and not getattr(toggles, toggle_key, True):
             return
+
         timestamp = self.series.get_time(0)
-        text = title if message is None else f"{title} :: {message}"
-        self.alerts.append((timestamp, text))
         price_value = self.series.get("close")
         if isinstance(price_value, (int, float)) and not math.isnan(price_value):
             price_display = format_price(price_value)
         else:
+            price_value = NA
             price_display = "N/A"
+
+        symbol = getattr(self, "symbol", None) or getattr(self.inputs, "symbol", "") or ""
+        when_display = format_timestamp(timestamp)
+
+        resolved_message = message or ""
+        for pattern in ("{ticker}", "{{ticker}}"):
+            resolved_message = resolved_message.replace(pattern, symbol or "")
+        for pattern in ("{close}", "{{close}}"):
+            resolved_message = resolved_message.replace(pattern, price_display)
+        for pattern in ("{time}", "{{time}}"):
+            resolved_message = resolved_message.replace(pattern, when_display)
+
+        title_with_price = f"{title} @ {price_display}" if price_display else title
+        if symbol:
+            title_with_price = f"{symbol} {title_with_price}"
+        display = title_with_price if not resolved_message else f"{title_with_price} :: {resolved_message}"
+
+        self.alerts.append((timestamp, display))
+
         key = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_").upper()
         key = f"ALERT_{key}" if key else "ALERT_GENERIC"
-        display = f"{title} @ {price_display}"
-        if message:
-            display = f"{display} :: {message}"
         self.console_event_log[key] = {
             "text": title,
             "price": price_value,
             "time": timestamp,
-            "time_display": format_timestamp(timestamp),
+            "time_display": when_display,
             "display": display,
-            "message": message or "",
+            "message": resolved_message,
+            "symbol": symbol,
         }
         self._trace(
             "alertcondition",
