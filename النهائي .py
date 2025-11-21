@@ -1411,29 +1411,6 @@ class SmartMoneyAlgoProE5:
         "retest": "إعادة اختبار",
         "archived": "محفوظة تاريخياً",
     }
-    ALERT_WHITELIST = {
-        "Golden Zone Created",
-        "Golden Zone Created (Untouched)",
-        "Golden Zone First Touch",
-        "IDM OB Zone Created",
-        "EXT OB Zone Created",
-        "Bearish External OB",
-        "Bullish External OB",
-        "Bearish Internal OB",
-        "Bullish Internal OB",
-        "Bullish OB Break",
-        "Bearish OB Break",
-        "Bullish Sweep",
-        "Bearish Sweep",
-        "Bullish FVG",
-        "Bearish FVG",
-        "Bullish FVG Break",
-        "Bearish FVG Break",
-        "High Liquidity Level",
-        "Low Liquidity Level",
-        "High Liquidity Level Break",
-        "Low Liquidity Level Break",
-    }
     ALERT_TITLE_TOGGLE_MAP = {
         "Golden Zone Created": "golden_zone_created",
         "Golden Zone Created (Untouched)": "golden_zone_created",
@@ -1511,8 +1488,6 @@ class SmartMoneyAlgoProE5:
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
         if not condition:
-            return
-        if title not in self.ALERT_WHITELIST:
             return
         toggle_key = self.ALERT_TITLE_TOGGLE_MAP.get(title)
         toggles = getattr(self, "alert_toggles", None)
