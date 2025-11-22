@@ -9601,6 +9601,26 @@ _AR_KEYS = {
 }
 # Buckets for "latest per logic"
 _LAST_BUCKETS = {
+    "Bullish FVG": ["bullish fvg", "fvg up", "fvg صاعدة"],
+    "Bearish FVG": ["bearish fvg", "fvg down", "fvg هابطة"],
+    "Bullish FVG Break": ["bullish fvg break", "fvg break up"],
+    "Bearish FVG Break": ["bearish fvg break", "fvg break down"],
+    "Bullish External OB": ["bullish external ob", "ext ob bull"],
+    "Bearish External OB": ["bearish external ob", "ext ob bear"],
+    "Bullish Internal OB": ["bullish internal ob", "idm ob bull"],
+    "Bearish Internal OB": ["bearish internal ob", "idm ob bear"],
+    "Bullish OB Break": ["bullish ob break"],
+    "Bearish OB Break": ["bearish ob break"],
+    "Bullish Sweep": ["bullish sweep"],
+    "Bearish Sweep": ["bearish sweep"],
+    "Bullish MSS": ["bullish mss"],
+    "Bearish MSS": ["bearish mss"],
+    "Bullish BOS": ["bullish bos"],
+    "Bearish BOS": ["bearish bos"],
+    "Bullish MSS+": ["bullish mss+", "bullish mss plus"],
+    "Bearish MSS+": ["bearish mss+", "bearish mss plus"],
+    "Bullish BOS+": ["bullish bos+", "bullish bos plus"],
+    "Bearish BOS+": ["bearish bos+", "bearish bos plus"],
     "BOS": ["bos", "b 0 s"],
     "CHOCH": ["choch", "ch o ch"],
     "Golden zone": ["golden zone"],
@@ -9614,6 +9634,26 @@ _LAST_BUCKETS = {
 }
 # ---- Bind to indicator metrics if available ----
 _METRIC_MAP = {
+    "Bullish FVG": ["BULLISH_FVG", "bullish_fvg"],
+    "Bearish FVG": ["BEARISH_FVG", "bearish_fvg"],
+    "Bullish FVG Break": ["BULLISH_FVG_BREAK", "bullish_fvg_break"],
+    "Bearish FVG Break": ["BEARISH_FVG_BREAK", "bearish_fvg_break"],
+    "Bullish External OB": ["BULLISH_EXT_OB", "bullish_ext_ob"],
+    "Bearish External OB": ["BEARISH_EXT_OB", "bearish_ext_ob"],
+    "Bullish Internal OB": ["BULLISH_IDM_OB", "bullish_idm_ob"],
+    "Bearish Internal OB": ["BEARISH_IDM_OB", "bearish_idm_ob"],
+    "Bullish OB Break": ["BULLISH_OB_BREAK", "bullish_ob_break"],
+    "Bearish OB Break": ["BEARISH_OB_BREAK", "bearish_ob_break"],
+    "Bullish Sweep": ["BULLISH_SWEEP", "bullish_sweep"],
+    "Bearish Sweep": ["BEARISH_SWEEP", "bearish_sweep"],
+    "Bullish MSS": ["BULLISH_MSS", "bullish_mss"],
+    "Bearish MSS": ["BEARISH_MSS", "bearish_mss"],
+    "Bullish BOS": ["BULLISH_BOS", "bullish_bos"],
+    "Bearish BOS": ["BEARISH_BOS", "bearish_bos"],
+    "Bullish MSS+": ["BULLISH_MSS_PLUS", "bullish_mss_plus"],
+    "Bearish MSS+": ["BEARISH_MSS_PLUS", "bearish_mss_plus"],
+    "Bullish BOS+": ["BULLISH_BOS_PLUS", "bullish_bos_plus"],
+    "Bearish BOS+": ["BEARISH_BOS_PLUS", "bearish_bos_plus"],
     "BOS": ["BOS", "bos"],
     "CHOCH": ["CHOCH", "choch"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
@@ -9785,11 +9825,11 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
+    latest = _extract_latest_from_runtime(runtime)
+    if not latest:
         print("—")
     else:
         # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
         for name in _LAST_BUCKETS.keys():
             item = latest.get(name)
             if not item:
@@ -10000,6 +10040,26 @@ _AR_KEYS = {
 
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
+    "Bullish FVG": ["bullish fvg","fvg up","fvg صاعدة"],
+    "Bearish FVG": ["bearish fvg","fvg down","fvg هابطة"],
+    "Bullish FVG Break": ["bullish fvg break","fvg break up"],
+    "Bearish FVG Break": ["bearish fvg break","fvg break down"],
+    "Bullish External OB": ["bullish external ob","ext ob bull"],
+    "Bearish External OB": ["bearish external ob","ext ob bear"],
+    "Bullish Internal OB": ["bullish internal ob","idm ob bull"],
+    "Bearish Internal OB": ["bearish internal ob","idm ob bear"],
+    "Bullish OB Break": ["bullish ob break"],
+    "Bearish OB Break": ["bearish ob break"],
+    "Bullish Sweep": ["bullish sweep"],
+    "Bearish Sweep": ["bearish sweep"],
+    "Bullish MSS": ["bullish mss"],
+    "Bearish MSS": ["bearish mss"],
+    "Bullish BOS": ["bullish bos"],
+    "Bearish BOS": ["bearish bos"],
+    "Bullish MSS+": ["bullish mss+","bullish mss plus"],
+    "Bearish MSS+": ["bearish mss+","bearish mss plus"],
+    "Bullish BOS+": ["bullish bos+","bullish bos plus"],
+    "Bearish BOS+": ["bearish bos+","bearish bos plus"],
     "BOS": ["bos","b 0 s"],
     "CHOCH": ["choch","ch o ch"],
     "Golden zone": ["golden zone","gz"],
@@ -10053,6 +10113,26 @@ _INT_KEYS = [
 ]
 
 _METRIC_MAP = {
+    "Bullish FVG": ["BULLISH_FVG","bullish_fvg"],
+    "Bearish FVG": ["BEARISH_FVG","bearish_fvg"],
+    "Bullish FVG Break": ["BULLISH_FVG_BREAK","bullish_fvg_break"],
+    "Bearish FVG Break": ["BEARISH_FVG_BREAK","bearish_fvg_break"],
+    "Bullish External OB": ["BULLISH_EXT_OB","bullish_ext_ob"],
+    "Bearish External OB": ["BEARISH_EXT_OB","bearish_ext_ob"],
+    "Bullish Internal OB": ["BULLISH_IDM_OB","bullish_idm_ob"],
+    "Bearish Internal OB": ["BEARISH_IDM_OB","bearish_idm_ob"],
+    "Bullish OB Break": ["BULLISH_OB_BREAK","bullish_ob_break"],
+    "Bearish OB Break": ["BEARISH_OB_BREAK","bearish_ob_break"],
+    "Bullish Sweep": ["BULLISH_SWEEP","bullish_sweep"],
+    "Bearish Sweep": ["BEARISH_SWEEP","bearish_sweep"],
+    "Bullish MSS": ["BULLISH_MSS","bullish_mss"],
+    "Bearish MSS": ["BEARISH_MSS","bearish_mss"],
+    "Bullish BOS": ["BULLISH_BOS","bullish_bos"],
+    "Bearish BOS": ["BEARISH_BOS","bearish_bos"],
+    "Bullish MSS+": ["BULLISH_MSS_PLUS","bullish_mss_plus"],
+    "Bearish MSS+": ["BEARISH_MSS_PLUS","bearish_mss_plus"],
+    "Bullish BOS+": ["BULLISH_BOS_PLUS","bullish_bos_plus"],
+    "Bearish BOS+": ["BEARISH_BOS_PLUS","bearish_bos_plus"],
     "BOS": ["BOS","bos","b 0 s"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
