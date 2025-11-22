@@ -107,9 +107,47 @@ ANSI_HEADER_COLORS = [
 ]
 
 
+# ============================================================================
+# ========== STRATEGY CONFIGURATION (timeframes, risk, symbols) ==============
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class TimeframeConfig:
+    """Centralised timeframe knobs for quick tuning from the top of the file."""
+
+    base: str = "1m"  # الإطار الرئيسي للماسح اللحظي
+    analysis: str = "15m"  # إطار تحليلي بديل للتقارير أو الفلاتر الإضافية
+    htf: str = "1h"  # إطار أعلى لتأكيد الهيكل السعري (HTF)
+    session_london: str = "15m"  # يفضّل 15m لتقسيم جلسة لندن
+    session_newyork: str = "15m"  # يفضّل 15m لجلسة نيويورك
+    data_scan: str = "1m"  # إطار جلب البيانات الحي للماسح
+
+
+@dataclass(frozen=True)
+class DateRangeConfig:
+    """تحديد فترة البيانات التاريخية للاختبار السريع."""
+
+    start: str = "2022-01-01"
+    end: str = "2023-12-31"
+
+
+@dataclass(frozen=True)
+class CapitalConfig:
+    """Basic capital and risk settings shared across strategy presets."""
+
+    equity: float = 100.0
+    risk_pct: float = 2.0
+
+
+TIMEFRAMES = TimeframeConfig()
+HISTORICAL_RANGE = DateRangeConfig()
+CAPITAL = CapitalConfig()
+
+
 @dataclass(frozen=True)
 class _EditorAutorunDefaults:
-    timeframe: str = "1m"
+    timeframe: str = TIMEFRAMES.data_scan
     candle_limit: int = 500
     max_symbols: int = 600
     recent_bars: int = 2
@@ -145,7 +183,7 @@ class BinanceSymbolSelectorConfig:
     prioritize_top_gainers: bool = True
     top_gainer_metric: str = "percentage"  # {percentage, pricechange, lastprice}
     top_gainer_threshold: Optional[float] = 5
-    top_gainer_scope: Optional[str] = "1m"
+    top_gainer_scope: Optional[str] = TIMEFRAMES.data_scan
     top_gainer_candle_window: Optional[int] = 10
 
 DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
@@ -159,48 +197,77 @@ class StrategyAutorunConfig:
 
     strategy: str = "ICT 2022"
     symbols: str = "BTCUSDT"
-    start: str = "2022-01-01"
-    end: str = "2023-12-31"
-    equity: float = 100.0
-    risk_pct: float = 2.0
+    start: str = HISTORICAL_RANGE.start
+    end: str = HISTORICAL_RANGE.end
+    equity: float = CAPITAL.equity
+    risk_pct: float = CAPITAL.risk_pct
     ny_offset: int = -4
     live: bool = False
     csv: Optional[str] = None
 
 
+def _default_strategy_profile_overrides() -> Dict[str, Dict[str, Any]]:
+    return {
+        "ICT 2022": {"risk_pct": 2.0, "ny_offset": -4},
+        "Silver Bullet": {"risk_pct": 1.5, "ny_offset": -4},
+        "Judas Swing": {"risk_pct": 1.5, "ny_offset": -4},
+        "Turtle Soup": {"risk_pct": 1.25, "ny_offset": -4},
+        "OTE": {"risk_pct": 2.0, "ny_offset": -4},
+        "PO3": {"risk_pct": 1.75, "ny_offset": -4},
+        "Liquidity Sweep + OB": {"risk_pct": 1.5, "ny_offset": -4},
+        "Breaker Block": {"risk_pct": 1.5, "ny_offset": -4},
+        "FVG Continuation": {"risk_pct": 1.25, "ny_offset": -4},
+        "OSOK": {"risk_pct": 1.0, "ny_offset": -4, "symbols": "BTCUSDT,ETHUSDT"},
+    }
+
+
+def _default_strategy_enable_flags() -> Dict[str, bool]:
+    return {
+        "ICT 2022": True,
+        "Silver Bullet": True,
+        "Judas Swing": True,
+        "Turtle Soup": True,
+        "OTE": True,
+        "PO3": True,
+        "Liquidity Sweep + OB": True,
+        "Breaker Block": True,
+        "FVG Continuation": True,
+        "OSOK": True,
+    }
+
+
+@dataclass(frozen=True)
+class StrategyUserConfig:
+    """Unified config surface for scanner, risk, and timeframe tuning."""
+
+    autorun_mode: str = "strategies"  # اختر بين events / strategies
+    timeframes: TimeframeConfig = TIMEFRAMES
+    date_range: DateRangeConfig = HISTORICAL_RANGE
+    capital: CapitalConfig = CAPITAL
+    strategy_overrides: Dict[str, Dict[str, Any]] = dataclasses.field(
+        default_factory=_default_strategy_profile_overrides
+    )
+    strategy_enable_flags: Dict[str, bool] = dataclasses.field(
+        default_factory=_default_strategy_enable_flags
+    )
+    editor_autorun: _EditorAutorunDefaults = EDITOR_AUTORUN_DEFAULTS
+    binance_selector: BinanceSymbolSelectorConfig = DEFAULT_BINANCE_SYMBOL_SELECTOR
+
+
+GLOBAL_STRATEGY_CONFIG = StrategyUserConfig()
+
+
 # اختر وضع التشغيل الافتراضي من هنا بدون الحاجة لتعديل بقية الشيفرة.
 # - "events": تشغيل ماسح الأحداث/التنبيهات.
 # - "strategies": تشغيل ماسح الاستراتيجيات (Top 10 ICT) باستخدام الإعدادات أدناه.
-AUTORUN_MODE: str = "strategies"
+AUTORUN_MODE: str = GLOBAL_STRATEGY_CONFIG.autorun_mode
 
 # إعدادات مخصّصة لكل استراتيجية (يمكن تعديلها من الأعلى بسهولة).
 # أي قيمة غير مذكورة هنا ستعود إلى قيم STRATEGY_AUTORUN_DEFAULTS أو معاملات سطر الأوامر.
-STRATEGY_PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
-    "ICT 2022": {"risk_pct": 2.0, "ny_offset": -4},
-    "Silver Bullet": {"risk_pct": 1.5, "ny_offset": -4},
-    "Judas Swing": {"risk_pct": 1.5, "ny_offset": -4},
-    "Turtle Soup": {"risk_pct": 1.25, "ny_offset": -4},
-    "OTE": {"risk_pct": 2.0, "ny_offset": -4},
-    "PO3": {"risk_pct": 1.75, "ny_offset": -4},
-    "Liquidity Sweep + OB": {"risk_pct": 1.5, "ny_offset": -4},
-    "Breaker Block": {"risk_pct": 1.5, "ny_offset": -4},
-    "FVG Continuation": {"risk_pct": 1.25, "ny_offset": -4},
-    "OSOK": {"risk_pct": 1.0, "ny_offset": -4, "symbols": "BTCUSDT,ETHUSDT"},
-}
+STRATEGY_PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = GLOBAL_STRATEGY_CONFIG.strategy_overrides
 
 # مفاتيح لتفعيل/تعطيل كل استراتيجية من الأعلى بسرعة.
-STRATEGY_ENABLE_FLAGS: Dict[str, bool] = {
-    "ICT 2022": True,
-    "Silver Bullet": True,
-    "Judas Swing": True,
-    "Turtle Soup": True,
-    "OTE": True,
-    "PO3": True,
-    "Liquidity Sweep + OB": True,
-    "Breaker Block": True,
-    "FVG Continuation": True,
-    "OSOK": True,
-}
+STRATEGY_ENABLE_FLAGS: Dict[str, bool] = GLOBAL_STRATEGY_CONFIG.strategy_enable_flags
 
 STRATEGY_CHOICES: Tuple[str, ...] = tuple(STRATEGY_PROFILE_OVERRIDES.keys())
 
@@ -221,6 +288,10 @@ _DEFAULT_AUTORUN_STRATEGY = ENABLED_STRATEGY_CHOICES[0] if ENABLED_STRATEGY_CHOI
 STRATEGY_AUTORUN_DEFAULTS = StrategyAutorunConfig(
     strategy=_DEFAULT_AUTORUN_STRATEGY,
     symbols=ALL_BINANCE_USDTM_TOKEN,
+    start=HISTORICAL_RANGE.start,
+    end=HISTORICAL_RANGE.end,
+    equity=CAPITAL.equity,
+    risk_pct=CAPITAL.risk_pct,
     live=True,
 )
 
@@ -8954,8 +9025,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Smart Money Algo Pro E5 Python port")
     parser.add_argument("--data", type=Path, help="JSON file with OHLCV candles", required=False)
     parser.add_argument("--outfile", type=Path, default=Path("FINAL_REPORT_SMART_MONEY_ANALYSIS.md"))
-    parser.add_argument("--timeframe", type=str, default="1h", help="Timeframe used when scanning Binance")
-    parser.add_argument("--analysis-timeframe", type=str, default="", help="Override base timeframe when using --data or --no-scan")
+    parser.add_argument("--timeframe", type=str, default=TIMEFRAMES.data_scan, help="Timeframe used when scanning Binance")
+    parser.add_argument("--analysis-timeframe", type=str, default=TIMEFRAMES.analysis, help="Override base timeframe when using --data or --no-scan")
     parser.add_argument(
         "--lookback",
         type=int,
@@ -9321,7 +9392,7 @@ def _parse_args_android() -> Tuple[_CLISettings, argparse.Namespace]:
     p.add_argument("--symbol", "-s", default="")
     p.add_argument("--max-symbols", "-n", type=int, default=300)
     # timeframe/limit
-    p.add_argument("--timeframe", "-t", default="1m")
+    p.add_argument("--timeframe", "-t", default=TIMEFRAMES.base)
     p.add_argument("--limit", "-l", type=int, default=800)
     p.add_argument("--drop-last", action="store_true", default=False)
     # indicator view toggles
@@ -10927,34 +10998,83 @@ class _StrategyEngine:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
-        missing: List[str] = []
+        base_missing: List[str] = []
         if require_killzone:
             minutes = _utc_to_ny_minutes(t, self.ny_offset)
-            if not (10*60 <= minutes < 11*60):
-                missing.append("خارج KillZone نيويورك (10:00-11:00)")
+            if not (10 * 60 <= minutes < 11 * 60):
+                base_missing.append("خارج KillZone نيويورك (10:00-11:00)")
+
         swept = _swept_against_pdh_pdl(self.rt, lookback=3, use_wicks=True, buffer_ratio=0.00025)
         bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
         bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
+
         if not swept:
-            missing.append("لم يتم كنس سيولة PDH/PDL (استخدم الويك خلال 3 شمعات)")
-        has_bullish_confluence = bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True))
-        has_bearish_confluence = bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False))
+            base_missing.append("لم يتم كنس سيولة PDH/PDL (استخدم الويك خلال 3 شمعات)")
         if not bull_bos and not bear_bos:
             if ev:
-                missing.append("لا يوجد BOS/CHOCH واضح")
+                base_missing.append("لا يوجد BOS/CHOCH واضح")
             else:
-                missing.append("أحداث BOS/CHOCH غير متاحة من المصدر")
-        if swept == "down" and has_bullish_confluence:
+                base_missing.append("أحداث BOS/CHOCH غير متاحة من المصدر")
+
+        def merge_missing(*parts: Iterable[str]) -> List[str]:
+            seen: set[str] = set()
+            merged: List[str] = []
+            for part in parts:
+                for item in part:
+                    if item not in seen:
+                        merged.append(item)
+                        seen.add(item)
+            return merged
+
+        def long_entry() -> Tuple[bool, List[str], Optional[Tuple[float, float, str]]]:
+            missing: List[str] = []
+            confluence = _has_fvg(self.rt, True) or _last_ob_zone(self.rt, True)
+            if swept != "down":
+                missing.append("لا يوجد كنس هبوطي حديث")
+            if not bull_bos:
+                missing.append("BOS/CHOCH صعودي غير متاح")
+            if not confluence:
+                missing.append("لا يوجد FVG/OB داعم للشراء")
+            zone = self._entry_zone(True, price, label="ICT")
+            ready = swept == "down" and bull_bos and confluence
+            return ready, missing, zone
+
+        def short_entry() -> Tuple[bool, List[str], Optional[Tuple[float, float, str]]]:
+            missing: List[str] = []
+            confluence = _has_fvg(self.rt, False) or _last_ob_zone(self.rt, False)
+            if swept != "up":
+                missing.append("لا يوجد كنس صعودي حديث")
+            if not bear_bos:
+                missing.append("BOS/CHOCH هبوطي غير متاح")
+            if not confluence:
+                missing.append("لا يوجد FVG/OB داعم للبيع")
+            zone = self._entry_zone(False, price, label="ICT")
+            ready = swept == "up" and bear_bos and confluence
+            return ready, missing, zone
+
+        long_ready, long_missing, long_zone = long_entry()
+        short_ready, short_missing, short_zone = short_entry()
+
+        if long_ready:
             ob = _last_ob_zone(self.rt, True)
             sl = ob[0] if ob else (price - 0.001 * price)
-            zone = self._entry_zone(True, price, label="ICT")
-            return _StrategyDecision(_Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB"), zone, [])
-        if swept == "up" and has_bearish_confluence:
+            return _StrategyDecision(
+                _Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB"),
+                long_zone,
+                [],
+            )
+        if short_ready:
             ob = _last_ob_zone(self.rt, False)
             sl = ob[1] if ob else (price + 0.001 * price)
-            zone = self._entry_zone(False, price, label="ICT")
-            return _StrategyDecision(_Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB"), zone, [])
-        return _StrategyDecision(None, self._entry_zone(bull_bos, price, label="ICT") if bull_bos or bear_bos else None, missing)
+            return _StrategyDecision(
+                _Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB"),
+                short_zone,
+                [],
+            )
+
+        combined_missing = merge_missing(base_missing, long_missing, short_missing)
+        fallback_zone = long_zone if bull_bos else short_zone if bear_bos else None
+        return _StrategyDecision(None, fallback_zone, combined_missing)
 
     def _silver_bullet(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
