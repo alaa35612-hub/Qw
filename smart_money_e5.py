@@ -2441,6 +2441,7 @@ class SmartMoneyAlgoProE5:
         self.bxty = 0
         self.prev_oi1: float = NA
         self.bxf_touched: bool = False
+        self.golden_zone_retest_seen: bool = False
 
         self.motherHigh_history: List[float] = [self.motherHigh]
         self.motherLow_history: List[float] = [self.motherLow]
@@ -6191,6 +6192,7 @@ class SmartMoneyAlgoProE5:
         self.bxf = None
         self.bxty = 0
         self.bxf_touched = False
+        self.golden_zone_retest_seen = False
         self.console_event_log.pop("GOLDEN_ZONE_RETEST", None)
         self.last_golden_zone_retest_alert_time = None
 
@@ -6233,6 +6235,7 @@ class SmartMoneyAlgoProE5:
             self.bxf.set_text_size(self.inputs.structure_util.sizGd)
         self.bxf_touched = False
         self.bxty = 1 if dir_up else -1
+        self.golden_zone_retest_seen = False
 
     def _check_golden_zone_first_touch(
         self,
@@ -6266,6 +6269,9 @@ class SmartMoneyAlgoProE5:
         last_break = self.last_bos_choch_event
         if not isinstance(last_break, dict):
             return
+        if self.golden_zone_retest_seen:
+            # استبعاد أي لمسة جديدة لأن المنطقة الذهبية سبق لمسها بالفعل
+            return
         timestamp = self.series.get_time(0)
         if self.last_golden_zone_retest_alert_time == timestamp:
             return
@@ -6288,6 +6294,7 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "status": "active",
         }
+        self.golden_zone_retest_seen = True
         self.last_golden_zone_retest_alert_time = timestamp
 
     def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
