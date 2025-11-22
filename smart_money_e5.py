@@ -1339,6 +1339,8 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         self.last_bos_choch_event: Optional[Dict[str, Any]] = None
         self.last_golden_zone_retest_alert_time: Optional[int] = None
+        self.golden_zone_touch_history: List[Tuple[float, float]] = []
+        self.active_golden_zone_signature: Optional[Tuple[float, float]] = None
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -6195,6 +6197,7 @@ class SmartMoneyAlgoProE5:
         self.golden_zone_retest_seen = False
         self.console_event_log.pop("GOLDEN_ZONE_RETEST", None)
         self.last_golden_zone_retest_alert_time = None
+        self.active_golden_zone_signature = None
 
     def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
         if not isinstance(self.bxf, Box):
@@ -6206,6 +6209,15 @@ class SmartMoneyAlgoProE5:
         lower = min(top, bottom)
         upper = max(top, bottom)
         return lower, upper
+
+    def _golden_zone_signature(self, bounds: Optional[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+        if not bounds:
+            return None
+        lower, upper = bounds
+        if math.isnan(lower) or math.isnan(upper):
+            return None
+        # استخدم تقريب ثابت لتجميع المناطق المتطابقة ومنع التنبيهات المكررة
+        return (round(lower, 6), round(upper, 6))
 
     def _spawn_golden_zone(
         self,
@@ -6236,6 +6248,11 @@ class SmartMoneyAlgoProE5:
         self.bxf_touched = False
         self.bxty = 1 if dir_up else -1
         self.golden_zone_retest_seen = False
+        bounds = self._golden_zone_bounds()
+        self.active_golden_zone_signature = self._golden_zone_signature(bounds)
+        if self.active_golden_zone_signature and self.active_golden_zone_signature in self.golden_zone_touch_history:
+            # إذا كانت هذه المنطقة قد لُمست سابقًا، فلا نسجل إعادة الاختبار مرة أخرى
+            self.golden_zone_retest_seen = True
 
     def _check_golden_zone_first_touch(
         self,
@@ -6295,6 +6312,9 @@ class SmartMoneyAlgoProE5:
             "status": "active",
         }
         self.golden_zone_retest_seen = True
+        signature = self.active_golden_zone_signature or self._golden_zone_signature(bounds)
+        if signature and signature not in self.golden_zone_touch_history:
+            self.golden_zone_touch_history.append(signature)
         self.last_golden_zone_retest_alert_time = timestamp
 
     def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
