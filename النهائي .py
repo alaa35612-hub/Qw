@@ -10646,6 +10646,15 @@ class _Signal:
     reason: str = ""
 
 
+@dataclass
+class _StrategyDecision:
+    """يمثل حكم الاستراتيجية مع مناطق دخول وشروط ناقصة."""
+
+    signal: Optional[_Signal]
+    entry_zone: Optional[Tuple[float, float, str]]
+    missing_conditions: List[str]
+
+
 def _fmt(v: float) -> str:
     s = f"{v:.6f}"
     return s.rstrip("0").rstrip(".")
@@ -10721,16 +10730,46 @@ def _has_fvg(rt: Any, bullish: bool) -> bool:
         return False
 
 
+def _zone_bounds(obj: Any) -> Optional[Tuple[float, float]]:
+    """يحاول استخراج حدود علوية/سفلية من أي كائن منطقة (OB/FVG)."""
+
+    for lo_key, hi_key in (("bottom", "top"), ("low", "high"), ("lo", "hi")):
+        lo = getattr(obj, lo_key, None)
+        hi = getattr(obj, hi_key, None)
+        try:
+            if lo is not None and hi is not None:
+                return float(lo), float(hi)
+        except Exception:
+            continue
+    if isinstance(obj, (list, tuple)) and len(obj) >= 2:
+        try:
+            return float(obj[0]), float(obj[1])
+        except Exception:
+            return None
+    return None
+
+
 def _last_ob_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
     arr = getattr(rt, "demandZone" if bullish else "supplyZone", None)
     try:
         if arr and arr.size() > 0:
             box = arr.get(arr.size() - 1)
-            top = getattr(box, "top", None)
-            bottom = getattr(box, "bottom", None)
-            if top is not None and bottom is not None:
-                lo, hi = (float(bottom), float(top))
-                return (lo, hi)
+            bounds = _zone_bounds(box)
+            if bounds:
+                return bounds
+    except Exception:
+        pass
+    return None
+
+
+def _last_fvg_zone(rt: Any, bullish: bool) -> Optional[Tuple[float, float]]:
+    holder = getattr(rt, "bullish_gap_holder" if bullish else "bearish_gap_holder", None)
+    try:
+        if holder and holder.size() > 0:
+            gap = holder.get(holder.size() - 1)
+            bounds = _zone_bounds(gap)
+            if bounds:
+                return bounds
     except Exception:
         pass
     return None
@@ -10763,19 +10802,41 @@ class _StrategyEngine:
         self.risk_pct = risk_pct
         self.ny_offset = ny_offset
 
-    def _print(self, sig: _Signal) -> None:
+    def _format_zone(self, zone: Optional[Tuple[float, float, str]]) -> str:
+        if not zone:
+            return ""
+        lo, hi, label = zone
+        return f" — منطقة دخول {label}: [{_fmt(lo)} → {_fmt(hi)}]"
+
+    def _print(self, sig: _Signal, zone: Optional[Tuple[float, float, str]]) -> None:
         size = _pos_size(self.equity, self.risk_pct, sig.entry, sig.stop)
         when = dt.datetime.utcfromtimestamp(sig.t/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
-        print(f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
-              f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
+        print(
+            f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
+            f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}"
+            f"{self._format_zone(zone)}"
+        )
+
+    def _print_missing(self, decision: _StrategyDecision, strategy: str) -> None:
+        if not decision.missing_conditions:
+            return
+        zone_txt = self._format_zone(decision.entry_zone)
+        missing_txt = " ؛ ".join(decision.missing_conditions)
+        print(
+            f"[ℹ️] {self.symbol} — الاستراتيجية {strategy}: لم تكتمل الشروط ({missing_txt}){zone_txt}"
+        )
 
     def evaluate_and_print(self, name: str) -> None:
-        sig = self._evaluate(name)
-        if sig:
-            self._print(sig)
+        decision = self._evaluate(name)
+        if not decision:
+            return
+        if decision.signal:
+            self._print(decision.signal, decision.entry_zone)
+        elif decision.missing_conditions:
+            self._print_missing(decision, name)
 
     # ----------------- استراتيجيات (نسخة خفيفة) -----------------
-    def _evaluate(self, name: str) -> Optional[_Signal]:
+    def _evaluate(self, name: str) -> Optional[_StrategyDecision]:
         name = (name or "").strip()
         if name in ("", "ICT 2022"):
             return self._ict_2022()
@@ -10796,150 +10857,214 @@ class _StrategyEngine:
         if name == "FVG Continuation":
             return self._fvg_cont()
         if name == "OSOK":
-            sig = self._ict_2022(require_killzone=True)
-            if sig:
-                sig.strategy = "OSOK"
-            return sig
-        return None
+            decision = self._ict_2022(require_killzone=True)
+            if decision and decision.signal:
+                decision.signal.strategy = "OSOK"
+            return decision
+        return _StrategyDecision(None, None, ["الاستراتيجية غير معروفة"])
 
-    def _ict_2022(self, require_killzone: bool = False) -> Optional[_Signal]:
+    def _entry_zone(self, bullish: bool, fallback_price: float, *, label: str = "ذكية") -> Optional[Tuple[float, float, str]]:
+        ob = _last_ob_zone(self.rt, bullish)
+        if ob:
+            return (ob[0], ob[1], f"OB {label}")
+        fvg = _last_fvg_zone(self.rt, bullish)
+        if fvg:
+            return (fvg[0], fvg[1], f"FVG {label}")
+        pdh, pdl = _pdh_pdl(self.rt)
+        if bullish and pdl:
+            return (pdl, fallback_price, "سيولة يومية سفلية")
+        if not bullish and pdh:
+            return (fallback_price, pdh, "سيولة يومية علوية")
+        delta = max(fallback_price * 0.0025, 1e-8)
+        return (fallback_price - delta, fallback_price + delta, "تقدير")
+
+    def _ict_2022(self, require_killzone: bool = False) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
+        missing: List[str] = []
         if require_killzone:
             minutes = _utc_to_ny_minutes(t, self.ny_offset)
             if not (10*60 <= minutes < 11*60):
-                return None
+                missing.append("خارج KillZone نيويورك (10:00-11:00)")
         swept = _swept_against_pdh_pdl(self.rt)
         bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
         bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
-        if swept == "down" and bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True)):
+        if not swept:
+            missing.append("لم يتم كنس سيولة PDH/PDL")
+        has_bullish_confluence = bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True))
+        has_bearish_confluence = bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False))
+        if not bull_bos and not bear_bos:
+            missing.append("لا يوجد BOS/CHOCH واضح")
+        if swept == "down" and has_bullish_confluence:
             ob = _last_ob_zone(self.rt, True)
-            sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB")
-        if swept == "up" and bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False)):
+            sl = ob[0] if ob else (price - 0.001 * price)
+            zone = self._entry_zone(True, price, label="ICT")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, sl, "ICT 2022", t, "sweep↓ + BOS↑ + FVG/OB"), zone, [])
+        if swept == "up" and has_bearish_confluence:
             ob = _last_ob_zone(self.rt, False)
-            sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB")
-        return None
+            sl = ob[1] if ob else (price + 0.001 * price)
+            zone = self._entry_zone(False, price, label="ICT")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, sl, "ICT 2022", t, "sweep↑ + BOS↓ + FVG/OB"), zone, [])
+        return _StrategyDecision(None, self._entry_zone(bull_bos, price, label="ICT") if bull_bos or bear_bos else None, missing)
 
-    def _silver_bullet(self) -> Optional[_Signal]:
+    def _silver_bullet(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         minutes = _utc_to_ny_minutes(t, self.ny_offset)
         in_win = (3*60 <= minutes < 4*60) or (10*60 <= minutes < 11*60) or (14*60 <= minutes < 15*60)
+        missing: List[str] = []
         if not in_win:
-            return None
+            missing.append("خارج نوافذ Silver Bullet الزمنية")
         price = _series_get(self.rt, "close", 0)
         bull = _dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
         bear = _dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
+        if not bull and not bear:
+            missing.append("لا يوجد MSS/CHOCH واضح")
         if bull and _has_fvg(self.rt, True):
             ob = _last_ob_zone(self.rt, True)
             sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Silver Bullet", t, "NY window + MSS↑ + FVG")
+            zone = self._entry_zone(True, price, label="Silver Bullet")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, sl, "Silver Bullet", t, "NY window + MSS↑ + FVG"), zone, [])
         if bear and _has_fvg(self.rt, False):
             ob = _last_ob_zone(self.rt, False)
             sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Silver Bullet", t, "NY window + MSS↓ + FVG")
-        return None
+            zone = self._entry_zone(False, price, label="Silver Bullet")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, sl, "Silver Bullet", t, "NY window + MSS↓ + FVG"), zone, [])
+        return _StrategyDecision(None, self._entry_zone(bull, price, label="Silver Bullet") if bull or bear else None, missing)
 
-    def _judas(self) -> Optional[_Signal]:
+    def _judas(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         minutes = _utc_to_ny_minutes(t, self.ny_offset)
+        missing: List[str] = []
         if not (3*60 <= minutes < 5*60):
-            return None
+            missing.append("خارج جلسة لندن 03:00-05:00")
         price = _series_get(self.rt, "close", 0)
         swept = _swept_against_pdh_pdl(self.rt)
+        if not swept:
+            missing.append("لا يوجد كنس للسيولة حول PDH/PDL")
         if swept == "up" and (_dir_from(ev, "MSS") == "bearish" or _dir_from(ev, "BOS") == "bearish"):
             ob = _last_ob_zone(self.rt, False); sl = ob[1] if ob else (price + 0.001*price)
-            return _Signal(self.symbol, "SELL", price, sl, "Judas Swing", t, "London sweep↑ + shift↓")
+            zone = self._entry_zone(False, price, label="Judas")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, sl, "Judas Swing", t, "London sweep↑ + shift↓"), zone, [])
         if swept == "down" and (_dir_from(ev, "MSS") == "bullish" or _dir_from(ev, "BOS") == "bullish"):
             ob = _last_ob_zone(self.rt, True); sl = ob[0] if ob else (price - 0.001*price)
-            return _Signal(self.symbol, "BUY", price, sl, "Judas Swing", t, "London sweep↓ + shift↑")
-        return None
+            zone = self._entry_zone(True, price, label="Judas")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, sl, "Judas Swing", t, "London sweep↓ + shift↑"), zone, [])
+        return _StrategyDecision(None, self._entry_zone(True, price, label="Judas") if swept else None, missing)
 
-    def _turtle_soup(self) -> Optional[_Signal]:
+    def _turtle_soup(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         pdh, pdl = _pdh_pdl(self.rt)
         pc = _series_get(self.rt, "close", 1)
+        missing: List[str] = []
         if pdh is not None and pc > pdh and price < pdh and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"):
             sl = pdh + abs(price - pc)
-            return _Signal(self.symbol, "SELL", price, sl, "Turtle Soup", t, "fake breakout above PDH")
+            zone = (pdh, pdh + abs(price - pdh), "عودة داخل النطاق")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, sl, "Turtle Soup", t, "fake breakout above PDH"), zone, [])
         if pdl is not None and pc < pdl and price > pdl and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"):
             sl = pdl - abs(price - pc)
-            return _Signal(self.symbol, "BUY", price, sl, "Turtle Soup", t, "fake breakdown below PDL")
-        return None
+            zone = (pdl - abs(price - pdl), pdl, "عودة داخل النطاق")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, sl, "Turtle Soup", t, "fake breakdown below PDL"), zone, [])
+        if pdh is None and pdl is None:
+            missing.append("لا توجد PDH/PDL معرفة")
+        return _StrategyDecision(None, None, missing)
 
-    def _ote(self) -> Optional[_Signal]:
+    def _ote(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         gz = ev.get("GOLDEN_ZONE", {})
-        bounds = gz.get("price")
-        if isinstance(bounds, (list, tuple)) and len(bounds) == 2:
-            lo, hi = float(bounds[0]), float(bounds[1])
-            if lo <= price <= hi and (_dir_from(ev, "BOS") in ("bullish","bearish") or _dir_from(ev, "MSS") in ("bullish","bearish")):
+        if isinstance(gz.get("price"), (list, tuple)) and len(gz["price"]) >= 2:
+            lo, hi = map(float, gz["price"][:2])
+            if lo <= price <= hi:
                 if _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish":
-                    return _Signal(self.symbol, "BUY", price, lo, "OTE", t, "inside OTE + bullish shift")
+                    zone = (lo, hi, "منطقة OTE")
+                    return _StrategyDecision(_Signal(self.symbol, "BUY", price, lo, "OTE", t, "inside OTE + bullish shift"), zone, [])
                 if _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish":
-                    return _Signal(self.symbol, "SELL", price, hi, "OTE", t, "inside OTE + bearish shift")
-        return None
+                    zone = (lo, hi, "منطقة OTE")
+                    return _StrategyDecision(_Signal(self.symbol, "SELL", price, hi, "OTE", t, "inside OTE + bearish shift"), zone, [])
+            missing = ["السعر خارج منطقة OTE"]
+            return _StrategyDecision(None, (lo, hi, "منطقة OTE"), missing)
+        return _StrategyDecision(None, None, ["لا توجد منطقة OTE متاحة"])
 
-    def _po3(self) -> Optional[_Signal]:
+    def _po3(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         minutes = _utc_to_ny_minutes(t, self.ny_offset)
         swept = _swept_against_pdh_pdl(self.rt)
-        if (3*60 <= minutes < 8*60) and swept == "down" and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish"):
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "PO3", t, "AM sweep↓ -> distribution↑")
-        if (3*60 <= minutes < 8*60) and swept == "up" and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish"):
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "PO3", t, "AM sweep↑ -> distribution↓")
-        return None
+        missing: List[str] = []
+        if not (3*60 <= minutes < 8*60):
+            missing.append("خارج نافذة PO3 الصباحية")
+        if not swept:
+            missing.append("لا يوجد كنس AM واضح")
+        bull_ok = swept == "down" and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish")
+        bear_ok = swept == "up" and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish")
+        if bull_ok:
+            zone = self._entry_zone(True, price, label="PO3")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, price - 0.001*price, "PO3", t, "AM sweep↓ -> distribution↑"), zone, [])
+        if bear_ok:
+            zone = self._entry_zone(False, price, label="PO3")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, price + 0.001*price, "PO3", t, "AM sweep↑ -> distribution↓"), zone, [])
+        return _StrategyDecision(None, self._entry_zone(True, price, label="PO3") if swept else None, missing)
 
-    def _sweep_ob(self) -> Optional[_Signal]:
+    def _sweep_ob(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         swept = _swept_against_pdh_pdl(self.rt)
+        missing: List[str] = []
+        if not swept:
+            missing.append("لم يحدث كنس PDH/PDL")
         if swept == "up" and _dir_from(ev, "BOS") == "bearish":
             ob = _last_ob_zone(self.rt, False)
             if ob:
-                return _Signal(self.symbol, "SELL", price, ob[1], "Liquidity Sweep + OB", t, "sweep↑ + bearish BOS + OB")
+                zone = (ob[0], ob[1], "OB عكسي")
+                return _StrategyDecision(_Signal(self.symbol, "SELL", price, ob[1], "Liquidity Sweep + OB", t, "sweep↑ + bearish BOS + OB"), zone, [])
+            missing.append("لا توجد منطقة عرض (OB) بعد الكسر")
         if swept == "down" and _dir_from(ev, "BOS") == "bullish":
             ob = _last_ob_zone(self.rt, True)
             if ob:
-                return _Signal(self.symbol, "BUY", price, ob[0], "Liquidity Sweep + OB", t, "sweep↓ + bullish BOS + OB")
-        return None
+                zone = (ob[0], ob[1], "OB عكسي")
+                return _StrategyDecision(_Signal(self.symbol, "BUY", price, ob[0], "Liquidity Sweep + OB", t, "sweep↓ + bullish BOS + OB"), zone, [])
+            missing.append("لا توجد منطقة طلب (OB) بعد الكسر")
+        return _StrategyDecision(None, None, missing)
 
-    def _breaker(self) -> Optional[_Signal]:
+    def _breaker(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         has_idm = "IDM_OB" in ev and isinstance(ev["IDM_OB"].get("price"), (list, tuple))
         has_ext = "EXT_OB" in ev and isinstance(ev["EXT_OB"].get("price"), (list, tuple))
+        missing: List[str] = []
         if has_idm and _dir_from(ev, "BOS") == "bearish":
             lo, hi = map(float, ev["IDM_OB"]["price"])
-            return _Signal(self.symbol, "SELL", price, hi, "Breaker Block", t, "IDM OB broken -> retest")
+            zone = (lo, hi, "IDM OB (breaker)")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, hi, "Breaker Block", t, "IDM OB broken -> retest"), zone, [])
         if has_ext and _dir_from(ev, "BOS") == "bullish":
             lo, hi = map(float, ev["EXT_OB"]["price"])
-            return _Signal(self.symbol, "BUY", price, lo, "Breaker Block", t, "EXT OB broken -> retest")
-        return None
+            zone = (lo, hi, "EXT OB (breaker)")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, lo, "Breaker Block", t, "EXT OB broken -> retest"), zone, [])
+        missing.append("لا يوجد OB مكسور أو اتجاه كسر غير متطابق")
+        return _StrategyDecision(None, None, missing)
 
-    def _fvg_cont(self) -> Optional[_Signal]:
+    def _fvg_cont(self) -> Optional[_StrategyDecision]:
         ev = _extract_events(self.rt)
         t = _last_time(self.rt)
         price = _series_get(self.rt, "close", 0)
         bull = _has_fvg(self.rt, True) and (_dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "MSS") == "bullish")
         bear = _has_fvg(self.rt, False) and (_dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "MSS") == "bearish")
         if bull:
-            return _Signal(self.symbol, "BUY", price, price - 0.001*price, "FVG Continuation", t, "trend↑ + bullish FVG")
+            zone = self._entry_zone(True, price, label="FVG")
+            return _StrategyDecision(_Signal(self.symbol, "BUY", price, price - 0.001*price, "FVG Continuation", t, "trend↑ + bullish FVG"), zone, [])
         if bear:
-            return _Signal(self.symbol, "SELL", price, price + 0.001*price, "FVG Continuation", t, "trend↓ + bearish FVG")
-        return None
+            zone = self._entry_zone(False, price, label="FVG")
+            return _StrategyDecision(_Signal(self.symbol, "SELL", price, price + 0.001*price, "FVG Continuation", t, "trend↓ + bearish FVG"), zone, [])
+        return _StrategyDecision(None, None, ["لا توجد فجوة قيمة عادلة متوافقة مع الاتجاه"])
 
 
 # ---------------------- محرّك التشغيل (باكتيست/حي) ----------------------
