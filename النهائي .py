@@ -10854,6 +10854,28 @@ def _dir_from(events: Dict[str, Any], key: str) -> Optional[str]:
     return None
 
 
+def _infer_local_bos(rt: Any, lookback: int = 5) -> Tuple[bool, bool]:
+    """Approximate BOS/CHOCH when event logs are unavailable.
+
+    We simply check whether the latest bar has pierced a recent swing high/low
+    using wicks. This keeps ICT flow usable even if the external BOS/CHOCH
+    detector is silent, while remaining lightweight and non-invasive.
+    """
+
+    try:
+        lb = max(int(lookback), 2)
+        highs = [_series_get(rt, "high", i) for i in range(lb)]
+        lows = [_series_get(rt, "low", i) for i in range(lb)]
+        cur_high, cur_low = highs[0], lows[0]
+        prev_high = max(highs[1:])
+        prev_low = min(lows[1:])
+        bull = cur_high > prev_high and cur_low >= prev_low
+        bear = cur_low < prev_low and cur_high <= prev_high
+        return bull, bear
+    except Exception:
+        return False, False
+
+
 def _swept_against_pdh_pdl(
     rt: Any,
     *,
@@ -11008,6 +11030,13 @@ class _StrategyEngine:
         bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
         bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
 
+        if not bull_bos and not bear_bos:
+            fallback_bull, fallback_bear = _infer_local_bos(self.rt)
+            bull_bos = bull_bos or fallback_bull
+            bear_bos = bear_bos or fallback_bear
+            if fallback_bull or fallback_bear:
+                base_missing.append("تم استنتاج BOS/CHOCH داخليًا (بدون أحداث)")
+
         if not swept:
             base_missing.append("لم يتم كنس سيولة PDH/PDL (استخدم الويك خلال 3 شمعات)")
         if not bull_bos and not bear_bos:
@@ -11071,6 +11100,13 @@ class _StrategyEngine:
                 short_zone,
                 [],
             )
+
+        if swept == "down" or (bull_bos and not bear_bos):
+            focused_missing = merge_missing(base_missing, long_missing)
+            return _StrategyDecision(None, long_zone, focused_missing)
+        if swept == "up" or (bear_bos and not bull_bos):
+            focused_missing = merge_missing(base_missing, short_missing)
+            return _StrategyDecision(None, short_zone, focused_missing)
 
         combined_missing = merge_missing(base_missing, long_missing, short_missing)
         fallback_zone = long_zone if bull_bos else short_zone if bear_bos else None
