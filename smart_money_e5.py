@@ -1337,6 +1337,8 @@ class SmartMoneyAlgoProE5:
         self.bar_colors: List[Tuple[int, str]] = []
         self.console_event_log: Dict[str, Dict[str, Any]] = {}
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
+        self.last_bos_choch_event: Optional[Dict[str, Any]] = None
+        self.last_golden_zone_retest_alert_time: Optional[int] = None
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
             max_age = 1
@@ -1383,10 +1385,7 @@ class SmartMoneyAlgoProE5:
         "archived": "محفوظة تاريخياً",
     }
     ALERT_WHITELIST = {
-        "Golden Zone Created",
-        "Golden Zone First Touch",
-        "IDM OB Zone Created",
-        "EXT OB Zone Created",
+        "Golden Zone Structure Retest",
     }
 
     def label_new(
@@ -1630,6 +1629,14 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "source": "confirmed",
         }
+        if key in {"BOS", "CHOCH"}:
+            self.last_bos_choch_event = {
+                "key": key,
+                "price": price,
+                "time": timestamp,
+                "direction": "bullish" if bullish else "bearish",
+                "direction_display": direction_text,
+            }
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
         text = box.text.strip()
@@ -6170,6 +6177,8 @@ class SmartMoneyAlgoProE5:
         self.bxf = None
         self.bxty = 0
         self.bxf_touched = False
+        self.console_event_log.pop("GOLDEN_ZONE_RETEST", None)
+        self.last_golden_zone_retest_alert_time = None
 
     def _golden_zone_bounds(self) -> Optional[Tuple[float, float]]:
         if not isinstance(self.bxf, Box):
@@ -6231,6 +6240,40 @@ class SmartMoneyAlgoProE5:
                 message = f"{{ticker}} Golden Zone First Touch, Range: {price_range}, Close: {close_text}"
                 self.alertcondition(True, "Golden Zone First Touch", message)
 
+    def _maybe_alert_golden_zone_structure_retest(self, bounds: Tuple[float, float]) -> None:
+        close_price = self.series.get("close")
+        if math.isnan(close_price):
+            return
+        lower, upper = bounds
+        if not (lower <= close_price <= upper):
+            return
+        last_break = self.last_bos_choch_event
+        if not isinstance(last_break, dict):
+            return
+        timestamp = self.series.get_time(0)
+        if self.last_golden_zone_retest_alert_time == timestamp:
+            return
+        direction_text = last_break.get("direction_display", "") or (
+            "صاعد" if last_break.get("direction") == "bullish" else "هابط"
+        )
+        price_range = f"{format_price(lower)} → {format_price(upper)}"
+        message = (
+            f"{{ticker}} {last_break.get('key', 'Structure')} تصحيح في Golden Zone ({direction_text}), "
+            f"Range: {price_range}, Close: {format_price(close_price)}"
+        )
+        self.alertcondition(True, "Golden Zone Structure Retest", message)
+        self.console_event_log["GOLDEN_ZONE_RETEST"] = {
+            "text": "Golden Zone Structure Retest",
+            "price": close_price,
+            "time": timestamp,
+            "time_display": format_timestamp(timestamp),
+            "display": f"{last_break.get('key', 'Structure')} @ {format_price(close_price)} داخل Golden Zone",
+            "direction": last_break.get("direction"),
+            "direction_display": direction_text,
+            "status": "active",
+        }
+        self.last_golden_zone_retest_alert_time = timestamp
+
     def _update_golden_zone(self, time_val: int, high: float, low: float) -> None:
         prev_oi1 = None if is_na(self.prev_oi1) else float(self.prev_oi1)
         bounds = self._golden_zone_bounds()
@@ -6263,6 +6306,9 @@ class SmartMoneyAlgoProE5:
                     # Price may touch the zone on the same candle it is created
                     self._check_golden_zone_first_touch(high, low, bounds[0], bounds[1])
             self.prev_oi1 = oi1_value
+        bounds = self._golden_zone_bounds()
+        if bounds:
+            self._maybe_alert_golden_zone_structure_retest(bounds)
 
     # ------------------------------------------------------------------
     # High level drawing helpers
