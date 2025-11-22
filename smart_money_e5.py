@@ -1388,6 +1388,10 @@ class SmartMoneyAlgoProE5:
         # يُعطَّل كل تنبيه قديم ويُسمح فقط بتنبيه إعادة اختبار المنطقة الذهبية
         "Golden Zone Structure Retest",
     }
+    CONSOLE_EVENT_WHITELIST = {
+        # لا يُعرض في "أحدث الإشارات مع الأسعار" سوى تنبيه إعادة اختبار المنطقة الذهبية
+        "GOLDEN_ZONE_RETEST",
+    }
 
     def label_new(
         self,
@@ -1601,14 +1605,15 @@ class SmartMoneyAlgoProE5:
                 existing = self.console_event_log.get(key)
                 if existing and existing.get("source") == "confirmed":
                     return
-            self.console_event_log[key] = {
-                "text": label.text,
-                "price": label.y,
-                "time": label.x,
-                "time_display": format_timestamp(label.x),
-                "display": f"{label.text} @ {format_price(label.y)}",
-            }
-            self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
+            if key in self.CONSOLE_EVENT_WHITELIST:
+                self.console_event_log[key] = {
+                    "text": label.text,
+                    "price": label.y,
+                    "time": label.x,
+                    "time_display": format_timestamp(label.x),
+                    "display": f"{label.text} @ {format_price(label.y)}",
+                }
+                self._trace("label", "register", timestamp=label.x, key=key, text=label.text, price=label.y)
 
     def _register_structure_break_event(
         self,
@@ -1620,16 +1625,17 @@ class SmartMoneyAlgoProE5:
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
-        self.console_event_log[key] = {
-            "text": key,
-            "price": price,
-            "time": timestamp,
-            "time_display": format_timestamp(timestamp),
-            "display": display,
-            "direction": "bullish" if bullish else "bearish",
-            "direction_display": direction_text,
-            "source": "confirmed",
-        }
+        if key in self.CONSOLE_EVENT_WHITELIST:
+            self.console_event_log[key] = {
+                "text": key,
+                "price": price,
+                "time": timestamp,
+                "time_display": format_timestamp(timestamp),
+                "display": display,
+                "direction": "bullish" if bullish else "bearish",
+                "direction_display": direction_text,
+                "source": "confirmed",
+            }
         if key in {"BOS", "CHOCH"}:
             self.last_bos_choch_event = {
                 "key": key,
@@ -1658,25 +1664,26 @@ class SmartMoneyAlgoProE5:
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
-            self.console_event_log[key] = {
-                "text": box.text,
-                "price": (box.bottom, box.top),
-                "time": ts,
-                "time_display": format_timestamp(ts),
-                "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
-                "status": status,
-                "status_display": status_label,
-            }
-            self._trace(
-                "box",
-                "register",
-                timestamp=box.right,
-                key=key,
-                text=box.text,
-                top=box.top,
-                bottom=box.bottom,
-                status=status,
-            )
+            if key in self.CONSOLE_EVENT_WHITELIST:
+                self.console_event_log[key] = {
+                    "text": box.text,
+                    "price": (box.bottom, box.top),
+                    "time": ts,
+                    "time_display": format_timestamp(ts),
+                    "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
+                    "status": status,
+                    "status_display": status_label,
+                }
+                self._trace(
+                    "box",
+                    "register",
+                    timestamp=box.right,
+                    key=key,
+                    text=box.text,
+                    top=box.top,
+                    bottom=box.bottom,
+                    status=status,
+                )
             if status_key == "new":
                 alert_titles = {
                     "IDM_OB": "IDM OB Zone Created",
@@ -1692,6 +1699,8 @@ class SmartMoneyAlgoProE5:
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
         for key, value in self.console_event_log.items():
+            if key not in self.CONSOLE_EVENT_WHITELIST:
+                continue
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
@@ -1704,6 +1713,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Label], bool],
             formatter: Optional[Callable[[Label], str]] = None,
         ) -> None:
+            if key not in self.CONSOLE_EVENT_WHITELIST:
+                return
             for lbl in reversed(self.labels):
                 if not isinstance(lbl, Label):
                     continue
@@ -1725,6 +1736,8 @@ class SmartMoneyAlgoProE5:
             predicate: Callable[[Box], bool],
             sources: Optional[Sequence[Iterable[Box]]] = None,
         ) -> None:
+            if key not in self.CONSOLE_EVENT_WHITELIST:
+                return
             iterables = sources or (self.boxes,)
             for source in iterables:
                 if isinstance(source, PineArray):
