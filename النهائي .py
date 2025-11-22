@@ -10783,13 +10783,46 @@ def _dir_from(events: Dict[str, Any], key: str) -> Optional[str]:
     return None
 
 
-def _swept_against_pdh_pdl(rt: Any) -> Optional[str]:
+def _swept_against_pdh_pdl(
+    rt: Any,
+    *,
+    lookback: int = 3,
+    use_wicks: bool = True,
+    buffer_ratio: float = 0.0005,
+) -> Optional[str]:
+    """Detect a PDH/PDL liquidity sweep over a short lookback window.
+
+    The previous implementation required a close-to-close cross on a single
+    candle which was too strict for typical ICT sweeps that occur with wicks or
+    intra-bar spikes.  This version scans the most recent ``lookback`` bars,
+    optionally using highs/lows and a tiny buffer to accept shallow violations.
+    """
+
     pdh, pdl = _pdh_pdl(rt)
-    lc = _series_get(rt, "close", 0)
-    pc = _series_get(rt, "close", 1)
-    if pdh is not None and pc <= pdh and lc > pdh:
+    if pdh is None and pdl is None:
+        return None
+
+    lb = max(int(lookback), 1)
+    highs = [_series_get(rt, "high", i) for i in range(lb)]
+    lows = [_series_get(rt, "low", i) for i in range(lb)]
+    closes = [_series_get(rt, "close", i) for i in range(lb)]
+
+    swept_up = False
+    swept_down = False
+
+    if pdh is not None:
+        ref = pdh * (1 + buffer_ratio)
+        touched = max(highs) if use_wicks else max(closes)
+        swept_up = touched > ref
+
+    if pdl is not None:
+        ref = pdl * (1 - buffer_ratio)
+        touched = min(lows) if use_wicks else min(closes)
+        swept_down = touched < ref
+
+    if swept_up and not swept_down:
         return "up"
-    if pdl is not None and pc >= pdl and lc < pdl:
+    if swept_down and not swept_up:
         return "down"
     return None
 
@@ -10801,6 +10834,7 @@ class _StrategyEngine:
         self.equity = equity
         self.risk_pct = risk_pct
         self.ny_offset = ny_offset
+        self._last_missing_key: Optional[str] = None
 
     def _format_zone(self, zone: Optional[Tuple[float, float, str]]) -> str:
         if not zone:
@@ -10826,14 +10860,25 @@ class _StrategyEngine:
             f"[ℹ️] {self.symbol} — الاستراتيجية {strategy}: لم تكتمل الشروط ({missing_txt}){zone_txt}"
         )
 
+    def _missing_key(self, name: str, decision: _StrategyDecision) -> str:
+        zone_label = decision.entry_zone[2] if decision.entry_zone else ""
+        zone_bounds = (
+            f"{decision.entry_zone[0]}-{decision.entry_zone[1]}" if decision.entry_zone else ""
+        )
+        return "|".join((name, "|".join(sorted(decision.missing_conditions or [])), zone_label, zone_bounds))
+
     def evaluate_and_print(self, name: str) -> None:
         decision = self._evaluate(name)
         if not decision:
             return
         if decision.signal:
             self._print(decision.signal, decision.entry_zone)
+            self._last_missing_key = None
         elif decision.missing_conditions:
-            self._print_missing(decision, name)
+            key = self._missing_key(name, decision)
+            if key != self._last_missing_key:
+                self._print_missing(decision, name)
+                self._last_missing_key = key
 
     # ----------------- استراتيجيات (نسخة خفيفة) -----------------
     def _evaluate(self, name: str) -> Optional[_StrategyDecision]:
@@ -10887,15 +10932,18 @@ class _StrategyEngine:
             minutes = _utc_to_ny_minutes(t, self.ny_offset)
             if not (10*60 <= minutes < 11*60):
                 missing.append("خارج KillZone نيويورك (10:00-11:00)")
-        swept = _swept_against_pdh_pdl(self.rt)
+        swept = _swept_against_pdh_pdl(self.rt, lookback=3, use_wicks=True, buffer_ratio=0.00025)
         bull_bos = _dir_from(ev, "BOS") == "bullish" or _dir_from(ev, "CHOCH") == "bullish"
         bear_bos = _dir_from(ev, "BOS") == "bearish" or _dir_from(ev, "CHOCH") == "bearish"
         if not swept:
-            missing.append("لم يتم كنس سيولة PDH/PDL")
+            missing.append("لم يتم كنس سيولة PDH/PDL (استخدم الويك خلال 3 شمعات)")
         has_bullish_confluence = bull_bos and (_has_fvg(self.rt, True) or _last_ob_zone(self.rt, True))
         has_bearish_confluence = bear_bos and (_has_fvg(self.rt, False) or _last_ob_zone(self.rt, False))
         if not bull_bos and not bear_bos:
-            missing.append("لا يوجد BOS/CHOCH واضح")
+            if ev:
+                missing.append("لا يوجد BOS/CHOCH واضح")
+            else:
+                missing.append("أحداث BOS/CHOCH غير متاحة من المصدر")
         if swept == "down" and has_bullish_confluence:
             ob = _last_ob_zone(self.rt, True)
             sl = ob[0] if ob else (price - 0.001 * price)
