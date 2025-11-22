@@ -1504,6 +1504,10 @@ class SmartMoneyAlgoProE5:
             return True
         return bars_ago <= self.console_max_age_bars
 
+    def _is_15m_timeframe(self, timeframe: Optional[str]) -> bool:
+        seconds = _parse_timeframe_to_seconds(timeframe or "", self.base_tf_seconds)
+        return seconds == 15 * 60 if seconds is not None else False
+
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
 
@@ -1624,6 +1628,7 @@ class SmartMoneyAlgoProE5:
         timestamp: int,
         *,
         bullish: bool,
+        timeframe: Optional[str] = None,
     ) -> None:
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
@@ -1639,12 +1644,17 @@ class SmartMoneyAlgoProE5:
                 "source": "confirmed",
             }
         if key in {"BOS", "CHOCH"}:
+            event_timeframe = timeframe or self.base_timeframe or "15m"
             self.last_bos_choch_event = {
                 "key": key,
                 "price": price,
                 "time": timestamp,
                 "direction": "bullish" if bullish else "bearish",
                 "direction_display": direction_text,
+                "timeframe": event_timeframe,
+                "timeframe_seconds": _parse_timeframe_to_seconds(
+                    event_timeframe, self.base_tf_seconds
+                ),
             }
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
@@ -6286,6 +6296,9 @@ class SmartMoneyAlgoProE5:
         last_break = self.last_bos_choch_event
         if not isinstance(last_break, dict):
             return
+        if not self._is_15m_timeframe(last_break.get("timeframe") or self.base_timeframe):
+            # لا تنبيه إلا إذا كان الكسر الأخير على إطار 15 دقيقة
+            return
         if self.golden_zone_retest_seen:
             # استبعاد أي لمسة جديدة لأن المنطقة الذهبية سبق لمسها بالفعل
             return
@@ -6310,6 +6323,7 @@ class SmartMoneyAlgoProE5:
             "direction": last_break.get("direction"),
             "direction_display": direction_text,
             "status": "active",
+            "color": "#FFD700",  # أصفر لتمييز التنبيه في شاشة المحرر
         }
         self.golden_zone_retest_seen = True
         signature = self.active_golden_zone_signature or self._golden_zone_signature(bounds)
@@ -6497,9 +6511,13 @@ class SmartMoneyAlgoProE5:
         event_time = self.series.get_time()
         if not math.isnan(y):
             if name == "BOS":
-                self._register_structure_break_event("BOS", y, event_time, bullish=trend)
+                self._register_structure_break_event(
+                    "BOS", y, event_time, bullish=trend, timeframe=self.base_timeframe
+                )
             elif name == "ChoCh":
-                self._register_structure_break_event("CHOCH", y, event_time, bullish=trend)
+                self._register_structure_break_event(
+                    "CHOCH", y, event_time, bullish=trend, timeframe=self.base_timeframe
+                )
         if name == "BOS" and self.inputs.structure.showSMC:
             ln = self.line_new(x, y, self.series.get_time(), y, "xloc.bar_time", color, "line.style_dashed")
             lbl = self.label_new(
