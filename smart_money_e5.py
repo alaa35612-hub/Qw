@@ -6260,6 +6260,8 @@ class SmartMoneyAlgoProE5:
             return
         lower, upper = bounds
         if not (lower <= close_price <= upper):
+            # تجاهل أي إشارة قديمة إذا كان السعر قد غادر المنطقة الذهبية
+            self.console_event_log.pop("GOLDEN_ZONE_RETEST", None)
             return
         last_break = self.last_bos_choch_event
         if not isinstance(last_break, dict):
