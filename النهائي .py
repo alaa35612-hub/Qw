@@ -929,7 +929,7 @@ class CandleInputs:
 
 @dataclass
 class ConsoleInputs:
-    max_age_bars: int = 1
+    max_age_bars: int = 50
 
 
 @dataclass
@@ -1379,12 +1379,12 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = 50
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                max_age = int(getattr(console_inputs, "max_age_bars", 50) or 50)
             except (TypeError, ValueError):
-                max_age = 1
+                max_age = 50
         self.console_max_age_bars = max(1, max_age)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
@@ -1762,13 +1762,23 @@ class SmartMoneyAlgoProE5:
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
+        stale: Dict[str, Dict[str, Any]] = {}
+
+        def _ts(payload: Dict[str, Any]) -> int:
+            ts = payload.get("time") or payload.get("timestamp") or payload.get("ts")
+            return int(ts) if isinstance(ts, (int, float)) else 0
+
+        def _store(target: Dict[str, Dict[str, Any]], key: str, payload: Dict[str, Any]) -> None:
+            existing = target.get(key)
+            if existing is None or _ts(payload) >= _ts(existing):
+                target[key] = payload
+
         for key, value in self.console_event_log.items():
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
-                continue
-            events[key] = payload
+            target = events if self._console_event_within_age(payload.get("time")) else stale
+            _store(target, key, payload)
 
         def record_label(
             key: str,
@@ -1778,17 +1788,17 @@ class SmartMoneyAlgoProE5:
             for lbl in reversed(self.labels):
                 if not isinstance(lbl, Label):
                     continue
-                if not self._console_event_within_age(lbl.x):
-                    continue
                 if predicate(lbl):
                     display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
-                    events[key] = {
+                    payload = {
                         "text": lbl.text,
                         "price": lbl.y,
                         "display": display,
                         "time": lbl.x,
                         "time_display": format_timestamp(lbl.x),
                     }
+                    target = events if self._console_event_within_age(lbl.x) else stale
+                    _store(target, key, payload)
                     break
 
         def record_box(
@@ -1807,10 +1817,8 @@ class SmartMoneyAlgoProE5:
                 for bx in reversed(seq):
                     if not isinstance(bx, Box):
                         continue
-                    if not self._console_event_within_age(bx.left):
-                        continue
                     if predicate(bx):
-                        events[key] = {
+                        payload = {
                             "text": bx.text,
                             "price": (bx.bottom, bx.top),
                             "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
@@ -1822,6 +1830,8 @@ class SmartMoneyAlgoProE5:
                                 self.BOX_STATUS_LABELS.get("active", "active"),
                             ),
                         }
+                        target = events if self._console_event_within_age(bx.left) else stale
+                        _store(target, key, payload)
                         return
 
         bull_color = self.inputs.structure.bull
@@ -1877,6 +1887,10 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+        for key, payload in stale.items():
+            if key not in events:
+                events[key] = payload
 
         return events
 
