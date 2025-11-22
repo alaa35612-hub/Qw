@@ -1389,13 +1389,36 @@ class SmartMoneyAlgoProE5:
         "archived": "محفوظة تاريخياً",
     }
     ALERT_WHITELIST = {
-        # يُعطَّل كل تنبيه قديم ويُسمح فقط بتنبيه إعادة اختبار المنطقة الذهبية
         "Golden Zone Structure Retest",
+        "Bullish FVG",
+        "Bearish FVG",
+        "Bullish FVG Break",
+        "Bearish FVG Break",
+        "Bearish External OB",
+        "Bullish External OB",
+        "Bearish Internal OB",
+        "Bullish Internal OB",
+        "Bullish OB Break",
+        "Bearish OB Break",
+        "Bullish Sweep",
+        "Bearish Sweep",
     }
-    CONSOLE_EVENT_WHITELIST = {
-        # لا يُعرض في "أحدث الإشارات مع الأسعار" سوى تنبيه إعادة اختبار المنطقة الذهبية
-        "GOLDEN_ZONE_RETEST",
+    ALERT_CONSOLE_MAP = {
+        "Golden Zone Structure Retest": "GOLDEN_ZONE_RETEST",
+        "Bullish FVG": "BULLISH_FVG",
+        "Bearish FVG": "BEARISH_FVG",
+        "Bullish FVG Break": "BULLISH_FVG_BREAK",
+        "Bearish FVG Break": "BEARISH_FVG_BREAK",
+        "Bearish External OB": "BEARISH_EXTERNAL_OB",
+        "Bullish External OB": "BULLISH_EXTERNAL_OB",
+        "Bearish Internal OB": "BEARISH_INTERNAL_OB",
+        "Bullish Internal OB": "BULLISH_INTERNAL_OB",
+        "Bullish OB Break": "BULLISH_OB_BREAK",
+        "Bearish OB Break": "BEARISH_OB_BREAK",
+        "Bullish Sweep": "BULLISH_SWEEP",
+        "Bearish Sweep": "BEARISH_SWEEP",
     }
+    CONSOLE_EVENT_WHITELIST = set(ALERT_CONSOLE_MAP.values())
 
     def label_new(
         self,
@@ -1456,6 +1479,18 @@ class SmartMoneyAlgoProE5:
         timestamp = self.series.get_time(0)
         text = title if message is None else f"{title} :: {message}"
         self.alerts.append((timestamp, text))
+        console_key = self.ALERT_CONSOLE_MAP.get(title)
+        if console_key in self.CONSOLE_EVENT_WHITELIST:
+            existing_retest = console_key == "GOLDEN_ZONE_RETEST" and "GOLDEN_ZONE_RETEST" in self.console_event_log
+            if not existing_retest:
+                price_val = self.series.get("close")
+                self.console_event_log[console_key] = {
+                    "text": title,
+                    "price": price_val,
+                    "time": timestamp,
+                    "time_display": format_timestamp(timestamp),
+                    "display": f"{title} @ {format_price(price_val)}",
+                }
         self._trace(
             "alertcondition",
             "trigger",
