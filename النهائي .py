@@ -153,6 +153,78 @@ DEFAULT_BINANCE_SYMBOL_SELECTOR = BinanceSymbolSelectorConfig(
 )
 
 
+@dataclass(frozen=True)
+class StrategyAutorunConfig:
+    """إعدادات سريعة لتشغيل ماسح الاستراتيجيات من أعلى الملف."""
+
+    strategy: str = "ICT 2022"
+    symbols: str = "BTCUSDT"
+    start: str = "2022-01-01"
+    end: str = "2023-12-31"
+    equity: float = 100.0
+    risk_pct: float = 2.0
+    ny_offset: int = -4
+    live: bool = False
+    csv: Optional[str] = None
+
+
+# اختر وضع التشغيل الافتراضي من هنا بدون الحاجة لتعديل بقية الشيفرة.
+# - "events": تشغيل ماسح الأحداث/التنبيهات.
+# - "strategies": تشغيل ماسح الاستراتيجيات (Top 10 ICT) باستخدام الإعدادات أدناه.
+AUTORUN_MODE: str = "strategies"
+
+# إعدادات مخصّصة لكل استراتيجية (يمكن تعديلها من الأعلى بسهولة).
+# أي قيمة غير مذكورة هنا ستعود إلى قيم STRATEGY_AUTORUN_DEFAULTS أو معاملات سطر الأوامر.
+STRATEGY_PROFILE_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "ICT 2022": {"risk_pct": 2.0, "ny_offset": -4},
+    "Silver Bullet": {"risk_pct": 1.5, "ny_offset": -4},
+    "Judas Swing": {"risk_pct": 1.5, "ny_offset": -4},
+    "Turtle Soup": {"risk_pct": 1.25, "ny_offset": -4},
+    "OTE": {"risk_pct": 2.0, "ny_offset": -4},
+    "PO3": {"risk_pct": 1.75, "ny_offset": -4},
+    "Liquidity Sweep + OB": {"risk_pct": 1.5, "ny_offset": -4},
+    "Breaker Block": {"risk_pct": 1.5, "ny_offset": -4},
+    "FVG Continuation": {"risk_pct": 1.25, "ny_offset": -4},
+    "OSOK": {"risk_pct": 1.0, "ny_offset": -4, "symbols": "BTCUSDT,ETHUSDT"},
+}
+
+# مفاتيح لتفعيل/تعطيل كل استراتيجية من الأعلى بسرعة.
+STRATEGY_ENABLE_FLAGS: Dict[str, bool] = {
+    "ICT 2022": True,
+    "Silver Bullet": True,
+    "Judas Swing": True,
+    "Turtle Soup": True,
+    "OTE": True,
+    "PO3": True,
+    "Liquidity Sweep + OB": True,
+    "Breaker Block": True,
+    "FVG Continuation": True,
+    "OSOK": True,
+}
+
+STRATEGY_CHOICES: Tuple[str, ...] = tuple(STRATEGY_PROFILE_OVERRIDES.keys())
+
+
+def _enabled_strategies() -> Tuple[str, ...]:
+    enabled = [name for name in STRATEGY_CHOICES if STRATEGY_ENABLE_FLAGS.get(name, True)]
+    return tuple(enabled) if enabled else STRATEGY_CHOICES
+
+
+ENABLED_STRATEGY_CHOICES: Tuple[str, ...] = _enabled_strategies()
+
+# رمز خاص لاختيار جميع عقود USDT-M المتاحة.
+ALL_BINANCE_USDTM_TOKEN = "ALL_USDTM"
+
+_DEFAULT_AUTORUN_STRATEGY = ENABLED_STRATEGY_CHOICES[0] if ENABLED_STRATEGY_CHOICES else STRATEGY_CHOICES[0]
+
+# إعدادات افتراضية موحّدة لماسح الاستراتيجيات عند اختيار AUTORUN_MODE = "strategies".
+STRATEGY_AUTORUN_DEFAULTS = StrategyAutorunConfig(
+    strategy=_DEFAULT_AUTORUN_STRATEGY,
+    symbols=ALL_BINANCE_USDTM_TOKEN,
+    live=True,
+)
+
+
 def _normalize_direction(value: Any) -> Optional[str]:
     if isinstance(value, str):
         token = value.strip().lower()
@@ -10447,8 +10519,7 @@ def __router_main__():
     return _android_cli_entry()
 
 # ---------- Main ----------
-if __name__ == "__main__":
-    __router_main__()
+# (تم نقل نقطة التشغيل إلى نهاية الملف للتحكم في وضع التشغيل الافتراضي.)
 
 
 # ============================================================================
@@ -10468,15 +10539,15 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Literal
 
 # -------- إعدادات إفتراضية للتشغيل التلقائي من المحرّر --------
-DEFAULT_STRATEGY: str = "ICT 2022"   # بدّلها إلى أي اسم من القائمة المسموح بها أدناه
-DEFAULT_EQUITY: float = 100.0        # الرصيد بالدولار
-DEFAULT_RISK: float = 2.0            # نسبة المخاطرة لكل صفقة (%)
-DEFAULT_NY_OFFSET: int = -4          # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
-DEFAULT_SYMBOLS: str = "BTCUSDT"     # رموز مفصولة بفواصل
-DEFAULT_START: str = "2022-01-01"    # بداية الباكتيست
-DEFAULT_END: str   = "2023-12-31"    # نهاية الباكتيست
-DEFAULT_LIVE: bool = False           # الوضع الحي (يتطلب ccxt)
-DEFAULT_CSV: Optional[str] = None    # مثال: "BTCUSDT=./btc_1m.csv"
+DEFAULT_STRATEGY: str = STRATEGY_AUTORUN_DEFAULTS.strategy   # بدّلها من أعلى الملف
+DEFAULT_EQUITY: float = STRATEGY_AUTORUN_DEFAULTS.equity     # الرصيد بالدولار
+DEFAULT_RISK: float = STRATEGY_AUTORUN_DEFAULTS.risk_pct     # نسبة المخاطرة لكل صفقة (%)
+DEFAULT_NY_OFFSET: int = STRATEGY_AUTORUN_DEFAULTS.ny_offset # إزاحة نيويورك عن UTC (تقريبية، بدون DST)
+DEFAULT_SYMBOLS: str = STRATEGY_AUTORUN_DEFAULTS.symbols     # رموز مفصولة بفواصل (ALL_USDTM لجلب الكل)
+DEFAULT_START: str = STRATEGY_AUTORUN_DEFAULTS.start         # بداية الباكتيست
+DEFAULT_END: str   = STRATEGY_AUTORUN_DEFAULTS.end           # نهاية الباكتيست
+DEFAULT_LIVE: bool = STRATEGY_AUTORUN_DEFAULTS.live          # الوضع الحي (يتطلب ccxt)
+DEFAULT_CSV: Optional[str] = STRATEGY_AUTORUN_DEFAULTS.csv   # مثال: "BTCUSDT=./btc_1m.csv"
 
 # محاولـة تحميل ccxt إن توفّر
 try:
@@ -10953,12 +11024,28 @@ def _parse_csv_map(arg: Optional[str]) -> Dict[str, str]:
     return mapping
 
 
+def _resolve_symbols_list(symbols_csv: str, live_flag: bool) -> List[str]:
+    tokens = [s.strip() for s in symbols_csv.split(",") if s.strip()]
+    wants_all = any(
+        t.upper() in {ALL_BINANCE_USDTM_TOKEN, "ALL", "ALL_USDT-M", "BINANCE_USDTM"}
+        for t in tokens or [symbols_csv]
+    )
+    if wants_all:
+        if not live_flag:
+            raise RuntimeError("اختيار ALL_USDTM متاح للوضع الحي فقط لضمان بيانات محدثة.")
+        if ccxt is None:
+            raise RuntimeError("اختيار جميع عقود Binance USDT-M يتطلب ccxt واتصالاً مباشراً — تم حذف وضع المسح التجريبي بدون نت.")
+        exchange = ccxt.binanceusdm({"enableRateLimit": True})
+        symbols = fetch_binance_usdtm_symbols(exchange, selector=DEFAULT_BINANCE_SYMBOL_SELECTOR)
+        return list(dict.fromkeys(symbols))
+    return tokens
+
+
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ICT Strategy Runner (Integrated, text-only)")
     p.add_argument("--strategy", default=DEFAULT_STRATEGY,
-                   choices=["ICT 2022","Silver Bullet","Judas Swing","Turtle Soup","OTE","PO3",
-                            "Liquidity Sweep + OB","Breaker Block","FVG Continuation","OSOK"],
-                   help="الاستراتيجية المفعلة")
+                   choices=list(ENABLED_STRATEGY_CHOICES),
+                   help="الاستراتيجية المفعلة (يمكن ضبطها من أعلى الملف)")
     p.add_argument("--symbols", default=DEFAULT_SYMBOLS, help="قائمة رموز مفصولة بفواصل (USDT-M)")
     p.add_argument("--start", default=DEFAULT_START, help="YYYY-MM-DD")
     p.add_argument("--end", default=DEFAULT_END, help="YYYY-MM-DD")
@@ -10973,19 +11060,38 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def _main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
-    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    start = dt.datetime.strptime(args.start, "%Y-%m-%d")
-    end = dt.datetime.strptime(args.end, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(milliseconds=1)
+    if args.strategy not in ENABLED_STRATEGY_CHOICES:
+        raise RuntimeError("تم تعطيل هذه الاستراتيجية من الأعلى. فعّلها من STRATEGY_ENABLE_FLAGS لتشغيلها.")
+    profile = STRATEGY_PROFILE_OVERRIDES.get(args.strategy, {})
+    symbols_csv = profile.get("symbols", args.symbols)
+    live_flag = bool(profile.get("live", args.live))
+    csv_arg = profile.get("csv", args.csv)
+    csv_map = _parse_csv_map(csv_arg)
+    if live_flag and ccxt is None:
+        raise RuntimeError("الوضع الحي يتطلب ccxt واتصالاً مباشراً — تم تعطيل وضع المسح التجريبي بدون نت.")
+    if csv_map:
+        symbols = [s.strip() for s in symbols_csv.split(",") if s.strip()]
+    else:
+        symbols = _resolve_symbols_list(symbols_csv, live_flag)
+    if not symbols:
+        raise RuntimeError("لم يتم العثور على أي رموز للمسح. تحقق من STRATEGY_AUTORUN_DEFAULTS أو معاملات CLI.")
+    start_str = profile.get("start", args.start)
+    end_str = profile.get("end", args.end)
+    start = dt.datetime.strptime(start_str, "%Y-%m-%d")
+    end = dt.datetime.strptime(end_str, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(milliseconds=1)
+    equity = float(profile.get("equity", args.equity))
+    risk_pct = float(profile.get("risk_pct", args.risk))
+    ny_offset = int(profile.get("ny_offset", args.ny_offset))
     cfg = _Config(
         strategy=args.strategy,
         symbols=symbols,
         start=start,
         end=end,
-        equity=float(args.equity),
-        risk_pct=float(args.risk),
-        ny_offset=int(args.ny_offset),
-        live=bool(args.live),
-        csv_map=_parse_csv_map(args.csv),
+        equity=equity,
+        risk_pct=risk_pct,
+        ny_offset=ny_offset,
+        live=live_flag,
+        csv_map=csv_map,
     )
     eng = _Engine(cfg)
     if cfg.live:
@@ -10994,7 +11100,20 @@ def _main(argv: Optional[List[str]] = None) -> None:
         eng.run_backtest()
 
 
+def _resolve_autorun_mode(argv: List[str]) -> str:
+    """تحديد وضع التشغيل (أحداث/استراتيجيات) اعتمادًا على الإعداد العلوي أو أعلام CLI."""
+
+    if any(arg.startswith("--strategy") for arg in argv):
+        return "strategies"
+    selected = (AUTORUN_MODE or "events").strip().lower()
+    return "strategies" if selected == "strategies" else "events"
+
+
 if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
+    argv = sys.argv[1:]
+    mode = _resolve_autorun_mode(argv)
+    if mode == "strategies":
+        _main(argv)
+    else:
+        __router_main__()
 # ============================ End of Integration ============================
