@@ -1323,6 +1323,8 @@ class SmartMoneyAlgoProE5:
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
+        self.structure_break_timeframe = "15m"
+        self.golden_zone_retest_timeframe = "1m"
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
@@ -1508,6 +1510,10 @@ class SmartMoneyAlgoProE5:
         seconds = _parse_timeframe_to_seconds(timeframe or "", self.base_tf_seconds)
         return seconds == 15 * 60 if seconds is not None else False
 
+    def _is_1m_timeframe(self, timeframe: Optional[str]) -> bool:
+        seconds = _parse_timeframe_to_seconds(timeframe or "", self.base_tf_seconds)
+        return seconds == 60 if seconds is not None else False
+
     def gather_console_metrics(self) -> Dict[str, Any]:
         """Aggregate runtime metrics for console presentation."""
 
@@ -1644,7 +1650,12 @@ class SmartMoneyAlgoProE5:
                 "source": "confirmed",
             }
         if key in {"BOS", "CHOCH"}:
-            event_timeframe = timeframe or self.base_timeframe or "15m"
+            candidate_tf = timeframe or self.structure_break_timeframe
+            event_timeframe = (
+                candidate_tf
+                if self._is_15m_timeframe(candidate_tf)
+                else self.structure_break_timeframe
+            )
             self.last_bos_choch_event = {
                 "key": key,
                 "price": price,
@@ -6296,8 +6307,11 @@ class SmartMoneyAlgoProE5:
         last_break = self.last_bos_choch_event
         if not isinstance(last_break, dict):
             return
-        if not self._is_15m_timeframe(last_break.get("timeframe") or self.base_timeframe):
+        if not self._is_15m_timeframe(last_break.get("timeframe") or self.structure_break_timeframe):
             # لا تنبيه إلا إذا كان الكسر الأخير على إطار 15 دقيقة
+            return
+        if not self._is_1m_timeframe(self.base_timeframe or self.golden_zone_retest_timeframe):
+            # إشارات إعادة الاختبار للمنطقة الذهبية محصورة في إطار الدقيقة الواحدة
             return
         if self.golden_zone_retest_seen:
             # استبعاد أي لمسة جديدة لأن المنطقة الذهبية سبق لمسها بالفعل
@@ -6324,6 +6338,7 @@ class SmartMoneyAlgoProE5:
             "direction_display": direction_text,
             "status": "active",
             "color": "#FFD700",  # أصفر لتمييز التنبيه في شاشة المحرر
+            "timeframe": self.golden_zone_retest_timeframe,
         }
         self.golden_zone_retest_seen = True
         signature = self.active_golden_zone_signature or self._golden_zone_signature(bounds)
