@@ -5,25 +5,35 @@ import math
 import os
 import csv
 import sys
-import aiohttp
-from collections import deque, defaultdict
+import logging
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+
+import aiohttp
 
 # =====================[ ⚙️ إعدادات المحرك الكمي ]=====================
 
 CONFIG = {
-    "WINDOW_SIZE": 60,            # نافذة التحليل بالثواني (لصنع المتوسطات)
-    "MIN_24H_VOL": 20_000_000,    # تجاهل العملات الميتة (أقل من 10 مليون)
-    
+    "WINDOW_SIZE": 90,               # نافذة التحليل بالثواني (لصنع المتوسطات)
+    "MIN_24H_VOL": 25_000_000,       # تجاهل العملات الميتة (أقل من 25 مليون)
+    "MAX_QUEUE_SIZE": 7_500,         # الحد الأقصى للطابور لحماية الذاكرة
+    "RECONNECT_BACKOFF": 2,          # ثواني الانتظار قبل إعادة الاتصال
+    "EMA_ALPHA": 0.24,               # معامل التنعيم للحجوم السعرية (0.2 = سلاسة أكبر)
+    "FAST_ALPHA": 0.35,              # معامل أسرع لالتقاط اللحظات الحادة
+
     # --- [ خوارزميات الحساسية ] ---
-    "SIGMA_THRESHOLD": 1.5,       # (Z-Score) الحساسية للشذوذ الإحصائي (3.5 = حدث نادر جداً)
-    "ACCELERATION_FACTOR": 1.0,   # معامل تسارع السيولة المطلوب
-    
+    "SIGMA_THRESHOLD": 1.4,          # (Z-Score) الحساسية للشذوذ الإحصائي (أقل = أكثر حساسية)
+    "MAD_MULTIPLIER": 4.0,           # مضاعف حساس لـ MAD-Score للتأكيد المتقاطع
+    "ACCELERATION_FACTOR": 1.15,     # معامل تسارع السيولة المطلوب
+    "COOLDOWN_SECONDS": 18,          # تهدئة بين إشارات العملة الواحدة لمنع الإغراق
+    "WARMUP_POINTS": 25,             # الحد الأدنى للعينات قبل تفعيل المنطق الخارق
+
     # --- [ حماية السوق ] ---
-    "BTC_PROTECTION": True,       # إيقاف الشراء إذا كان البيتكوين ينهار
-    "BTC_DUMP_PERCENT": -0.4,     # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
-    
+    "BTC_PROTECTION": True,          # إيقاف الشراء إذا كان البيتكوين ينهار
+    "BTC_DUMP_PERCENT": -0.35,       # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
+    "BTC_RISK_AVERSION": -0.15,      # عطّل إشارات القفز إذا كان البيتكوين سلبيًا قليلًا
+
     "LOG_FILE": "quantum_signals.csv"
 }
 
@@ -47,8 +57,8 @@ class Term:
         print("\033c", end="")
         print(f"""{Term.PURPLE}{Term.BOLD}
         ╔═══════════════════════════════════════════════════════════════╗
-        ║           QUANTUM FLOW SNIPER v5.1 (STATISTICAL)              ║
-        ║       [ Z-Score Analysis | Momentum Velocity | BTC Guard ]    ║
+        ║           QUANTUM FLOW SNIPER v5.3 (MULTI-FACTOR)            ║
+        ║  [ Z-Score | MAD | Dual Momentum | BTC Guard | Cooldowns ]   ║
         ╚═══════════════════════════════════════════════════════════════╝
         {Term.END}""")
 
@@ -57,31 +67,46 @@ class Term:
 @dataclass
 class MarketPulse:
     """يخزن نبض السوق لكل عملة لحساب الإحصائيات"""
+
     symbol: str
     prices: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
     volumes: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
     last_accumulated_vol: float = 0.0
-    
-    def add_snapshot(self, price: float, accumulated_vol: float):
+    ema_volume: Optional[float] = None
+    ema_price: Optional[float] = None
+    fast_ema_price: Optional[float] = None
+    fast_ema_volume: Optional[float] = None
+
+    def add_snapshot(self, price: float, accumulated_vol: float) -> float:
         # حساب حجم التدفق في هذه اللحظة (Delta)
         if self.last_accumulated_vol == 0:
             delta_vol = 0
         else:
             delta_vol = accumulated_vol - self.last_accumulated_vol
             # تصحيح في حالة إعادة تعيين اليوم
-            if delta_vol < 0: delta_vol = 0 
+            if delta_vol < 0: delta_vol = 0
             
         self.last_accumulated_vol = accumulated_vol
-        
+
         self.prices.append(price)
         self.volumes.append(delta_vol)
+
+        # تحديث المتوسط الأسي للحجم والسعر لتقليل الضوضاء ورفع حساسية الكشف
+        alpha = CONFIG["EMA_ALPHA"]
+        fast_alpha = CONFIG["FAST_ALPHA"]
+        self.ema_volume = delta_vol if self.ema_volume is None else (alpha * delta_vol + (1 - alpha) * self.ema_volume)
+        self.ema_price = price if self.ema_price is None else (alpha * price + (1 - alpha) * self.ema_price)
+        self.fast_ema_volume = delta_vol if self.fast_ema_volume is None else (fast_alpha * delta_vol + (1 - fast_alpha) * self.fast_ema_volume)
+        self.fast_ema_price = price if self.fast_ema_price is None else (fast_alpha * price + (1 - fast_alpha) * self.fast_ema_price)
+
+        return delta_vol
 
     @property
     def is_ready(self):
         # نحتاج بيانات كافية ليكون الانحراف المعياري دقيقاً
-        return len(self.volumes) >= 20
+        return len(self.volumes) >= CONFIG["WARMUP_POINTS"]
 
-    def calculate_statistics(self, current_vol_delta):
+    def calculate_statistics(self, current_vol_delta: float) -> Tuple[float, float]:
         """حساب الدرجة المعيارية (Z-Score) لاكتشاف الشذوذ"""
         if not self.volumes: return 0, 0
         
@@ -98,15 +123,47 @@ class MarketPulse:
         
         # معادلة Z-Score: (القيمة الحالية - المتوسط) / الانحراف
         z_score = (current_vol_delta - mean) / std_dev
-        
+
         return z_score, mean
 
-    def get_price_momentum(self):
+    def mad_score(self, current_vol_delta: float) -> float:
+        """قياس الشذوذ باستخدام الانحراف المطلق الوسيط (أكثر ثباتًا ضد القمم)."""
+        if not self.volumes:
+            return 0.0
+        vol_list = list(self.volumes)
+        median = sorted(vol_list)[len(vol_list) // 2]
+        deviations = [abs(v - median) for v in vol_list]
+        if not deviations:
+            return 0.0
+        mad = sorted(deviations)[len(deviations) // 2]
+        if mad == 0:
+            return 0.0
+        return 0.6745 * (current_vol_delta - median) / mad
+
+    def get_price_momentum(self) -> float:
         if len(self.prices) < 5: return 0
         # نسبة التغير خلال آخر 5 ثواني
         start = self.prices[-5]
         end = self.prices[-1]
         return ((end - start) / start) * 100
+
+    def get_smoothed_velocity(self) -> float:
+        """حساب نسبة التغير اللحظية باستخدام المتوسط الأسي لزيادة دقة الاستباق."""
+        if self.ema_price is None or len(self.prices) < 2:
+            return 0
+        last_price = self.prices[-1]
+        if self.ema_price == 0:
+            return 0
+        return ((last_price - self.ema_price) / self.ema_price) * 100
+
+    def get_fast_velocity(self) -> float:
+        """تسارع أسرع مبني على EMA سريع لالتقاط الانطلاقة الأولى."""
+        if self.fast_ema_price is None or len(self.prices) < 2:
+            return 0
+        last_price = self.prices[-1]
+        if self.fast_ema_price == 0:
+            return 0
+        return ((last_price - self.fast_ema_price) / self.fast_ema_price) * 100
 
 # =====================[ 🚀 الكور الرئيسي ]=====================
 
@@ -115,10 +172,18 @@ class QuantumSniper:
         self.base_ws = "wss://fstream.binance.com/ws/!ticker@arr"
         self.coins: Dict[str, MarketPulse] = {}
         # هام: لا تقم بتهيئة Queue هنا لتجنب مشاكل Loop
-        self.msg_queue = None 
+        self.msg_queue = None
         self.session = None
         self.btc_trend = 0.0
         self.paused = False
+        self.last_signal_time: Dict[str, float] = {}
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.StreamHandler(sys.stdout)],
+        )
+        self.logger = logging.getLogger("quantum-sniper")
         
         # إعداد ملف اللوج
         if not os.path.exists(CONFIG["LOG_FILE"]):
@@ -126,19 +191,42 @@ class QuantumSniper:
                 writer = csv.writer(f)
                 writer.writerow(["Time", "Symbol", "Type", "Price", "Z-Score", "Volume($)", "Change%"])
 
+    def is_on_cooldown(self, symbol: str) -> bool:
+        """منع إغراق الإشعارات لنفس العملة مع السماح للانفجارات النووية بالمرور."""
+        last_time = self.last_signal_time.get(symbol)
+        if last_time is None:
+            return False
+        return (time.time() - last_time) < CONFIG["COOLDOWN_SECONDS"]
+
+    def record_signal(self, symbol: str):
+        self.last_signal_time[symbol] = time.time()
+
+    def btc_relative_strength(self, price_change: float) -> float:
+        """قياس قوة العملة مقابل اتجاه البيتكوين لرفض الإشارات المتعبة."""
+        if 'BTCUSDT' not in self.coins or len(self.coins['BTCUSDT'].prices) < 2:
+            return price_change
+        btc_pulse = self.coins['BTCUSDT']
+        btc_change = btc_pulse.get_price_momentum()
+        return price_change - btc_change
+
     async def ws_listener(self):
         """مهمته الوحيدة شفط البيانات ورميها في الطابور بأقصى سرعة"""
+        backoff = CONFIG["RECONNECT_BACKOFF"]
         while True:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.ws_connect(self.base_ws) as ws:
                         print(f"{Term.GREEN}✓ Connected to Binance Neural Network...{Term.END}")
+                        backoff = CONFIG["RECONNECT_BACKOFF"]
                         async for msg in ws:
-                            if self.msg_queue:
+                            if self.msg_queue and not self.msg_queue.full():
                                 await self.msg_queue.put(json.loads(msg.data))
+                            elif self.msg_queue and self.msg_queue.full():
+                                self.logger.warning("Dropping snapshot: queue is full")
             except Exception as e:
                 print(f"{Term.RED}⚠️ Network Error: {e}{Term.END}")
-                await asyncio.sleep(2)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def market_analyzer(self):
         """العقل المدبر: يعالج البيانات رياضياً"""
@@ -165,40 +253,55 @@ class QuantumSniper:
                 tasks = []
                 for ticker in data:
                     symbol = ticker['s']
-                    if not symbol.endswith('USDT'): continue
-                    if 'BTC' in symbol and symbol != 'BTCUSDT': continue
-                    
+                    if not self.should_track(symbol, ticker):
+                        continue
+
                     # تهيئة العملة إذا كانت جديدة
                     if symbol not in self.coins:
-                        # فلتر الحجم اليومي
-                        if float(ticker['q']) < CONFIG["MIN_24H_VOL"]: continue
                         self.coins[symbol] = MarketPulse(symbol)
 
                     tasks.append(self.process_coin(self.coins[symbol], ticker))
-                
+
                 if tasks:
                     await asyncio.gather(*tasks)
-            
+
             except Exception as e:
-                print(f"Error in Analyzer: {e}")
+                self.logger.exception("Error in Analyzer: %s", e)
             finally:
                 self.msg_queue.task_done()
 
-    async def update_btc_status(self, ticker):
+    @staticmethod
+    def should_track(symbol: str, ticker: Dict) -> bool:
+        """فلترة صارمة لتجنب الرموز غير المستهدفة وتقليل الضوضاء"""
+        if not symbol.endswith('USDT'):
+            return False
+        if 'BTC' in symbol and symbol != 'BTCUSDT':
+            return False
+
+        # فلتر الحجم اليومي
+        try:
+            if float(ticker['q']) < CONFIG["MIN_24H_VOL"]:
+                return False
+        except (KeyError, ValueError, TypeError):
+            return False
+
+        return True
+
+    async def update_btc_status(self, ticker: Dict):
         """مراقبة اتجاه البيتكوين العام"""
         pulse = self.coins.get('BTCUSDT')
-        if not pulse: 
+        if not pulse:
             self.coins['BTCUSDT'] = MarketPulse('BTCUSDT')
             return
-            
+
         price = float(ticker['c'])
         vol = float(ticker['q'])
         pulse.add_snapshot(price, vol)
-        
+
         if len(pulse.prices) > 10:
             start_price = pulse.prices[0]
             self.btc_trend = ((price - start_price) / start_price) * 100
-            
+
             if self.btc_trend < CONFIG["BTC_DUMP_PERCENT"]:
                 if not self.paused:
                     print(f"\n{Term.RED}{Term.BOLD}⛔ BTC CRASH DETECTED ({self.btc_trend:.2f}%) - HALTING SNIPER{Term.END}")
@@ -208,11 +311,11 @@ class QuantumSniper:
                     print(f"\n{Term.GREEN}✅ BTC STABILIZED - RESUMING{Term.END}")
                 self.paused = False
 
-    async def process_coin(self, pulse: MarketPulse, ticker):
+    async def process_coin(self, pulse: MarketPulse, ticker: Dict):
         """تحليل العملة الواحدة"""
         current_price = float(ticker['c'])
         accumulated_vol = float(ticker['q'])
-        
+
         # حساب الحجم اللحظي قبل التحديث
         prev_vol = pulse.last_accumulated_vol
         if prev_vol == 0:
@@ -221,42 +324,86 @@ class QuantumSniper:
 
         delta_vol = accumulated_vol - prev_vol
         if delta_vol < 0: delta_vol = 0 # Reset case
-        
+
         # تحديث البيانات التاريخية
         pulse.add_snapshot(current_price, accumulated_vol)
 
         if not pulse.is_ready: return
 
         # --- [ المنطق الخارق: التحليل الإحصائي ] ---
-        
         z_score, mean_vol = pulse.calculate_statistics(delta_vol)
+        mad_score = pulse.mad_score(delta_vol)
         price_momentum = pulse.get_price_momentum()
-        
-        # 1. استراتيجية "الحدث النووي" (Sigma Event)
+        smoothed_velocity = pulse.get_smoothed_velocity()
+        fast_velocity = pulse.get_fast_velocity()
+        relative_momentum = self.btc_relative_strength(price_momentum)
+
+        # حواجز السوق العامة: خفّض الحساسية إذا كان البيتكوين متعبًا
+        if CONFIG["BTC_PROTECTION"] and self.btc_trend < CONFIG["BTC_RISK_AVERSION"] and relative_momentum < 0.5:
+            return
+
+        vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
+        ema_ratio = delta_vol / pulse.ema_volume if pulse.ema_volume else 0
+        fast_ratio = delta_vol / pulse.fast_ema_volume if pulse.fast_ema_volume else 0
+        liquidity_pressure = (vol_acceleration + ema_ratio + fast_ratio) / 3 if (vol_acceleration or ema_ratio or fast_ratio) else 0
+
+        composite_score = (
+            max(z_score, mad_score) * 0.4 +
+            max(smoothed_velocity, fast_velocity) * 0.3 +
+            liquidity_pressure * 0.3
+        )
+
+        # 1. استراتيجية "الحدث النووي" (Sigma Event) مع تجاوز التهدئة
         if z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
             await self.trigger_alert(
-                "☢️ STATISTICAL ANOMALY", 
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED
+                "☢️ STATISTICAL ANOMALY",
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED,
+                force=True
             )
-            
+            return
+
+        # تطبيق التهدئة لمنع التكرار
+        if self.is_on_cooldown(pulse.symbol):
+            return
+
         # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        elif z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
+        if max(z_score, mad_score) > 2.8 and -0.1 <= price_momentum <= 0.1 and liquidity_pressure > 1.1:
             await self.trigger_alert(
-                "🐳 SILENT ACCUMULATION", 
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.PURPLE
+                "🐳 SILENT ACCUMULATION",
+                pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE
             )
+            return
 
         # 3. استراتيجية "كسر الزخم" (Velocity Breakout)
-        vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
-        if vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
+        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25:
             await self.trigger_alert(
-                "🚀 VELOCITY BREAKOUT", 
+                "🚀 VELOCITY BREAKOUT",
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
             )
+            return
 
-    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color):
+        # 4. استراتيجية "التسارع الأسي" (Exponential Thrust) مطعمة ب MAD
+        if pulse.ema_volume and pulse.ema_volume > 0:
+            if ema_ratio > (CONFIG["ACCELERATION_FACTOR"] * 1.35) and smoothed_velocity > 0.18 and mad_score > CONFIG["MAD_MULTIPLIER"]:
+                await self.trigger_alert(
+                    "🌌 EXPONENTIAL THRUST",
+                    pulse.symbol, current_price, mad_score, delta_vol, smoothed_velocity, Term.CYAN
+                )
+                return
+
+        # 5. صفارة "الإشعال المبكر" تجمع عدة مقاييس متوسطة لصيد الدفعة الأولى
+        if composite_score > 2.4 and relative_momentum > 0.2 and fast_ratio > 1.2:
+            await self.trigger_alert(
+                "⚡ EARLY IGNITION",
+                pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN
+            )
+
+    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, force: bool = False):
         timestamp = time.strftime("%H:%M:%S")
-        
+
+        if not force and self.is_on_cooldown(symbol):
+            return
+
         # تنسيق الحجم
         vol_str = f"${vol/1000:.1f}K" if vol < 1000000 else f"${vol/1000000:.2f}M"
         
@@ -267,7 +414,9 @@ class QuantumSniper:
         print(f"{color}║ 📊 Z-Score: {z:.2f}σ (Rare!)     💎 Price: {price}       ║{Term.END}")
         print(f"{color}║ 🌊 Vol 1s:  {vol_str:<10}     📈 Change: {change:+.2f}%       ║{Term.END}")
         print(f"{color}╚══════════════════════════════════════════════════════════╝{Term.END}")
-        
+
+        self.record_signal(symbol)
+
         # حفظ في ملف CSV
         with open(CONFIG["LOG_FILE"], 'a', newline='') as f:
             writer = csv.writer(f)
@@ -278,7 +427,7 @@ class QuantumSniper:
         print(f"{Term.YELLOW}⏳ Calibrating statistical models (Collecting History)...{Term.END}")
         
         # الحل الجذري للمشكلة: إنشاء الطابور داخل الحلقة النشطة هنا
-        self.msg_queue = asyncio.Queue()
+        self.msg_queue = asyncio.Queue(maxsize=CONFIG["MAX_QUEUE_SIZE"])
         
         # تشغيل العمليات بشكل متوازي
         await asyncio.gather(
