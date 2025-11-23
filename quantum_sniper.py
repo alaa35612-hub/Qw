@@ -6,9 +6,10 @@ import os
 import csv
 import sys
 import logging
+import statistics
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Deque
 
 import aiohttp
 
@@ -21,6 +22,9 @@ CONFIG = {
     "RECONNECT_BACKOFF": 2,          # ثواني الانتظار قبل إعادة الاتصال
     "EMA_ALPHA": 0.24,               # معامل التنعيم للحجوم السعرية (0.2 = سلاسة أكبر)
     "FAST_ALPHA": 0.35,              # معامل أسرع لالتقاط اللحظات الحادة
+    "VOLATILITY_SMOOTH": 0.18,       # تنعيم لتصنيف نظام التذبذب
+    "VOL_REGIME_RANGE": 0.9,         # تقدير عنف السوق من نطاق السعر النسبي داخل النافذة
+    "MULTI_WINDOWS": (15, 60, 180, 300),  # أطر زمنية متعددة للتقاطع
 
     # --- [ خوارزميات الحساسية ] ---
     "SIGMA_THRESHOLD": 1.4,          # (Z-Score) الحساسية للشذوذ الإحصائي (أقل = أكثر حساسية)
@@ -28,6 +32,11 @@ CONFIG = {
     "ACCELERATION_FACTOR": 1.15,     # معامل تسارع السيولة المطلوب
     "COOLDOWN_SECONDS": 18,          # تهدئة بين إشارات العملة الواحدة لمنع الإغراق
     "WARMUP_POINTS": 25,             # الحد الأدنى للعينات قبل تفعيل المنطق الخارق
+    "SIGMA_ADAPT_FLOOR": 0.85,       # أقل معامل تخفيض للسقف الديناميكي
+    "SIGMA_ADAPT_CEIL": 1.75,        # أعلى معامل تضخيم للسقف الديناميكي
+    "WHL_SPIKE_MULT": 2.35,          # مضاعف حجم مفاجئ للحيتان
+    "SILENT_SPREAD": 0.35,           # أقصى نطاق سعري % لتعريف التجميع/التصريف الهادئ
+    "DISTRIBUTION_DRIFT": -0.25,     # ميل سعري سلبي بسيط لتعريف التصريف الهادئ
 
     # --- [ حماية السوق ] ---
     "BTC_PROTECTION": True,          # إيقاف الشراء إذا كان البيتكوين ينهار
@@ -71,13 +80,19 @@ class MarketPulse:
     symbol: str
     prices: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
     volumes: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
+    snapshots: Dict[int, Deque[Tuple[float, float, float]]] = field(default_factory=lambda: {
+        window: deque() for window in CONFIG["MULTI_WINDOWS"]
+    })
     last_accumulated_vol: float = 0.0
     ema_volume: Optional[float] = None
     ema_price: Optional[float] = None
     fast_ema_price: Optional[float] = None
     fast_ema_volume: Optional[float] = None
+    on_balance_volume: float = 0.0
+    last_price: Optional[float] = None
+    regime_score: float = 1.0
 
-    def add_snapshot(self, price: float, accumulated_vol: float) -> float:
+    def add_snapshot(self, price: float, accumulated_vol: float, now: Optional[float] = None) -> float:
         # حساب حجم التدفق في هذه اللحظة (Delta)
         if self.last_accumulated_vol == 0:
             delta_vol = 0
@@ -91,6 +106,12 @@ class MarketPulse:
         self.prices.append(price)
         self.volumes.append(delta_vol)
 
+        # تحديث OBV لتقدير تدفق السيولة المحمية
+        if self.last_price is not None:
+            direction = 1 if price > self.last_price else -1 if price < self.last_price else 0
+            self.on_balance_volume += direction * delta_vol
+        self.last_price = price
+
         # تحديث المتوسط الأسي للحجم والسعر لتقليل الضوضاء ورفع حساسية الكشف
         alpha = CONFIG["EMA_ALPHA"]
         fast_alpha = CONFIG["FAST_ALPHA"]
@@ -98,6 +119,14 @@ class MarketPulse:
         self.ema_price = price if self.ema_price is None else (alpha * price + (1 - alpha) * self.ema_price)
         self.fast_ema_volume = delta_vol if self.fast_ema_volume is None else (fast_alpha * delta_vol + (1 - fast_alpha) * self.fast_ema_volume)
         self.fast_ema_price = price if self.fast_ema_price is None else (fast_alpha * price + (1 - fast_alpha) * self.fast_ema_price)
+
+        # الاحتفاظ بأطر زمنية متعددة مع الوقت الفعلي
+        ts = now or time.time()
+        for window, buf in self.snapshots.items():
+            buf.append((ts, price, delta_vol))
+            cutoff = ts - window
+            while buf and buf[0][0] < cutoff:
+                buf.popleft()
 
         return delta_vol
 
@@ -147,6 +176,47 @@ class MarketPulse:
         end = self.prices[-1]
         return ((end - start) / start) * 100
 
+    def volatility_regime(self) -> float:
+        """تقدير ديناميكي لتصنيف التذبذب (هدوء/عاصف) لتعديل العتبات."""
+        if len(self.prices) < 10:
+            return 1.0
+        returns = []
+        for i in range(1, len(self.prices)):
+            prev, curr = self.prices[i - 1], self.prices[i]
+            if prev > 0:
+                returns.append((curr - prev) / prev)
+        if not returns:
+            return 1.0
+        std_dev = statistics.pstdev(returns)
+        price_range = (max(self.prices) - min(self.prices)) / max(self.prices) if self.prices else 0
+        regime = (std_dev + price_range * CONFIG["VOL_REGIME_RANGE"]) * 10
+        # تنعيم لخفض الضوضاء الزمنية
+        self.regime_score = (CONFIG["VOLATILITY_SMOOTH"] * regime) + ((1 - CONFIG["VOLATILITY_SMOOTH"]) * self.regime_score)
+        return max(CONFIG["SIGMA_ADAPT_FLOOR"], min(self.regime_score, CONFIG["SIGMA_ADAPT_CEIL"]))
+
+    def multi_frame_features(self, now: float) -> Dict[int, Dict[str, float]]:
+        """حساب الزخم والحجم النسبي على عدة أطر زمنية."""
+        features: Dict[int, Dict[str, float]] = {}
+        for window, buf in self.snapshots.items():
+            if len(buf) < 2:
+                features[window] = {"momentum": 0.0, "vol_ratio": 0.0}
+                continue
+            start_ts, start_price, _ = buf[0]
+            end_ts, end_price, _ = buf[-1]
+            if start_price == 0:
+                momentum = 0.0
+            else:
+                momentum = ((end_price - start_price) / start_price) * 100
+            total_vol = sum(x[2] for x in buf)
+            base_vol = statistics.fmean(self.volumes) if self.volumes else 1
+            vol_ratio = (total_vol / (len(buf) or 1)) / base_vol
+            features[window] = {
+                "momentum": momentum,
+                "vol_ratio": vol_ratio,
+                "duration": end_ts - start_ts,
+            }
+        return features
+
     def get_smoothed_velocity(self) -> float:
         """حساب نسبة التغير اللحظية باستخدام المتوسط الأسي لزيادة دقة الاستباق."""
         if self.ema_price is None or len(self.prices) < 2:
@@ -164,6 +234,13 @@ class MarketPulse:
         if self.fast_ema_price == 0:
             return 0
         return ((last_price - self.fast_ema_price) / self.fast_ema_price) * 100
+
+    def range_percent(self) -> float:
+        if len(self.prices) < 2:
+            return 0.0
+        high, low = max(self.prices), min(self.prices)
+        base = self.prices[0] if self.prices[0] != 0 else 1
+        return ((high - low) / base) * 100
 
 # =====================[ 🚀 الكور الرئيسي ]=====================
 
@@ -296,7 +373,7 @@ class QuantumSniper:
 
         price = float(ticker['c'])
         vol = float(ticker['q'])
-        pulse.add_snapshot(price, vol)
+        pulse.add_snapshot(price, vol, now=time.time())
 
         if len(pulse.prices) > 10:
             start_price = pulse.prices[0]
@@ -313,30 +390,36 @@ class QuantumSniper:
 
     async def process_coin(self, pulse: MarketPulse, ticker: Dict):
         """تحليل العملة الواحدة"""
+        now = time.time()
         current_price = float(ticker['c'])
         accumulated_vol = float(ticker['q'])
 
         # حساب الحجم اللحظي قبل التحديث
         prev_vol = pulse.last_accumulated_vol
         if prev_vol == 0:
-            pulse.add_snapshot(current_price, accumulated_vol)
+            pulse.add_snapshot(current_price, accumulated_vol, now=now)
             return
 
         delta_vol = accumulated_vol - prev_vol
         if delta_vol < 0: delta_vol = 0 # Reset case
 
         # تحديث البيانات التاريخية
-        pulse.add_snapshot(current_price, accumulated_vol)
+        pulse.add_snapshot(current_price, accumulated_vol, now=now)
 
         if not pulse.is_ready: return
 
         # --- [ المنطق الخارق: التحليل الإحصائي ] ---
+        regime_factor = pulse.volatility_regime()
+        adaptive_sigma = CONFIG["SIGMA_THRESHOLD"] * regime_factor
+
         z_score, mean_vol = pulse.calculate_statistics(delta_vol)
         mad_score = pulse.mad_score(delta_vol)
         price_momentum = pulse.get_price_momentum()
         smoothed_velocity = pulse.get_smoothed_velocity()
         fast_velocity = pulse.get_fast_velocity()
         relative_momentum = self.btc_relative_strength(price_momentum)
+        range_pct = pulse.range_percent()
+        multi_frames = pulse.multi_frame_features(now)
 
         # حواجز السوق العامة: خفّض الحساسية إذا كان البيتكوين متعبًا
         if CONFIG["BTC_PROTECTION"] and self.btc_trend < CONFIG["BTC_RISK_AVERSION"] and relative_momentum < 0.5:
@@ -353,8 +436,11 @@ class QuantumSniper:
             liquidity_pressure * 0.3
         )
 
+        short_frame = multi_frames.get(15, {"momentum": 0.0, "vol_ratio": 0.0})
+        minute_frame = multi_frames.get(60, {"momentum": 0.0, "vol_ratio": 0.0})
+
         # 1. استراتيجية "الحدث النووي" (Sigma Event) مع تجاوز التهدئة
-        if z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
+        if z_score > adaptive_sigma and price_momentum > 0.2:
             await self.trigger_alert(
                 "☢️ STATISTICAL ANOMALY",
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED,
@@ -367,22 +453,38 @@ class QuantumSniper:
             return
 
         # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        if max(z_score, mad_score) > 2.8 and -0.1 <= price_momentum <= 0.1 and liquidity_pressure > 1.1:
+        if max(z_score, mad_score) > 2.8 and abs(price_momentum) <= 0.12 and liquidity_pressure > 1.1 and range_pct < CONFIG["SILENT_SPREAD"]:
             await self.trigger_alert(
                 "🐳 SILENT ACCUMULATION",
                 pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE
             )
             return
 
-        # 3. استراتيجية "كسر الزخم" (Velocity Breakout)
-        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25:
+        # 3. استراتيجية "التصريف الهادئ" (Silent Distribution)
+        if max(z_score, mad_score) > 1.8 and CONFIG["DISTRIBUTION_DRIFT"] <= price_momentum <= 0 and liquidity_pressure > 1.0 and pulse.on_balance_volume < 0 and range_pct < (CONFIG["SILENT_SPREAD"] * 1.3):
+            await self.trigger_alert(
+                "🥷 SILENT DISTRIBUTION",
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.BLUE
+            )
+            return
+
+        # 4. استراتيجية "حوت الحجم" (Volume Whale)
+        if mean_vol > 0 and delta_vol > mean_vol * CONFIG["WHL_SPIKE_MULT"] and short_frame["vol_ratio"] > 1.25:
+            await self.trigger_alert(
+                "🐋 VOLUME SPIKE",
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
+            )
+            return
+
+        # 5. استراتيجية "كسر الزخم" (Velocity Breakout)
+        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25 and short_frame["momentum"] > minute_frame["momentum"]:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT",
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
             )
             return
 
-        # 4. استراتيجية "التسارع الأسي" (Exponential Thrust) مطعمة ب MAD
+        # 6. استراتيجية "التسارع الأسي" (Exponential Thrust) مطعمة ب MAD
         if pulse.ema_volume and pulse.ema_volume > 0:
             if ema_ratio > (CONFIG["ACCELERATION_FACTOR"] * 1.35) and smoothed_velocity > 0.18 and mad_score > CONFIG["MAD_MULTIPLIER"]:
                 await self.trigger_alert(
@@ -391,8 +493,8 @@ class QuantumSniper:
                 )
                 return
 
-        # 5. صفارة "الإشعال المبكر" تجمع عدة مقاييس متوسطة لصيد الدفعة الأولى
-        if composite_score > 2.4 and relative_momentum > 0.2 and fast_ratio > 1.2:
+        # 7. رادار "الإشعال المبكر" متعدد الأطر
+        if composite_score > 2.4 and relative_momentum > 0.2 and fast_ratio > 1.2 and short_frame["momentum"] > 0.4 and short_frame["vol_ratio"] > 1.1:
             await self.trigger_alert(
                 "⚡ EARLY IGNITION",
                 pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN
@@ -418,6 +520,19 @@ class QuantumSniper:
         self.record_signal(symbol)
 
         # حفظ في ملف CSV
+        await asyncio.to_thread(
+            self._write_csv,
+            timestamp,
+            symbol,
+            signal_type,
+            price,
+            z,
+            vol,
+            change,
+        )
+
+    @staticmethod
+    def _write_csv(timestamp: str, symbol: str, signal_type: str, price: float, z: float, vol: float, change: float):
         with open(CONFIG["LOG_FILE"], 'a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([timestamp, symbol, signal_type, price, round(z, 2), round(vol, 2), round(change, 2)])
