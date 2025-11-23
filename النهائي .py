@@ -11101,6 +11101,25 @@ def _main(argv: Optional[List[str]] = None) -> None:
 
 
 if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
+    # توجيه التشغيل التلقائي نحو ماسح المنطقة الذهبية متعدد الأطر الزمنية
+    # مع الحفاظ على إمكانية استدعاء واجهة الإستراتيجيات المدمجة عند توفير
+    # وسائطها الخاصة. عدم تمرير أية وسائط يشغل ماسح Binance الذي يفرض
+    # التواجد داخل Golden zone على الأطر 1m/5m/15m/1h/4h/1d ويعرض تنبيهًا
+    # واحدًا باللون الأزرق داخل شاشة المحرر فقط.
+    argv = sys.argv[1:]
+    strategy_flags = {
+        "--strategy",
+        "--symbols",
+        "--start",
+        "--end",
+        "--equity",
+        "--risk",
+        "--ny-offset",
+        "--live",
+        "--csv",
+    }
+    if any(flag in argv for flag in strategy_flags):
+        _main(argv)
+    else:
+        sys.exit(main(argv))
 # ============================ End of Integration ============================
