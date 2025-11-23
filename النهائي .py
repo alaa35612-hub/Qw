@@ -38,6 +38,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+import builtins
 
 try:
     import ccxt  # type: ignore
@@ -50,9 +51,24 @@ try:
     from urllib3.util.retry import Retry  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     requests = None  # type: ignore
-    HTTPAdapter = None  # type: ignore
-    Retry = None  # type: ignore
+HTTPAdapter = None  # type: ignore
+Retry = None  # type: ignore
 
+
+# ----------------------------------------------------------------------------
+# Global feature toggles requested by the user
+# ----------------------------------------------------------------------------
+DISABLE_STRATEGIES = True
+DISABLE_ALERTS = True
+DISABLE_EVENTS = True
+EDITOR_ALERT_COLOR = "#1e90ff"
+
+_ORIGINAL_PRINT = builtins.print
+if DISABLE_EVENTS:
+    def _silent_print(*args: Any, **kwargs: Any) -> None:
+        return
+
+    builtins.print = _silent_print
 
 # ----------------------------------------------------------------------------
 # Pine compatibility helpers
@@ -1327,6 +1343,8 @@ class SmartMoneyAlgoProE5:
         self.ob_valid_history: Dict[str, bool] = {}
         self.security_bucket_tracker: Dict[str, Optional[int]] = {}
         self.tracer = tracer or ExecutionTracer(False)
+        self.enable_alerts = not DISABLE_ALERTS
+        self.enable_events = not DISABLE_EVENTS
 
         # Labels, boxes, lines ------------------------------------------------
         self.labels: List[Label] = []
@@ -1434,6 +1452,8 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
+        if not self.enable_alerts:
+            return
         if condition:
             timestamp = self.series.get_time(0)
             text = title if message is None else f"{title} :: {message}"
@@ -1560,6 +1580,8 @@ class SmartMoneyAlgoProE5:
         return metrics
 
     def _register_label_event(self, label: Label) -> None:
+        if not self.enable_events:
+            return
         text = label.text.strip()
         collapsed = text.replace(" ", "")
         key: Optional[str] = None
@@ -1608,6 +1630,8 @@ class SmartMoneyAlgoProE5:
         *,
         bullish: bool,
     ) -> None:
+        if not self.enable_events:
+            return
         direction_text = "صاعد" if bullish else "هابط"
         display = f"{key} @ {format_price(price)} ({direction_text})"
         self.console_event_log[key] = {
@@ -1622,6 +1646,8 @@ class SmartMoneyAlgoProE5:
         }
 
     def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
+        if not self.enable_events:
+            return
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -8762,6 +8788,43 @@ def _collect_recent_event_hits(
     return hits, recent_times
 
 
+def _price_in_golden_zone(runtime: SmartMoneyAlgoProE5) -> bool:
+    box = getattr(runtime, "bxf", None)
+    if not isinstance(box, Box):
+        return False
+    price = runtime.series.get("close")
+    if not isinstance(price, (int, float)) or math.isnan(price):
+        return False
+    lower = min(box.bottom, box.top)
+    upper = max(box.bottom, box.top)
+    return lower <= price <= upper
+
+
+def _emit_editor_alert(runtime: SmartMoneyAlgoProE5, symbol: str, timeframes: Sequence[str]) -> None:
+    """Create a blue, editor-visible label noting the multi-TF Golden zone match."""
+
+    box = getattr(runtime, "bxf", None)
+    mid_price: float
+    if isinstance(box, Box):
+        mid_price = (box.top + box.bottom) / 2
+    else:
+        price = runtime.series.get("close")
+        mid_price = 0.0 if not isinstance(price, (int, float)) or math.isnan(price) else price
+    ts = runtime.series.get_time(0) or int(time.time() * 1000)
+    tf_text = "/".join(timeframes)
+    runtime.label_new(
+        ts,
+        mid_price,
+        f"{symbol} — Golden zone ({tf_text})",
+        "xloc.bar_time",
+        "yloc.price",
+        EDITOR_ALERT_COLOR,
+        "label.style_label_up",
+        "size.normal",
+        EDITOR_ALERT_COLOR,
+    )
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8774,6 +8837,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    enforce_golden_zone: bool = True,
+    golden_zone_timeframes: Optional[Sequence[str]] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8787,6 +8852,12 @@ def scan_binance(
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
+    if inputs is None:
+        inputs = IndicatorInputs()
+    try:
+        inputs.structure_util.isOTE = True
+    except Exception:
+        pass
     window = recent_window_bars
     if window is None:
         console_inputs = getattr(inputs, "console", None) if inputs else None
@@ -8802,18 +8873,20 @@ def scan_binance(
         try:
             ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
+            if not DISABLE_EVENTS:
+                print(
+                    f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             continue
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
+            if not DISABLE_EVENTS:
+                print(
+                    f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
+                    flush=True,
+                )
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
@@ -8824,54 +8897,61 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
+        tfs = (
+            list(dict.fromkeys(golden_zone_timeframes))
+            if golden_zone_timeframes is not None
+            else ["1m", "5m", "15m", "1h", "4h", "1d"]
+        ) if enforce_golden_zone else [timeframe]
+        symbol_runs: List[Tuple[str, SmartMoneyAlgoProE5]] = []
+        failed_tf: Optional[str] = None
+
+        for tf in tfs:
+            candles = fetch_ohlcv(exchange, symbol, tf, limit)
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=tf, tracer=tracer)
+            runtime.process(candles)
+            symbol_runs.append((tf, runtime))
+            if enforce_golden_zone and not _price_in_golden_zone(runtime):
+                failed_tf = tf
+                break
+
+        if enforce_golden_zone and failed_tf:
+            if not DISABLE_EVENTS:
+                print(
+                    f"تخطي {_format_symbol(symbol)} لخروج السعر من Golden zone على إطار {failed_tf}",
+                    flush=True,
                 )
             continue
 
+        primary_tf, primary_rt = symbol_runs[0]
+        metrics = primary_rt.gather_console_metrics()
         metrics["daily_change_percent"] = daily_change
+        metrics["golden_zone_timeframes"] = tfs
+        metrics["golden_zone_match"] = enforce_golden_zone
+
         summaries.append(
             {
                 "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
+                "timeframe": primary_tf,
+                "candles": len(symbol_runs[0][1].series.time),
+                "alerts": metrics.get("alerts", len(primary_rt.alerts)),
+                "boxes": metrics.get("boxes", len(primary_rt.boxes)),
                 "metrics": metrics,
             }
         )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
+        _emit_editor_alert(primary_rt, symbol, tfs)
+        if not DISABLE_EVENTS:
+            print_symbol_summary(idx, symbol, primary_tf, len(symbol_runs[0][1].series.time), metrics)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
                 "symbol_complete",
-                timestamp=runtime.series.get_time(0),
+                timestamp=primary_rt.series.get_time(0),
                 symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
+                timeframe=primary_tf,
+                candles=len(symbol_runs[0][1].series.time),
             )
         if primary_runtime is None:
-            primary_runtime = runtime
+            primary_runtime = primary_rt
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
@@ -8898,6 +8978,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=float,
         default=0.0,
         help="الحد الأدنى لتغير 24 ساعة (٪) لاختيار الرمز عند مسح Binance، 0 لتعطيل الفلتر",
+    )
+    parser.add_argument(
+        "--golden-zone",
+        dest="golden_zone",
+        action=_OptionalBoolAction,
+        default=True,
+        help="تفعيل فلتر المنطقة الذهبية على كافة الأطر الزمنية",
+    )
+    parser.add_argument(
+        "--golden-timeframes",
+        type=str,
+        default="1m,5m,15m,1h,4h,1d",
+        help="الأطر الزمنية المطلوبة للمنطقة الذهبية، مفصولة بفواصل",
     )
     parser.add_argument(
         "--pullback-report",
@@ -8961,6 +9054,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     indicator_inputs = IndicatorInputs()
     indicator_inputs.console.max_age_bars = args.max_age_bars
+    try:
+        indicator_inputs.structure_util.isOTE = True
+    except Exception:
+        pass
+    golden_timeframes = [
+        tf.strip()
+        for tf in args.golden_timeframes.split(",")
+        if tf.strip()
+    ] if args.golden_zone else [args.timeframe]
 
     if args.pullback_report:
         log("Foundation")
@@ -9040,6 +9142,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tracer,
                 min_daily_change=args.min_daily_change,
                 inputs=indicator_inputs,
+                enforce_golden_zone=args.golden_zone,
+                golden_zone_timeframes=golden_timeframes,
             )
             perform_comparison()
             log("Rendering")
@@ -10699,6 +10803,8 @@ class _StrategyEngine:
               f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
 
     def evaluate_and_print(self, name: str) -> None:
+        if DISABLE_STRATEGIES:
+            return
         sig = self._evaluate(name)
         if sig:
             self._print(sig)
