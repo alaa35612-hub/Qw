@@ -17,32 +17,40 @@ import aiohttp
 # =====================[ ⚙️ إعدادات المحرك الكمي ]=====================
 
 CONFIG = {
-    "WINDOW_SIZE": 90,               # نافذة التحليل بالثواني (لصنع المتوسطات)
-    "MIN_24H_VOL": 25_000_000,       # تجاهل العملات الميتة (أقل من 25 مليون)
-    "MAX_QUEUE_SIZE": 7_500,         # الحد الأقصى للطابور لحماية الذاكرة
-    "RECONNECT_BACKOFF": 2,          # ثواني الانتظار قبل إعادة الاتصال
-    "EMA_ALPHA": 0.24,               # معامل التنعيم للحجوم السعرية (0.2 = سلاسة أكبر)
-    "FAST_ALPHA": 0.35,              # معامل أسرع لالتقاط اللحظات الحادة
-    "VOLATILITY_SMOOTH": 0.18,       # تنعيم لتصنيف نظام التذبذب
-    "VOL_REGIME_RANGE": 0.9,         # تقدير عنف السوق من نطاق السعر النسبي داخل النافذة
-    "MULTI_WINDOWS": (15, 60, 180, 300),  # أطر زمنية متعددة للتقاطع
+    "WINDOW_SIZE": 120,               # نافذة التحليل بالثواني (لصنع المتوسطات)
+    "MIN_24H_VOL": 25_000_000,        # تجاهل العملات الميتة (أقل من 25 مليون)
+    "MAX_QUEUE_SIZE": 7_500,          # الحد الأقصى للطابور لحماية الذاكرة
+    "RECONNECT_BACKOFF": 2,           # ثواني الانتظار قبل إعادة الاتصال
+    "EMA_ALPHA": 0.22,                # معامل التنعيم للحجوم السعرية (سلاسة أعلى ضد الضوضاء)
+    "FAST_ALPHA": 0.32,               # معامل أسرع لالتقاط اللحظات الحادة
+    "VOLATILITY_SMOOTH": 0.2,         # تنعيم لتصنيف نظام التذبذب
+    "VOL_REGIME_RANGE": 0.9,          # تقدير عنف السوق من نطاق السعر النسبي داخل النافذة
+    # أطر زمنية واضحة للمستخدم (1m، 5m، 15m، 1h، 4h)
+    "TIMEFRAMES": {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3_600,
+        "4h": 14_400,
+    },
+    "MULTI_WINDOWS": (60, 300, 900, 3_600, 14_400),
 
     # --- [ خوارزميات الحساسية ] ---
-    "SIGMA_THRESHOLD": 1.4,          # (Z-Score) الحساسية للشذوذ الإحصائي (أقل = أكثر حساسية)
-    "MAD_MULTIPLIER": 4.0,           # مضاعف حساس لـ MAD-Score للتأكيد المتقاطع
-    "ACCELERATION_FACTOR": 1.15,     # معامل تسارع السيولة المطلوب
-    "COOLDOWN_SECONDS": 18,          # تهدئة بين إشارات العملة الواحدة لمنع الإغراق
-    "WARMUP_POINTS": 25,             # الحد الأدنى للعينات قبل تفعيل المنطق الخارق
-    "SIGMA_ADAPT_FLOOR": 0.85,       # أقل معامل تخفيض للسقف الديناميكي
-    "SIGMA_ADAPT_CEIL": 1.75,        # أعلى معامل تضخيم للسقف الديناميكي
-    "WHL_SPIKE_MULT": 2.35,          # مضاعف حجم مفاجئ للحيتان
-    "SILENT_SPREAD": 0.35,           # أقصى نطاق سعري % لتعريف التجميع/التصريف الهادئ
-    "DISTRIBUTION_DRIFT": -0.25,     # ميل سعري سلبي بسيط لتعريف التصريف الهادئ
+    "SIGMA_THRESHOLD": 1.8,           # رفع العتبة لتقليل الضوضاء وتمييز الأحداث المهمة فقط
+    "MAD_MULTIPLIER": 3.2,            # تقليل المضاعف لالتقاط الانطلاقات المؤكدة دون إشارات عشوائية
+    "ACCELERATION_FACTOR": 1.2,       # معامل تسارع السيولة المطلوب
+    "COOLDOWN_SECONDS": 22,           # تهدئة أطول لتجنب التكرار المزعج
+    "WARMUP_POINTS": 35,              # الحد الأدنى للعينات قبل تفعيل المنطق الخارق
+    "SIGMA_ADAPT_FLOOR": 1.0,         # أقل معامل تخفيض للسقف الديناميكي
+    "SIGMA_ADAPT_CEIL": 1.9,          # أعلى معامل تضخيم للسقف الديناميكي
+    "WHL_SPIKE_MULT": 2.5,            # مضاعف حجم مفاجئ للحيتان
+    "SILENT_SPREAD": 0.28,            # أقصى نطاق سعري % لتعريف التجميع/التصريف الهادئ
+    "DISTRIBUTION_DRIFT": -0.22,      # ميل سعري سلبي بسيط لتعريف التصريف الهادئ
 
     # --- [ حماية السوق ] ---
-    "BTC_PROTECTION": True,          # إيقاف الشراء إذا كان البيتكوين ينهار
-    "BTC_DUMP_PERCENT": -0.35,       # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
-    "BTC_RISK_AVERSION": -0.15,      # عطّل إشارات القفز إذا كان البيتكوين سلبيًا قليلًا
+    "BTC_PROTECTION": True,           # إيقاف الشراء إذا كان البيتكوين ينهار
+    "BTC_DUMP_PERCENT": -0.35,        # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
+    "BTC_RISK_AVERSION": -0.15,       # عطّل إشارات القفز إذا كان البيتكوين سلبيًا قليلًا
 
     "LOG_FILE": "quantum_signals.csv"
 }
@@ -81,16 +89,16 @@ class SignalWriter:
         self.queue: asyncio.Queue = asyncio.Queue(maxsize=1500)
         self.running = True
 
-    async def submit(self, payload: Tuple[str, str, str, float, float, float, float]):
+    async def submit(self, payload: Tuple[str, str, str, str, float, float, float, float]):
         QuantumSniper._bounded_put(self.queue, payload)
 
     async def run(self):
         while self.running or not self.queue.empty():
-            timestamp, symbol, signal_type, price, z, vol, change = await self.queue.get()
+            timestamp, symbol, signal_type, strength, price, z, vol, change = await self.queue.get()
             try:
                 with open(self.path, 'a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([timestamp, symbol, signal_type, price, round(z, 2), round(vol, 2), round(change, 2)])
+                    writer.writerow([timestamp, symbol, signal_type, strength, price, round(z, 2), round(vol, 2), round(change, 2)])
             finally:
                 self.queue.task_done()
 
@@ -294,7 +302,7 @@ class QuantumSniper:
         if not os.path.exists(CONFIG["LOG_FILE"]):
             with open(CONFIG["LOG_FILE"], 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Time", "Symbol", "Type", "Price", "Z-Score", "Volume($)", "Change%"])
+                writer.writerow(["Time", "Symbol", "Type", "Strength(ar)", "Price", "Z-Score", "Volume($)", "Change%"])
 
     @staticmethod
     def _bounded_put(queue: asyncio.Queue, item):
@@ -329,6 +337,40 @@ class QuantumSniper:
         regime_factor = pulse.volatility_regime()
         btc_bias = 1.15 if self.btc_trend < CONFIG["BTC_RISK_AVERSION"] else 1.0
         return min(CONFIG["SIGMA_ADAPT_CEIL"], max(CONFIG["SIGMA_ADAPT_FLOOR"], base * regime_factor * btc_bias))
+
+    def classify_strength(self, z_score: float, price_momentum: float, multi_frames: Dict[int, Dict[str, float]]) -> Tuple[str, float]:
+        """توليد توصيف عربي للإشارة حسب الزخم والحجم عبر الأطر المتعددة."""
+        def frame(key: str) -> Dict[str, float]:
+            secs = CONFIG["TIMEFRAMES"].get(key)
+            return multi_frames.get(secs, {"momentum": 0.0, "vol_ratio": 0.0})
+
+        tf_1m = frame("1m")
+        tf_5m = frame("5m")
+        tf_15m = frame("15m")
+
+        avg_momentum = statistics.fmean([
+            tf_1m.get("momentum", 0.0),
+            tf_5m.get("momentum", 0.0),
+            tf_15m.get("momentum", 0.0),
+        ]) if multi_frames else 0.0
+
+        vol_confirmation = max(
+            tf_1m.get("vol_ratio", 0.0),
+            tf_5m.get("vol_ratio", 0.0),
+            tf_15m.get("vol_ratio", 0.0),
+        )
+
+        composite = (
+            max(z_score, 0) * 0.45 +
+            max(price_momentum, avg_momentum) * 0.35 +
+            vol_confirmation * 0.35
+        )
+
+        if (z_score >= 2.5 and vol_confirmation >= 1.35 and avg_momentum >= 1.0) or composite >= 4.2:
+            return "شراء قوي جدا", composite
+        if (z_score >= 1.9 and vol_confirmation >= 1.1 and avg_momentum >= 0.45) or composite >= 3.1:
+            return "شراء قوي", composite
+        return "شراء ضعيف", composite
 
     async def ws_listener(self):
         """مهمته الوحيدة شفط البيانات ورميها في الطابور بأقصى سرعة"""
@@ -471,25 +513,32 @@ class QuantumSniper:
         if CONFIG["BTC_PROTECTION"] and self.btc_trend < CONFIG["BTC_RISK_AVERSION"] and relative_momentum < 0.5:
             return
 
+        tf_1m = multi_frames.get(CONFIG["TIMEFRAMES"]["1m"], {"momentum": 0.0, "vol_ratio": 0.0})
+        tf_5m = multi_frames.get(CONFIG["TIMEFRAMES"]["5m"], {"momentum": 0.0, "vol_ratio": 0.0})
+        tf_15m = multi_frames.get(CONFIG["TIMEFRAMES"]["15m"], {"momentum": 0.0, "vol_ratio": 0.0})
+        strength_label, strength_score = self.classify_strength(max(z_score, mad_score), price_momentum, multi_frames)
+
         vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
         ema_ratio = delta_vol / pulse.ema_volume if pulse.ema_volume else 0
         fast_ratio = delta_vol / pulse.fast_ema_volume if pulse.fast_ema_volume else 0
         liquidity_pressure = (vol_acceleration + ema_ratio + fast_ratio) / 3 if (vol_acceleration or ema_ratio or fast_ratio) else 0
 
         composite_score = (
-            max(z_score, mad_score) * 0.4 +
-            max(smoothed_velocity, fast_velocity) * 0.3 +
-            liquidity_pressure * 0.3
+            max(z_score, mad_score) * 0.35 +
+            max(smoothed_velocity, fast_velocity, price_momentum) * 0.3 +
+            liquidity_pressure * 0.25 +
+            (tf_1m.get("vol_ratio", 0.0) + tf_5m.get("vol_ratio", 0.0)) * 0.05
         )
 
-        short_frame = multi_frames.get(15, {"momentum": 0.0, "vol_ratio": 0.0})
-        minute_frame = multi_frames.get(60, {"momentum": 0.0, "vol_ratio": 0.0})
+        # فلتر حساسية أولي لتقليل الضوضاء: تجاهل الإشارات دون حجم داعم على 1-5 دقائق
+        if tf_1m["vol_ratio"] < 0.9 and tf_5m["vol_ratio"] < 0.9:
+            return
 
         # 1. استراتيجية "الحدث النووي" (Sigma Event) مع تجاوز التهدئة
-        if z_score > adaptive_sigma and price_momentum > 0.2:
+        if z_score > adaptive_sigma * 1.05 and price_momentum > 0.2 and tf_1m["vol_ratio"] > 1.05:
             await self.trigger_alert(
                 "☢️ STATISTICAL ANOMALY",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED,
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED, strength_label,
                 force=True
             )
             return
@@ -499,61 +548,61 @@ class QuantumSniper:
             return
 
         # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        if max(z_score, mad_score) > 2.8 and abs(price_momentum) <= 0.12 and liquidity_pressure > 1.1 and range_pct < CONFIG["SILENT_SPREAD"]:
+        if max(z_score, mad_score) > 2.8 and abs(price_momentum) <= 0.1 and liquidity_pressure > 1.15 and range_pct < CONFIG["SILENT_SPREAD"] and tf_5m["vol_ratio"] > 1.05:
             await self.trigger_alert(
                 "🐳 SILENT ACCUMULATION",
-                pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE
+                pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE, strength_label
             )
             return
 
         # 3. استراتيجية "التصريف الهادئ" (Silent Distribution)
-        if max(z_score, mad_score) > 1.8 and CONFIG["DISTRIBUTION_DRIFT"] <= price_momentum <= 0 and liquidity_pressure > 1.0 and pulse.on_balance_volume < 0 and range_pct < (CONFIG["SILENT_SPREAD"] * 1.3):
+        if max(z_score, mad_score) > 1.95 and CONFIG["DISTRIBUTION_DRIFT"] <= price_momentum <= 0 and liquidity_pressure > 1.05 and pulse.on_balance_volume < 0 and range_pct < (CONFIG["SILENT_SPREAD"] * 1.2):
             await self.trigger_alert(
                 "🥷 SILENT DISTRIBUTION",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.BLUE
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.BLUE, strength_label
             )
             return
 
         # 4. استراتيجية "حوت الحجم" (Volume Whale)
-        if mean_vol > 0 and delta_vol > mean_vol * CONFIG["WHL_SPIKE_MULT"] and short_frame["vol_ratio"] > 1.25:
+        if mean_vol > 0 and delta_vol > mean_vol * CONFIG["WHL_SPIKE_MULT"] and tf_1m["vol_ratio"] > 1.25:
             await self.trigger_alert(
                 "🐋 VOLUME SPIKE",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label
             )
             return
 
         # 5. استراتيجية "كسر الزخم" (Velocity Breakout)
-        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25 and short_frame["momentum"] > minute_frame["momentum"] and short_frame["vol_ratio"] > 1.15:
+        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.75 and fast_velocity > 0.3 and tf_1m["momentum"] > tf_5m["momentum"] and tf_1m["vol_ratio"] > 1.15 and tf_5m["vol_ratio"] > 1.05:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label
             )
             return
 
         # 6. استراتيجية "التسارع الأسي" (Exponential Thrust) مطعمة ب MAD
         if pulse.ema_volume and pulse.ema_volume > 0:
-            if ema_ratio > (CONFIG["ACCELERATION_FACTOR"] * 1.35) and smoothed_velocity > 0.18 and mad_score > CONFIG["MAD_MULTIPLIER"]:
+            if ema_ratio > (CONFIG["ACCELERATION_FACTOR"] * 1.45) and smoothed_velocity > 0.22 and mad_score > CONFIG["MAD_MULTIPLIER"] and tf_5m["momentum"] > 0:
                 await self.trigger_alert(
                     "🌌 EXPONENTIAL THRUST",
-                    pulse.symbol, current_price, mad_score, delta_vol, smoothed_velocity, Term.CYAN
+                    pulse.symbol, current_price, mad_score, delta_vol, smoothed_velocity, Term.CYAN, strength_label
                 )
                 return
 
         # 7. رادار "الإشعال المبكر" متعدد الأطر
-        if composite_score > 2.4 and relative_momentum > 0.2 and fast_ratio > 1.2 and short_frame["momentum"] > 0.4 and short_frame["vol_ratio"] > 1.1:
+        if composite_score > 2.9 and relative_momentum > 0.2 and fast_ratio > 1.25 and tf_1m["momentum"] > 0.45 and tf_1m["vol_ratio"] > 1.1 and tf_15m["momentum"] > -0.1:
             await self.trigger_alert(
                 "⚡ EARLY IGNITION",
-                pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN
+                pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN, strength_label
             )
 
         # 8. تفوق القوة النسبية عبر الأطر (Leaderboard إجرائي)
-        if relative_momentum > 0.8 and minute_frame["momentum"] > 0.5 and minute_frame["vol_ratio"] > 1.05 and short_frame["momentum"] > minute_frame["momentum"]:
+        if relative_momentum > 0.9 and tf_5m["momentum"] > 0.5 and tf_5m["vol_ratio"] > 1.05 and tf_1m["momentum"] > tf_5m["momentum"] and tf_15m["momentum"] > 0:
             await self.trigger_alert(
                 "🏁 RELATIVE STRENGTH SURGE",
-                pulse.symbol, current_price, relative_momentum, delta_vol, price_momentum, Term.DARKCYAN
+                pulse.symbol, current_price, relative_momentum, delta_vol, price_momentum, Term.DARKCYAN, strength_label
             )
 
-    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, force: bool = False):
+    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, strength_label: Optional[str] = None, force: bool = False):
         timestamp = time.strftime("%H:%M:%S")
 
         if not force and self.is_on_cooldown(symbol):
@@ -562,19 +611,22 @@ class QuantumSniper:
         # تنسيق الحجم
         vol_str = f"${vol/1000:.1f}K" if vol < 1000000 else f"${vol/1000000:.2f}M"
         
-        # طباعة التنبيه
+        strength_text = strength_label or "شراء ضعيف"
+
+        # طباعة التنبيه مع توضيح عربي لقوة الشراء
         print(f"{color}{Term.BOLD}╔══════════════════════════════════════════════════════════╗{Term.END}")
         print(f"{color}║ {signal_type:<25} | {symbol:<10} ⏰ {timestamp}    ║{Term.END}")
         print(f"{color}╠══════════════════════════════════════════════════════════╣{Term.END}")
         print(f"{color}║ 📊 Z-Score: {z:.2f}σ (Rare!)     💎 Price: {price}       ║{Term.END}")
         print(f"{color}║ 🌊 Vol 1s:  {vol_str:<10}     📈 Change: {change:+.2f}%       ║{Term.END}")
+        print(f"{color}║ 🧭 قوة الشراء: {strength_text:<12} (1m/5m/15m مؤكد)         ║{Term.END}")
         print(f"{color}╚══════════════════════════════════════════════════════════╝{Term.END}")
 
         self.record_signal(symbol)
 
         # حفظ في ملف CSV عبر خادم تسجيل خفيف الوزن
         if self.signal_writer:
-            await self.signal_writer.submit((timestamp, symbol, signal_type, price, z, vol, change))
+            await self.signal_writer.submit((timestamp, symbol, signal_type, strength_text, price, z, vol, change))
 
     async def main(self):
         Term.print_banner()
