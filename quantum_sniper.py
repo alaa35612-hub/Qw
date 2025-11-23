@@ -46,6 +46,9 @@ CONFIG = {
     "WHL_SPIKE_MULT": 2.5,            # مضاعف حجم مفاجئ للحيتان
     "SILENT_SPREAD": 0.28,            # أقصى نطاق سعري % لتعريف التجميع/التصريف الهادئ
     "DISTRIBUTION_DRIFT": -0.22,      # ميل سعري سلبي بسيط لتعريف التصريف الهادئ
+    "RISE_FILTER_ENABLED": True,      # تفعيل فلتر الارتفاع لعزل التنبيهات الضعيفة
+    "MIN_RISE_PERCENT": 0.65,         # نسبة الارتفاع الدنيا (٪) المطلوبة لتمرير أي تنبيه
+    "RISE_FILTER_FRAMES": ("1m", "5m"), # أطر زمنية تُفحص لتأكيد الارتفاع (قابلة للتخصيص)
 
     # --- [ حماية السوق ] ---
     "BTC_PROTECTION": True,           # إيقاف الشراء إذا كان البيتكوين ينهار
@@ -338,6 +341,24 @@ class QuantumSniper:
         btc_bias = 1.15 if self.btc_trend < CONFIG["BTC_RISK_AVERSION"] else 1.0
         return min(CONFIG["SIGMA_ADAPT_CEIL"], max(CONFIG["SIGMA_ADAPT_FLOOR"], base * regime_factor * btc_bias))
 
+    def passes_rise_filter(self, price_momentum: float, multi_frames: Dict[int, Dict[str, float]]) -> Tuple[bool, float]:
+        """فلتر الارتفاع قابل للتخصيص يمنع أي تنبيه دون حد الارتفاع المطلوب."""
+        if not CONFIG.get("RISE_FILTER_ENABLED", False):
+            return True, max(price_momentum, 0.0)
+
+        min_rise = CONFIG.get("MIN_RISE_PERCENT", 0.0)
+        frames = CONFIG.get("RISE_FILTER_FRAMES", ())
+
+        frame_momentums = []
+        for key in frames:
+            secs = CONFIG["TIMEFRAMES"].get(key)
+            if secs is None:
+                continue
+            frame_momentums.append(multi_frames.get(secs, {}).get("momentum", 0.0))
+
+        dominant_rise = max([price_momentum, *frame_momentums, 0.0])
+        return dominant_rise >= min_rise, dominant_rise
+
     def classify_strength(self, z_score: float, price_momentum: float, multi_frames: Dict[int, Dict[str, float]]) -> Tuple[str, float]:
         """توليد توصيف عربي للإشارة حسب الزخم والحجم عبر الأطر المتعددة."""
         def frame(key: str) -> Dict[str, float]:
@@ -508,6 +529,7 @@ class QuantumSniper:
         relative_momentum = self.btc_relative_strength(price_momentum)
         range_pct = pulse.range_percent()
         multi_frames = pulse.multi_frame_features(now)
+        rise_ok, dominant_rise = self.passes_rise_filter(price_momentum, multi_frames)
 
         # حواجز السوق العامة: خفّض الحساسية إذا كان البيتكوين متعبًا
         if CONFIG["BTC_PROTECTION"] and self.btc_trend < CONFIG["BTC_RISK_AVERSION"] and relative_momentum < 0.5:
@@ -539,7 +561,7 @@ class QuantumSniper:
             await self.trigger_alert(
                 "☢️ STATISTICAL ANOMALY",
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED, strength_label,
-                force=True
+                force=True, rise_ok=rise_ok
             )
             return
 
@@ -551,7 +573,8 @@ class QuantumSniper:
         if max(z_score, mad_score) > 2.8 and abs(price_momentum) <= 0.1 and liquidity_pressure > 1.15 and range_pct < CONFIG["SILENT_SPREAD"] and tf_5m["vol_ratio"] > 1.05:
             await self.trigger_alert(
                 "🐳 SILENT ACCUMULATION",
-                pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE, strength_label
+                pulse.symbol, current_price, max(z_score, mad_score), delta_vol, price_momentum, Term.PURPLE, strength_label,
+                rise_ok=rise_ok
             )
             return
 
@@ -559,7 +582,8 @@ class QuantumSniper:
         if max(z_score, mad_score) > 1.95 and CONFIG["DISTRIBUTION_DRIFT"] <= price_momentum <= 0 and liquidity_pressure > 1.05 and pulse.on_balance_volume < 0 and range_pct < (CONFIG["SILENT_SPREAD"] * 1.2):
             await self.trigger_alert(
                 "🥷 SILENT DISTRIBUTION",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.BLUE, strength_label
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.BLUE, strength_label,
+                rise_ok=rise_ok
             )
             return
 
@@ -567,7 +591,8 @@ class QuantumSniper:
         if mean_vol > 0 and delta_vol > mean_vol * CONFIG["WHL_SPIKE_MULT"] and tf_1m["vol_ratio"] > 1.25:
             await self.trigger_alert(
                 "🐋 VOLUME SPIKE",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label,
+                rise_ok=rise_ok
             )
             return
 
@@ -575,7 +600,8 @@ class QuantumSniper:
         if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.75 and fast_velocity > 0.3 and tf_1m["momentum"] > tf_5m["momentum"] and tf_1m["vol_ratio"] > 1.15 and tf_5m["vol_ratio"] > 1.05:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT",
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label
+                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW, strength_label,
+                rise_ok=rise_ok
             )
             return
 
@@ -584,7 +610,8 @@ class QuantumSniper:
             if ema_ratio > (CONFIG["ACCELERATION_FACTOR"] * 1.45) and smoothed_velocity > 0.22 and mad_score > CONFIG["MAD_MULTIPLIER"] and tf_5m["momentum"] > 0:
                 await self.trigger_alert(
                     "🌌 EXPONENTIAL THRUST",
-                    pulse.symbol, current_price, mad_score, delta_vol, smoothed_velocity, Term.CYAN, strength_label
+                    pulse.symbol, current_price, mad_score, delta_vol, smoothed_velocity, Term.CYAN, strength_label,
+                    rise_ok=rise_ok
                 )
                 return
 
@@ -592,20 +619,22 @@ class QuantumSniper:
         if composite_score > 2.9 and relative_momentum > 0.2 and fast_ratio > 1.25 and tf_1m["momentum"] > 0.45 and tf_1m["vol_ratio"] > 1.1 and tf_15m["momentum"] > -0.1:
             await self.trigger_alert(
                 "⚡ EARLY IGNITION",
-                pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN, strength_label
+                pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN, strength_label,
+                rise_ok=rise_ok
             )
 
         # 8. تفوق القوة النسبية عبر الأطر (Leaderboard إجرائي)
         if relative_momentum > 0.9 and tf_5m["momentum"] > 0.5 and tf_5m["vol_ratio"] > 1.05 and tf_1m["momentum"] > tf_5m["momentum"] and tf_15m["momentum"] > 0:
             await self.trigger_alert(
                 "🏁 RELATIVE STRENGTH SURGE",
-                pulse.symbol, current_price, relative_momentum, delta_vol, price_momentum, Term.DARKCYAN, strength_label
+                pulse.symbol, current_price, relative_momentum, delta_vol, price_momentum, Term.DARKCYAN, strength_label,
+                rise_ok=rise_ok
             )
 
-    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, strength_label: Optional[str] = None, force: bool = False):
+    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, strength_label: Optional[str] = None, force: bool = False, rise_ok: bool = True):
         timestamp = time.strftime("%H:%M:%S")
 
-        if not force and self.is_on_cooldown(symbol):
+        if (CONFIG.get("RISE_FILTER_ENABLED", False) and not rise_ok) or (not force and self.is_on_cooldown(symbol)):
             return
 
         # تنسيق الحجم
