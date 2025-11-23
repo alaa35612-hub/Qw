@@ -8873,7 +8873,7 @@ def scan_binance(
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
     _editor_status(
-        f"بدء فحص المنطقة الذهبية لـ {len(all_symbols)} رمز على الأطر {"/".join(required_tfs)}",
+        f"بدء فحص المنطقة الذهبية لـ {len(all_symbols)} رمز على الأطر {'/'.join(required_tfs)}",
     )
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
