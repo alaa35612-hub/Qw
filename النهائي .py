@@ -62,6 +62,7 @@ DISABLE_STRATEGIES = True
 DISABLE_ALERTS = True
 DISABLE_EVENTS = True
 EDITOR_ALERT_COLOR = "#1e90ff"
+EDITOR_STATUS_ENABLED = True
 
 _ORIGINAL_PRINT = builtins.print
 if DISABLE_EVENTS:
@@ -88,6 +89,7 @@ ANSI_VALUE_NEG = "\033[91m"
 ANSI_SYMBOL = ANSI_VALUE_POS
 ANSI_ALERT_BULL = ANSI_VALUE_POS
 ANSI_ALERT_BEAR = ANSI_VALUE_NEG
+ANSI_STATUS = ANSI_LABEL
 
 ALERT_BULLISH_KEYWORDS = (
     "bull",
@@ -121,6 +123,21 @@ ANSI_HEADER_COLORS = [
     "\033[93m",
     "\033[94m",
 ]
+
+
+def _editor_status(message: str, *, end: str = "\n", color: str = EDITOR_ALERT_COLOR) -> None:
+    """Emit a minimal, always-on status line to the editor console.
+
+    This bypasses the global ``DISABLE_EVENTS`` print shim so the user can
+    observe scan progress even when normal console noise is muted.
+    """
+
+    if not EDITOR_STATUS_ENABLED:
+        return
+    try:
+        _ORIGINAL_PRINT(f"{ANSI_STATUS}{message}{ANSI_RESET}", end=end, flush=True)
+    except Exception:
+        return
 
 
 @dataclass(frozen=True)
@@ -8848,8 +8865,16 @@ def scan_binance(
         limit=max_symbols,
         selector=symbol_selector,
     )
+    required_tfs = (
+        list(dict.fromkeys(golden_zone_timeframes))
+        if golden_zone_timeframes is not None
+        else ["1m", "5m", "15m", "1h", "4h", "1d"]
+    ) if enforce_golden_zone else [timeframe]
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
+    _editor_status(
+        f"بدء فحص المنطقة الذهبية لـ {len(all_symbols)} رمز على الأطر {"/".join(required_tfs)}",
+    )
     summaries: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
     if inputs is None:
@@ -8879,6 +8904,9 @@ def scan_binance(
                     file=sys.stderr,
                     flush=True,
                 )
+            _editor_status(
+                f"⏭️ {_format_symbol(symbol)} فشل fetch_ticker: {exc}",
+            )
             continue
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
@@ -8897,11 +8925,7 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             continue
-        tfs = (
-            list(dict.fromkeys(golden_zone_timeframes))
-            if golden_zone_timeframes is not None
-            else ["1m", "5m", "15m", "1h", "4h", "1d"]
-        ) if enforce_golden_zone else [timeframe]
+        tfs = required_tfs
         symbol_runs: List[Tuple[str, SmartMoneyAlgoProE5]] = []
         failed_tf: Optional[str] = None
 
@@ -8920,6 +8944,9 @@ def scan_binance(
                     f"تخطي {_format_symbol(symbol)} لخروج السعر من Golden zone على إطار {failed_tf}",
                     flush=True,
                 )
+            _editor_status(
+                f"⏭️ {_format_symbol(symbol)} خارج Golden zone على إطار {failed_tf}",
+            )
             continue
 
         primary_tf, primary_rt = symbol_runs[0]
@@ -8937,6 +8964,9 @@ def scan_binance(
                 "boxes": metrics.get("boxes", len(primary_rt.boxes)),
                 "metrics": metrics,
             }
+        )
+        _editor_status(
+            f"✅ {_format_symbol(symbol)} داخل Golden zone على {"/".join(tfs)}",
         )
         _emit_editor_alert(primary_rt, symbol, tfs)
         if not DISABLE_EVENTS:
