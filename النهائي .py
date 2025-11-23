@@ -8966,7 +8966,7 @@ def scan_binance(
             }
         )
         _editor_status(
-            f"✅ {_format_symbol(symbol)} داخل Golden zone على {"/".join(tfs)}",
+            f"✅ {_format_symbol(symbol)} داخل Golden zone على {'/'.join(tfs)}",
         )
         _emit_editor_alert(primary_rt, symbol, tfs)
         if not DISABLE_EVENTS:
