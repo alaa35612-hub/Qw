@@ -7,6 +7,7 @@ import csv
 import sys
 import logging
 import statistics
+import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Deque
@@ -70,6 +71,32 @@ class Term:
         ║  [ Z-Score | MAD | Dual Momentum | BTC Guard | Cooldowns ]   ║
         ╚═══════════════════════════════════════════════════════════════╝
         {Term.END}""")
+
+
+class SignalWriter:
+    """مسؤول عن تسجيل الإشارات في خيط خفيف لتخفيف الضغط عن حلقة asyncio."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=1500)
+        self.running = True
+
+    async def submit(self, payload: Tuple[str, str, str, float, float, float, float]):
+        QuantumSniper._bounded_put(self.queue, payload)
+
+    async def run(self):
+        while self.running or not self.queue.empty():
+            timestamp, symbol, signal_type, price, z, vol, change = await self.queue.get()
+            try:
+                with open(self.path, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([timestamp, symbol, signal_type, price, round(z, 2), round(vol, 2), round(change, 2)])
+            finally:
+                self.queue.task_done()
+
+    async def stop(self):
+        self.running = False
+        await self.queue.join()
 
 # =====================[ 🧠 المحرك الإحصائي ]=====================
 
@@ -250,6 +277,7 @@ class QuantumSniper:
         self.coins: Dict[str, MarketPulse] = {}
         # هام: لا تقم بتهيئة Queue هنا لتجنب مشاكل Loop
         self.msg_queue = None
+        self.signal_writer = None
         self.session = None
         self.btc_trend = 0.0
         self.paused = False
@@ -267,6 +295,16 @@ class QuantumSniper:
             with open(CONFIG["LOG_FILE"], 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Time", "Symbol", "Type", "Price", "Z-Score", "Volume($)", "Change%"])
+
+    @staticmethod
+    def _bounded_put(queue: asyncio.Queue, item):
+        """إضافة آمنة لطابور محدود عبر إسقاط أقدم عنصر للحفاظ على أحدث البيانات."""
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            queue.put_nowait(item)
 
     def is_on_cooldown(self, symbol: str) -> bool:
         """منع إغراق الإشعارات لنفس العملة مع السماح للانفجارات النووية بالمرور."""
@@ -286,6 +324,12 @@ class QuantumSniper:
         btc_change = btc_pulse.get_price_momentum()
         return price_change - btc_change
 
+    def adaptive_sigma(self, pulse: MarketPulse, base: float) -> float:
+        """ضبط العتبة بالاعتماد على نظام التذبذب واتجاه BTC لتقليل الإشارات الكاذبة."""
+        regime_factor = pulse.volatility_regime()
+        btc_bias = 1.15 if self.btc_trend < CONFIG["BTC_RISK_AVERSION"] else 1.0
+        return min(CONFIG["SIGMA_ADAPT_CEIL"], max(CONFIG["SIGMA_ADAPT_FLOOR"], base * regime_factor * btc_bias))
+
     async def ws_listener(self):
         """مهمته الوحيدة شفط البيانات ورميها في الطابور بأقصى سرعة"""
         backoff = CONFIG["RECONNECT_BACKOFF"]
@@ -296,10 +340,13 @@ class QuantumSniper:
                         print(f"{Term.GREEN}✓ Connected to Binance Neural Network...{Term.END}")
                         backoff = CONFIG["RECONNECT_BACKOFF"]
                         async for msg in ws:
-                            if self.msg_queue and not self.msg_queue.full():
+                            if not self.msg_queue:
+                                continue
+                            if self.msg_queue.full():
+                                self.logger.warning("Dropping stale snapshot: queue is full")
+                                self._bounded_put(self.msg_queue, json.loads(msg.data))
+                            else:
                                 await self.msg_queue.put(json.loads(msg.data))
-                            elif self.msg_queue and self.msg_queue.full():
-                                self.logger.warning("Dropping snapshot: queue is full")
             except Exception as e:
                 print(f"{Term.RED}⚠️ Network Error: {e}{Term.END}")
                 await asyncio.sleep(backoff)
@@ -409,8 +456,7 @@ class QuantumSniper:
         if not pulse.is_ready: return
 
         # --- [ المنطق الخارق: التحليل الإحصائي ] ---
-        regime_factor = pulse.volatility_regime()
-        adaptive_sigma = CONFIG["SIGMA_THRESHOLD"] * regime_factor
+        adaptive_sigma = self.adaptive_sigma(pulse, CONFIG["SIGMA_THRESHOLD"])
 
         z_score, mean_vol = pulse.calculate_statistics(delta_vol)
         mad_score = pulse.mad_score(delta_vol)
@@ -477,7 +523,7 @@ class QuantumSniper:
             return
 
         # 5. استراتيجية "كسر الزخم" (Velocity Breakout)
-        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25 and short_frame["momentum"] > minute_frame["momentum"]:
+        if liquidity_pressure > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.65 and fast_velocity > 0.25 and short_frame["momentum"] > minute_frame["momentum"] and short_frame["vol_ratio"] > 1.15:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT",
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
@@ -500,6 +546,13 @@ class QuantumSniper:
                 pulse.symbol, current_price, composite_score, delta_vol, fast_velocity, Term.GREEN
             )
 
+        # 8. تفوق القوة النسبية عبر الأطر (Leaderboard إجرائي)
+        if relative_momentum > 0.8 and minute_frame["momentum"] > 0.5 and minute_frame["vol_ratio"] > 1.05 and short_frame["momentum"] > minute_frame["momentum"]:
+            await self.trigger_alert(
+                "🏁 RELATIVE STRENGTH SURGE",
+                pulse.symbol, current_price, relative_momentum, delta_vol, price_momentum, Term.DARKCYAN
+            )
+
     async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color, force: bool = False):
         timestamp = time.strftime("%H:%M:%S")
 
@@ -519,35 +572,23 @@ class QuantumSniper:
 
         self.record_signal(symbol)
 
-        # حفظ في ملف CSV
-        await asyncio.to_thread(
-            self._write_csv,
-            timestamp,
-            symbol,
-            signal_type,
-            price,
-            z,
-            vol,
-            change,
-        )
-
-    @staticmethod
-    def _write_csv(timestamp: str, symbol: str, signal_type: str, price: float, z: float, vol: float, change: float):
-        with open(CONFIG["LOG_FILE"], 'a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([timestamp, symbol, signal_type, price, round(z, 2), round(vol, 2), round(change, 2)])
+        # حفظ في ملف CSV عبر خادم تسجيل خفيف الوزن
+        if self.signal_writer:
+            await self.signal_writer.submit((timestamp, symbol, signal_type, price, z, vol, change))
 
     async def main(self):
         Term.print_banner()
         print(f"{Term.YELLOW}⏳ Calibrating statistical models (Collecting History)...{Term.END}")
-        
+
         # الحل الجذري للمشكلة: إنشاء الطابور داخل الحلقة النشطة هنا
         self.msg_queue = asyncio.Queue(maxsize=CONFIG["MAX_QUEUE_SIZE"])
-        
+        self.signal_writer = SignalWriter(CONFIG["LOG_FILE"])
+
         # تشغيل العمليات بشكل متوازي
         await asyncio.gather(
             self.ws_listener(),
-            self.market_analyzer()
+            self.market_analyzer(),
+            self.signal_writer.run(),
         )
 
 if __name__ == "__main__":
