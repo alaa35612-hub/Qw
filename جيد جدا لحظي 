@@ -20,6 +20,11 @@ CONFIG = {
     "SIGMA_THRESHOLD": 1.5,       # (Z-Score) الحساسية للشذوذ الإحصائي (3.5 = حدث نادر جداً)
     "ACCELERATION_FACTOR": 1.0,   # معامل تسارع السيولة المطلوب
     
+    # --- [ تفعيل/تعطيل الاستراتيجيات ] ---
+    "ENABLE_SIGMA_EVENT": True,          # استراتيجية "الحدث النووي"
+    "ENABLE_VELOCITY_BREAKOUT": True,    # استراتيجية "كسر الزخم"
+    "ENABLE_SILENT_ACCUMULATION": True,  # استراتيجية "التجميع المخفي"
+    
     # --- [ حماية السوق ] ---
     "BTC_PROTECTION": True,       # إيقاف الشراء إذا كان البيتكوين ينهار
     "BTC_DUMP_PERCENT": -0.4,     # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
@@ -233,14 +238,14 @@ class QuantumSniper:
         price_momentum = pulse.get_price_momentum()
         
         # 1. استراتيجية "الحدث النووي" (Sigma Event)
-        if z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
+        if CONFIG["ENABLE_SIGMA_EVENT"] and z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
             await self.trigger_alert(
                 "☢️ STATISTICAL ANOMALY", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED
             )
             
         # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        elif z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
+        elif CONFIG["ENABLE_SILENT_ACCUMULATION"] and z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
             await self.trigger_alert(
                 "🐳 SILENT ACCUMULATION", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.PURPLE
@@ -248,7 +253,7 @@ class QuantumSniper:
 
         # 3. استراتيجية "كسر الزخم" (Velocity Breakout)
         vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
-        if vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
+        if CONFIG["ENABLE_VELOCITY_BREAKOUT"] and vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
