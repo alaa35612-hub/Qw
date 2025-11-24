@@ -67,6 +67,10 @@ CONFIG = {
     "ENABLE_IMBALANCE_ACCEL": True,
     "ENABLE_ICT_MODEL": True,
 
+    # زمنية لحظية وحماية من التأخير
+    "DROP_STALE_TICKS": True,          # تجاهل أي بيانات تتأخر عن الوقت الحقيقي
+    "MAX_TICK_LATENCY_SEC": 1.5,       # الحد الأقصى المقبول لتأخر الحدث بالثواني
+
     # عرض المقاييس التراكمية
     "ENABLE_CUMULATIVE_RISE": True,
     "ENABLE_CUMULATIVE_DROP": True,
@@ -186,9 +190,12 @@ class MarketState:
         self.kalman = Kalman1D(CONFIG["KALMAN_PROCESS_NOISE"], CONFIG["KALMAN_MEAS_NOISE"])
         self.residuals = deque(maxlen=CONFIG["KALMAN_STATE_SMOOTH"])
 
-    def update(self, price: float, bid_qty: float, ask_qty: float) -> Dict[str, float]:
+    def update(self, price: float, bid_qty: float, ask_qty: float, timestamp: float) -> Dict[str, float]:
         """تحديث السلاسل الزمنية لكل إطار زمني وإرجاع القياسات المحدثة."""
         metrics = {}
+        if timestamp <= self.last_timestamp:
+            return metrics
+        self.last_timestamp = timestamp
         self.prices.append(price)
 
         if len(self.prices) >= 2:
@@ -296,6 +303,7 @@ class QuantumSniper:
         self.alert_stats: Dict[Tuple[str, str], Dict[str, Dict[str, float]]] = defaultdict(
             lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
         )
+        self.last_event_ts: Dict[str, float] = defaultdict(float)
         self.paused = False
         self.btc_trend = 0.0
 
@@ -370,11 +378,19 @@ class QuantumSniper:
         ask_qty = float(ticker.get("A", 0.0))
 
         timestamp = float(ticker.get("E", time.time() * 1000)) / 1000.0
+        if CONFIG["DROP_STALE_TICKS"]:
+            now = time.time()
+            if now - timestamp > CONFIG["MAX_TICK_LATENCY_SEC"]:
+                return
+        if timestamp <= self.last_event_ts[symbol]:
+            return
+        self.last_event_ts[symbol] = timestamp
 
         # إطار tick الفوري
         tick_state = self.get_state(symbol, "tick")
-        metrics = tick_state.update(price, bid_qty, ask_qty)
-        await self.evaluate_signals(symbol, "tick", price, metrics, tick_state)
+        metrics = tick_state.update(price, bid_qty, ask_qty, timestamp)
+        if metrics:
+            await self.evaluate_signals(symbol, "tick", price, metrics, tick_state)
 
         # أطر زمنية مجمعة
         for tf_name, seconds in CONFIG["TIMEFRAMES"].items():
@@ -385,8 +401,11 @@ class QuantumSniper:
             if aggregated:
                 agg_price, agg_bid, agg_ask = aggregated
                 tf_state = self.get_state(symbol, tf_name)
-                tf_metrics = tf_state.update(agg_price, agg_bid, agg_ask)
-                await self.evaluate_signals(symbol, tf_name, agg_price, tf_metrics, tf_state)
+                tf_metrics = tf_state.update(agg_price, agg_bid, agg_ask, timestamp)
+                if tf_metrics:
+                    await self.evaluate_signals(
+                        symbol, tf_name, agg_price, tf_metrics, tf_state
+                    )
 
     async def evaluate_signals(
         self, symbol: str, timeframe: str, price: float, m: Dict[str, float], state: MarketState
