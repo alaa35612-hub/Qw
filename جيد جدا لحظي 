@@ -2,292 +2,379 @@ import asyncio
 import json
 import time
 import math
-import os
 import csv
 import sys
-import aiohttp
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, Deque, Tuple
+
+import aiohttp
+import numpy as np
+from scipy.stats import entropy as shannon_entropy
+
+"""
+محرّك "Quantum Flow Sniper" بنسخة مؤسسية:
+- يعتمد على تحليل فيزيائي إحصائي (Hurst, Shannon Entropy, Kalman Filter).
+- يستخدم تدفق Binance WebSocket الفوري (!ticker@arr) لأعلى سرعة ممكنة.
+- كل الإشارات مبنية على نماذج كمية تلتقط التشوهات البنيوية قبل الضخ.
+"""
 
 # =====================[ ⚙️ إعدادات المحرك الكمي ]=====================
-
 CONFIG = {
-    "WINDOW_SIZE": 60,            # نافذة التحليل بالثواني (لصنع المتوسطات)
-    "MIN_24H_VOL": 20_000_000,    # تجاهل العملات الميتة (أقل من 10 مليون)
-    
-    # --- [ خوارزميات الحساسية ] ---
-    "SIGMA_THRESHOLD": 1.5,       # (Z-Score) الحساسية للشذوذ الإحصائي (3.5 = حدث نادر جداً)
-    "ACCELERATION_FACTOR": 1.0,   # معامل تسارع السيولة المطلوب
-    
-    # --- [ تفعيل/تعطيل الاستراتيجيات ] ---
-    "ENABLE_SIGMA_EVENT": True,          # استراتيجية "الحدث النووي"
-    "ENABLE_VELOCITY_BREAKOUT": True,    # استراتيجية "كسر الزخم"
-    "ENABLE_SILENT_ACCUMULATION": True,  # استراتيجية "التجميع المخفي"
+    # نوافذ التحليل (بالثواني/العينات)
+    "WINDOW_SIZE": 180,                  # طول الذاكرة الزمنية للأسعار والحجوم
+    "RETURNS_WINDOW": 120,               # نافذة حساب إرجاع اللوج و الإنتروبيا
+    "IMBALANCE_WINDOW": 60,             # نافذة توازن العرض/الطلب
 
-    # --- [ تفعيل/تعطيل القياسات التراكمية ] ---
-    "ENABLE_CUMULATIVE_RISE": True,      # حساب نسبة الارتفاع التراكمية
-    "ENABLE_CUMULATIVE_DROP": True,      # حساب نسبة الانخفاض التراكمية
-    "SHOW_ALERT_COUNTERS": True,         # إظهار عدد مرات تكرار التنبيه
-    
-    # --- [ حماية السوق ] ---
-    "BTC_PROTECTION": True,       # إيقاف الشراء إذا كان البيتكوين ينهار
-    "BTC_DUMP_PERCENT": -0.4,     # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
-    
-    "LOG_FILE": "quantum_signals.csv"
+    # حواجز إحصائية
+    "MIN_24H_VOL": 20_000_000,          # تجاهل الأصول ذات سيولة ضعيفة
+    "HURST_MIN": 0.65,                  # الحد الأدنى لهيرست لاعتبار سلوك اتجاهي قوي
+    "ENTROPY_DROP_RATIO": 0.18,         # مقدار الانخفاض النسبي المطلوب في الإنتروبيا
+    "KALMAN_RESIDUAL_Z": 2.6,           # Z-Score لبقايا الكالمان لإعلان كسر هيكلي
+    "IMBALANCE_ACCEL_THRESHOLD": 0.12,  # تسارع توازن الطلب/العرض المطلوب
+
+    # بارامترات الكالمان (1D)
+    "KALMAN_PROCESS_NOISE": 1e-3,
+    "KALMAN_MEAS_NOISE": 2e-2,
+
+    # التفعيل/التعطيل لكل إشارة كمية
+    "ENABLE_HURST_TREND": True,
+    "ENABLE_ENTROPY_IMBALANCE": True,
+    "ENABLE_KALMAN_BREAK": True,
+    "ENABLE_IMBALANCE_ACCEL": True,
+
+    # عرض المقاييس التراكمية
+    "ENABLE_CUMULATIVE_RISE": True,
+    "ENABLE_CUMULATIVE_DROP": True,
+    "SHOW_ALERT_COUNTERS": True,
+
+    # حماية السوق
+    "BTC_PROTECTION": True,
+    "BTC_DUMP_PERCENT": -0.4,
+
+    "LOG_FILE": "quantum_signals.csv",
 }
 
 # =====================[ 🎨 واجهة التيرمينال الاحترافية ]=====================
-
 class Term:
-    PURPLE = '\033[95m'
-    CYAN = '\033[96m'
-    DARKCYAN = '\033[36m'
-    BLUE = '\033[94m'
-    GREEN = '\033[92m'
-    YELLOW = '\033[93m'
-    RED = '\033[91m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    END = '\033[0m'
-    
+    PURPLE = "\033[95m"
+    CYAN = "\033[96m"
+    DARKCYAN = "\033[36m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
+    END = "\033[0m"
+
     @staticmethod
     def print_banner():
         # تنظيف الشاشة بطريقة متوافقة مع جميع الأنظمة
         print("\033c", end="")
-        print(f"""{Term.PURPLE}{Term.BOLD}
+        print(
+            f"""{Term.PURPLE}{Term.BOLD}
         ╔═══════════════════════════════════════════════════════════════╗
-        ║           QUANTUM FLOW SNIPER v5.1 (STATISTICAL)              ║
-        ║       [ Z-Score Analysis | Momentum Velocity | BTC Guard ]    ║
+        ║      QUANTUM FLOW SNIPER v6.0 (Institutional Quant Edition)    ║
+        ║ [ Hurst | Shannon Entropy | Kalman Structural Break | OFI d² ] ║
         ╚═══════════════════════════════════════════════════════════════╝
-        {Term.END}""")
+        {Term.END}"""
+        )
 
-# =====================[ 🧠 المحرك الإحصائي ]=====================
+
+# =====================[ 🧠 أدوات التحليل الرياضي ]=====================
+@dataclass
+class Kalman1D:
+    process_noise: float
+    measurement_noise: float
+    state_estimate: float = 0.0
+    covariance: float = 1.0
+    initialized: bool = False
+
+    def update(self, measurement: float) -> Tuple[float, float]:
+        # تهيئة أولية لضبط البداية على أول قيمة سعر
+        if not self.initialized:
+            self.state_estimate = measurement
+            self.covariance = 1.0
+            self.initialized = True
+            residual = 0.0
+            return self.state_estimate, residual
+
+        # مرحلة التنبؤ
+        predicted_state = self.state_estimate
+        predicted_cov = self.covariance + self.process_noise
+
+        # مرحلة التصحيح باستخدام الملاحظة
+        kalman_gain = predicted_cov / (predicted_cov + self.measurement_noise)
+        residual = measurement - predicted_state
+        self.state_estimate = predicted_state + kalman_gain * residual
+        self.covariance = (1 - kalman_gain) * predicted_cov
+        return self.state_estimate, residual
+
+
+def hurst_exponent(series: np.ndarray) -> float:
+    """حساب Hurst عبر تحليل النطاق المُعاد ضبطه (R/S)."""
+    if series.size < 20:
+        return 0.5
+    lags = np.arange(2, min(40, series.size // 2))
+    tau = [np.sqrt(np.std(np.subtract(series[lag:], series[:-lag]))) for lag in lags]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] if not np.isnan(poly[0]) else 0.5
+
+
+def shannon_entropy_drop(returns: np.ndarray, bins: int = 20) -> Tuple[float, float]:
+    if returns.size < 30:
+        return 0.0, 0.0
+    hist, _ = np.histogram(returns, bins=bins, density=True)
+    hist = hist[hist > 0]
+    if hist.size == 0:
+        return 0.0, 0.0
+    ent = shannon_entropy(hist)
+    rolling_mean = float(np.mean(hist))
+    return float(ent), rolling_mean
+
 
 @dataclass
-class MarketPulse:
-    """يخزن نبض السوق لكل عملة لحساب الإحصائيات"""
+class MarketState:
     symbol: str
-    prices: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
-    volumes: deque = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
-    last_accumulated_vol: float = 0.0
-    
-    def add_snapshot(self, price: float, accumulated_vol: float):
-        # حساب حجم التدفق في هذه اللحظة (Delta)
-        if self.last_accumulated_vol == 0:
-            delta_vol = 0
-        else:
-            delta_vol = accumulated_vol - self.last_accumulated_vol
-            # تصحيح في حالة إعادة تعيين اليوم
-            if delta_vol < 0: delta_vol = 0 
-            
-        self.last_accumulated_vol = accumulated_vol
-        
+    prices: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
+    returns: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["RETURNS_WINDOW"]))
+    imbalance: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["IMBALANCE_WINDOW"]))
+    kalman: Kalman1D = field(
+        default_factory=lambda: Kalman1D(
+            CONFIG["KALMAN_PROCESS_NOISE"], CONFIG["KALMAN_MEAS_NOISE"]
+        )
+    )
+    last_timestamp: float = 0.0
+
+    def update(self, price: float, bid_qty: float, ask_qty: float) -> Dict[str, float]:
+        """تحديث السلاسل الزمنية وإرجاع القياسات المحدثة."""
+        metrics = {}
         self.prices.append(price)
-        self.volumes.append(delta_vol)
 
-    @property
-    def is_ready(self):
-        # نحتاج بيانات كافية ليكون الانحراف المعياري دقيقاً
-        return len(self.volumes) >= 20
+        if len(self.prices) >= 2:
+            ret = math.log(self.prices[-1] / self.prices[-2])
+            self.returns.append(ret)
 
-    def calculate_statistics(self, current_vol_delta):
-        """حساب الدرجة المعيارية (Z-Score) لاكتشاف الشذوذ"""
-        if not self.volumes: return 0, 0
-        
-        vol_list = list(self.volumes)
-        mean = sum(vol_list) / len(vol_list)
-        
-        if mean == 0: return 0, 0
-        
-        # حساب الانحراف المعياري (Standard Deviation)
-        variance = sum((x - mean) ** 2 for x in vol_list) / len(vol_list)
-        std_dev = math.sqrt(variance)
-        
-        if std_dev == 0: return 0, 0
-        
-        # معادلة Z-Score: (القيمة الحالية - المتوسط) / الانحراف
-        z_score = (current_vol_delta - mean) / std_dev
-        
-        return z_score, mean
+        total_depth = bid_qty + ask_qty
+        imbalance_value = (bid_qty - ask_qty) / total_depth if total_depth > 0 else 0.0
+        self.imbalance.append(imbalance_value)
 
-    def get_price_momentum(self):
-        if len(self.prices) < 5: return 0
-        # نسبة التغير خلال آخر 5 ثواني
-        start = self.prices[-5]
-        end = self.prices[-1]
-        return ((end - start) / start) * 100
+        price_array = np.fromiter(self.prices, dtype=float)
+        returns_array = np.fromiter(self.returns, dtype=float)
+        imbalance_array = np.fromiter(self.imbalance, dtype=float)
+
+        # Hurst
+        metrics["hurst"] = hurst_exponent(price_array)
+
+        # Entropy
+        current_entropy, _ = shannon_entropy_drop(returns_array)
+        metrics["entropy"] = current_entropy
+        if len(returns_array) > 10:
+            metrics["entropy_ema"] = float(pd_ema(returns_array, span=20)[-1])
+        else:
+            metrics["entropy_ema"] = current_entropy
+
+        # Imbalance derivatives
+        if imbalance_array.size >= 4:
+            first_derivative = np.gradient(imbalance_array)[-1]
+            second_derivative = np.gradient(np.gradient(imbalance_array))[-1]
+        else:
+            first_derivative = 0.0
+            second_derivative = 0.0
+        metrics["imbalance_d1"] = float(first_derivative)
+        metrics["imbalance_d2"] = float(second_derivative)
+
+        # Kalman residual
+        _, residual = self.kalman.update(price)
+        metrics["kalman_residual"] = residual
+
+        # Momentum آخر 5 نقاط
+        metrics["momentum"] = (
+            ((self.prices[-1] - self.prices[-5]) / self.prices[-5]) * 100
+            if len(self.prices) >= 5
+            else 0.0
+        )
+
+        return metrics
+
+
+# ===============[ 📈 مؤشرات مساندة عالية السرعة ]=====================
+def pd_ema(series: np.ndarray, span: int) -> np.ndarray:
+    """حساب EMA سريع باستخدام numpy (بدون pandas)."""
+    alpha = 2 / (span + 1)
+    ema = np.zeros_like(series)
+    ema[0] = series[0]
+    for i in range(1, len(series)):
+        ema[i] = alpha * series[i] + (1 - alpha) * ema[i - 1]
+    return ema
+
 
 # =====================[ 🚀 الكور الرئيسي ]=====================
-
 class QuantumSniper:
     def __init__(self):
-        self.base_ws = "wss://fstream.binance.com/ws/!ticker@arr"
-        self.coins: Dict[str, MarketPulse] = {}
-        # هام: لا تقم بتهيئة Queue هنا لتجنب مشاكل Loop
-        self.msg_queue = None 
-        self.session = None
-        self.btc_trend = 0.0
-        self.paused = False
+        self.msg_queue: asyncio.Queue = asyncio.Queue()
+        self.market_states: Dict[str, MarketState] = {}
         self.alert_stats: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
             lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
         )
-        
-        # إعداد ملف اللوج
-        if not os.path.exists(CONFIG["LOG_FILE"]):
-            with open(CONFIG["LOG_FILE"], 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Time", "Symbol", "Type", "Price", "Z-Score", "Volume($)", "Change%"])
+        self.paused = False
+        self.btc_trend = 0.0
 
     async def ws_listener(self):
-        """مهمته الوحيدة شفط البيانات ورميها في الطابور بأقصى سرعة"""
-        while True:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(self.base_ws) as ws:
-                        print(f"{Term.GREEN}✓ Connected to Binance Neural Network...{Term.END}")
-                        async for msg in ws:
-                            if self.msg_queue:
-                                await self.msg_queue.put(json.loads(msg.data))
-            except Exception as e:
-                print(f"{Term.RED}⚠️ Network Error: {e}{Term.END}")
-                await asyncio.sleep(2)
+        url = "wss://stream.binance.com:9443/ws/!ticker@arr"
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(url, heartbeat=60) as ws:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        await self.msg_queue.put(data)
 
     async def market_analyzer(self):
-        """العقل المدبر: يعالج البيانات رياضياً"""
-        print(f"{Term.CYAN}⚡ Analyzer Engine Started (Waiting for buffer)...{Term.END}")
-        
         while True:
-            if not self.msg_queue:
-                await asyncio.sleep(0.1)
+            tickers = await self.msg_queue.get()
+            if not isinstance(tickers, list):
                 continue
-                
-            data = await self.msg_queue.get()
-            
-            try:
-                # تحليل سريع للبيتكوين أولاً (Global Trend)
-                btc_data = next((x for x in data if x['s'] == 'BTCUSDT'), None)
-                if btc_data:
-                    await self.update_btc_status(btc_data)
+            for ticker in tickers:
+                await self.process_ticker(ticker)
 
-                # إذا كان السوق ينهار، توقف مؤقتاً
-                if self.paused and CONFIG["BTC_PROTECTION"]:
-                    continue
-
-                # معالجة باقي العملات
-                tasks = []
-                for ticker in data:
-                    symbol = ticker['s']
-                    if not symbol.endswith('USDT'): continue
-                    if 'BTC' in symbol and symbol != 'BTCUSDT': continue
-                    
-                    # تهيئة العملة إذا كانت جديدة
-                    if symbol not in self.coins:
-                        # فلتر الحجم اليومي
-                        if float(ticker['q']) < CONFIG["MIN_24H_VOL"]: continue
-                        self.coins[symbol] = MarketPulse(symbol)
-
-                    tasks.append(self.process_coin(self.coins[symbol], ticker))
-                
-                if tasks:
-                    await asyncio.gather(*tasks)
-            
-            except Exception as e:
-                print(f"Error in Analyzer: {e}")
-            finally:
-                self.msg_queue.task_done()
-
-    async def update_btc_status(self, ticker):
-        """مراقبة اتجاه البيتكوين العام"""
-        pulse = self.coins.get('BTCUSDT')
-        if not pulse: 
-            self.coins['BTCUSDT'] = MarketPulse('BTCUSDT')
+    def btc_guard(self, ticker):
+        if ticker.get("s") != "BTCUSDT":
             return
-            
-        price = float(ticker['c'])
-        vol = float(ticker['q'])
-        pulse.add_snapshot(price, vol)
-        
-        if len(pulse.prices) > 10:
-            start_price = pulse.prices[0]
-            self.btc_trend = ((price - start_price) / start_price) * 100
-            
-            if self.btc_trend < CONFIG["BTC_DUMP_PERCENT"]:
-                if not self.paused:
-                    print(f"\n{Term.RED}{Term.BOLD}⛔ BTC CRASH DETECTED ({self.btc_trend:.2f}%) - HALTING SNIPER{Term.END}")
-                self.paused = True
-            else:
-                if self.paused:
-                    print(f"\n{Term.GREEN}✅ BTC STABILIZED - RESUMING{Term.END}")
-                self.paused = False
+        price = float(ticker["c"])
+        open_price = float(ticker.get("o", price))
+        self.btc_trend = ((price - open_price) / open_price) * 100
+        if self.btc_trend < CONFIG["BTC_DUMP_PERCENT"]:
+            if not self.paused:
+                print(
+                    f"\n{Term.RED}{Term.BOLD}⛔ BTC CRASH DETECTED ({self.btc_trend:.2f}%) - HALTING SNIPER{Term.END}"
+                )
+            self.paused = True
+        elif self.paused:
+            print(f"\n{Term.GREEN}✅ BTC STABILIZED - RESUMING{Term.END}")
+            self.paused = False
 
-    async def process_coin(self, pulse: MarketPulse, ticker):
-        """تحليل العملة الواحدة"""
-        current_price = float(ticker['c'])
-        accumulated_vol = float(ticker['q'])
-        
-        # حساب الحجم اللحظي قبل التحديث
-        prev_vol = pulse.last_accumulated_vol
-        if prev_vol == 0:
-            pulse.add_snapshot(current_price, accumulated_vol)
+    async def process_ticker(self, ticker):
+        symbol = ticker.get("s")
+        if not symbol or symbol.endswith("BUSD"):
             return
 
-        delta_vol = accumulated_vol - prev_vol
-        if delta_vol < 0: delta_vol = 0 # Reset case
-        
-        # تحديث البيانات التاريخية
-        pulse.add_snapshot(current_price, accumulated_vol)
+        self.btc_guard(ticker)
+        if self.paused:
+            return
 
-        if not pulse.is_ready: return
+        quote_vol = float(ticker.get("q", 0))
+        if quote_vol < CONFIG["MIN_24H_VOL"]:
+            return
 
-        # --- [ المنطق الخارق: التحليل الإحصائي ] ---
-        
-        z_score, mean_vol = pulse.calculate_statistics(delta_vol)
-        price_momentum = pulse.get_price_momentum()
-        
-        # 1. استراتيجية "الحدث النووي" (Sigma Event)
-        if CONFIG["ENABLE_SIGMA_EVENT"] and z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
+        price = float(ticker["c"])
+        bid_qty = float(ticker.get("B", 0.0))
+        ask_qty = float(ticker.get("A", 0.0))
+
+        state = self.market_states.setdefault(symbol, MarketState(symbol))
+        metrics = state.update(price, bid_qty, ask_qty)
+
+        # إشارات كمية مركبة
+        await self.evaluate_signals(symbol, price, metrics)
+
+    async def evaluate_signals(self, symbol: str, price: float, m: Dict[str, float]):
+        entropy_buffer = list(self.market_states[symbol].returns)
+        entropy_arr = np.fromiter(entropy_buffer, dtype=float)
+        previous_entropy = float(pd_ema(entropy_arr, span=20)[-2]) if len(entropy_arr) > 2 else m["entropy"]
+
+        # 1) اتجاهية قوية وفق Hurst + زخم إيجابي
+        if (
+            CONFIG["ENABLE_HURST_TREND"]
+            and m["hurst"] > CONFIG["HURST_MIN"]
+            and m["momentum"] > 0.25
+        ):
             await self.trigger_alert(
-                "☢️ STATISTICAL ANOMALY", 
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED
+                "📐 HURST PERSISTENCE",
+                symbol,
+                price,
+                extra={
+                    "H": m["hurst"],
+                    "mom": m["momentum"],
+                },
+                color=Term.CYAN,
+                change=m["momentum"],
             )
-            
-        # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        elif CONFIG["ENABLE_SILENT_ACCUMULATION"] and z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
+
+        # 2) انهيار إنتروبيا + تسارع توازن إيجابي (تزامن حيتان)
+        entropy_drop = (
+            (previous_entropy - m["entropy"]) / previous_entropy
+            if previous_entropy > 0
+            else 0.0
+        )
+        if (
+            CONFIG["ENABLE_ENTROPY_IMBALANCE"]
+            and entropy_drop >= CONFIG["ENTROPY_DROP_RATIO"]
+            and m["imbalance_d2"] > 0
+            and m["imbalance_d1"] > 0
+        ):
             await self.trigger_alert(
-                "🐳 SILENT ACCUMULATION", 
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.PURPLE
+                "🧠 ENTROPY COLLAPSE",
+                symbol,
+                price,
+                extra={
+                    "ΔH": entropy_drop,
+                    "∂I": m["imbalance_d1"],
+                    "∂²I": m["imbalance_d2"],
+                },
+                color=Term.PURPLE,
+                change=m["imbalance_d1"] * 100,
             )
 
-        # 3. استراتيجية "كسر الزخم" (Velocity Breakout)
-        vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
-        if CONFIG["ENABLE_VELOCITY_BREAKOUT"] and vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
+        # 3) بقايا كالمان مرتفعة = كسر هيكلي مفاجئ
+        if CONFIG["ENABLE_KALMAN_BREAK"]:
+            residual_std = float(np.std(list(self.market_states[symbol].returns) or [0.0]))
+            residual_std = residual_std if residual_std > 0 else 1e-6
+            residual_z = m["kalman_residual"] / residual_std
+            if abs(residual_z) >= CONFIG["KALMAN_RESIDUAL_Z"]:
+                await self.trigger_alert(
+                    "🛰️ KALMAN STRUCTURAL BREAK",
+                    symbol,
+                    price,
+                    extra={
+                        "z_res": residual_z,
+                        "res": m["kalman_residual"],
+                    },
+                    color=Term.YELLOW,
+                    change=residual_z,
+                )
+
+        # 4) تسارع مشتق ثاني موجب لتوازن العرض/الطلب (تدفق أوامر حقيقي)
+        if (
+            CONFIG["ENABLE_IMBALANCE_ACCEL"]
+            and m["imbalance_d2"] > CONFIG["IMBALANCE_ACCEL_THRESHOLD"]
+            and m["imbalance_d1"] > 0
+        ):
             await self.trigger_alert(
-                "🚀 VELOCITY BREAKOUT", 
-                pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
+                "⚡ ORDERFLOW ACCEL",
+                symbol,
+                price,
+                extra={
+                    "∂I": m["imbalance_d1"],
+                    "∂²I": m["imbalance_d2"],
+                },
+                color=Term.GREEN,
+                change=m["imbalance_d2"] * 100,
             )
 
     def update_alert_stats(self, symbol: str, strategy: str, change: float):
         stats = self.alert_stats[symbol][strategy]
         stats["count"] += 1
-
         if CONFIG["ENABLE_CUMULATIVE_RISE"] and change > 0:
             stats["rise"] += change
-
         if CONFIG["ENABLE_CUMULATIVE_DROP"] and change < 0:
             stats["drop"] += abs(change)
-
         return stats
 
-    async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color):
+    async def trigger_alert(self, signal_type: str, symbol: str, price: float, extra: Dict[str, float], color: str, change: float):
         timestamp = time.strftime("%H:%M:%S")
-
         stats = self.update_alert_stats(symbol, signal_type, change)
 
-        # تنسيق الحجم
-        vol_str = f"${vol/1000:.1f}K" if vol < 1000000 else f"${vol/1000000:.2f}M"
-
-        # تجهيز معلومات الإحصاءات التراكمية
         counter_info = f"#{int(stats['count'])}" if CONFIG["SHOW_ALERT_COUNTERS"] else ""
         rise_info = f"🔺{stats['rise']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_RISE"] else ""
         drop_info = f"🔻{stats['drop']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_DROP"] else ""
@@ -295,43 +382,35 @@ class QuantumSniper:
         stats_text = " | ".join(stats_parts) if stats_parts else "N/A"
         symbol_display = f"{symbol} {counter_info} ({stats_text})".strip()
 
-        # طباعة التنبيه
+        # نص رياضي مختصر بالعربية
+        extra_lines = " | ".join([f"{k}:{v:.3f}" for k, v in extra.items()]) if extra else ""
+
         print(f"{color}{Term.BOLD}╔══════════════════════════════════════════════════════════╗{Term.END}")
-        print(f"{color}║ {signal_type:<25} | {symbol_display:<25} ⏰ {timestamp} ║{Term.END}")
+        print(f"{color}║ {signal_type:<28} | {symbol_display:<22} ⏰ {timestamp} ║{Term.END}")
         print(f"{color}╠══════════════════════════════════════════════════════════╣{Term.END}")
-        print(f"{color}║ 📊 Z-Score: {z:.2f}σ (Rare!)     💎 Price: {price}       ║{Term.END}")
-        print(f"{color}║ 🌊 Vol 1s:  {vol_str:<10}     📈 Change: {change:+.2f}%       ║{Term.END}")
+        print(f"{color}║ 💎 Price: {price:<12} | 📈 Change: {change:+.3f}             ║{Term.END}")
+        print(f"{color}║ 📊 Metrics: {extra_lines:<44}║{Term.END}")
         print(f"{color}╚══════════════════════════════════════════════════════════╝{Term.END}")
 
-        # حفظ في ملف CSV
-        with open(CONFIG["LOG_FILE"], 'a', newline='') as f:
+        with open(CONFIG["LOG_FILE"], "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([timestamp, symbol, signal_type, price, round(z, 2), round(vol, 2), round(change, 2)])
+            row = [timestamp, symbol, signal_type, price, change] + [f"{k}:{v}" for k, v in extra.items()]
+            writer.writerow(row)
 
     async def main(self):
         Term.print_banner()
-        print(f"{Term.YELLOW}⏳ Calibrating statistical models (Collecting History)...{Term.END}")
-        
-        # الحل الجذري للمشكلة: إنشاء الطابور داخل الحلقة النشطة هنا
-        self.msg_queue = asyncio.Queue()
-        
-        # تشغيل العمليات بشكل متوازي
-        await asyncio.gather(
-            self.ws_listener(),
-            self.market_analyzer()
-        )
+        print(f"{Term.YELLOW}⏳ Initializing Statistical Engines...{Term.END}")
+        await asyncio.gather(self.ws_listener(), self.market_analyzer())
+
 
 if __name__ == "__main__":
     try:
-        # إعدادات التوافقية لنظام Pydroid و Windows
-        if sys.platform == 'win32':
+        if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-            
         bot = QuantumSniper()
         asyncio.run(bot.main())
     except KeyboardInterrupt:
         print("\n🚫 System Shutdown.")
     except RuntimeError as e:
-        # تجاهل أخطاء إغلاق الحلقة المعروفة في Pydroid
         if "Event loop is closed" not in str(e):
             print(f"Runtime Error: {e}")
