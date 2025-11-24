@@ -6,7 +6,7 @@ import csv
 import sys
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Deque, Tuple
+from typing import Dict, Deque, Tuple, Optional
 
 import aiohttp
 import numpy as np
@@ -36,6 +36,29 @@ CONFIG = {
     # بارامترات الكالمان (1D)
     "KALMAN_PROCESS_NOISE": 1e-3,
     "KALMAN_MEAS_NOISE": 2e-2,
+    "KALMAN_STATE_SMOOTH": 10,
+
+    # الأطر الزمنية المدعومة
+    "TIMEFRAMES": {
+        "tick": 0,
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14_400,
+        "1d": 86_400,
+    },
+
+    # عدد الأشرطة لكل إطار زمني للحفاظ على تاريخ كافٍ للمقاييس
+    "TIMEFRAME_BARS": {
+        "tick": 240,
+        "1m": 360,
+        "5m": 240,
+        "15m": 180,
+        "1h": 120,
+        "4h": 90,
+        "1d": 60,
+    },
 
     # التفعيل/التعطيل لكل إشارة كمية
     "ENABLE_HURST_TREND": True,
@@ -138,18 +161,26 @@ def shannon_entropy_drop(returns: np.ndarray, bins: int = 20) -> Tuple[float, fl
 @dataclass
 class MarketState:
     symbol: str
-    prices: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["WINDOW_SIZE"]))
-    returns: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["RETURNS_WINDOW"]))
-    imbalance: Deque[float] = field(default_factory=lambda: deque(maxlen=CONFIG["IMBALANCE_WINDOW"]))
-    kalman: Kalman1D = field(
-        default_factory=lambda: Kalman1D(
-            CONFIG["KALMAN_PROCESS_NOISE"], CONFIG["KALMAN_MEAS_NOISE"]
-        )
-    )
+    timeframe: str
+    window_size: int
+    returns_window: int
+    imbalance_window: int
+    prices: Deque[float] = field(init=False)
+    returns: Deque[float] = field(init=False)
+    imbalance: Deque[float] = field(init=False)
+    kalman: Kalman1D = field(init=False)
+    residuals: Deque[float] = field(init=False)
     last_timestamp: float = 0.0
 
+    def __post_init__(self):
+        self.prices = deque(maxlen=self.window_size)
+        self.returns = deque(maxlen=self.returns_window)
+        self.imbalance = deque(maxlen=self.imbalance_window)
+        self.kalman = Kalman1D(CONFIG["KALMAN_PROCESS_NOISE"], CONFIG["KALMAN_MEAS_NOISE"])
+        self.residuals = deque(maxlen=CONFIG["KALMAN_STATE_SMOOTH"])
+
     def update(self, price: float, bid_qty: float, ask_qty: float) -> Dict[str, float]:
-        """تحديث السلاسل الزمنية وإرجاع القياسات المحدثة."""
+        """تحديث السلاسل الزمنية لكل إطار زمني وإرجاع القياسات المحدثة."""
         metrics = {}
         self.prices.append(price)
 
@@ -186,9 +217,11 @@ class MarketState:
         metrics["imbalance_d1"] = float(first_derivative)
         metrics["imbalance_d2"] = float(second_derivative)
 
-        # Kalman residual
+        # Kalman residuals مع تنعيم
         _, residual = self.kalman.update(price)
+        self.residuals.append(residual)
         metrics["kalman_residual"] = residual
+        metrics["kalman_residual_mean"] = float(np.mean(self.residuals)) if self.residuals else 0.0
 
         # Momentum آخر 5 نقاط
         metrics["momentum"] = (
@@ -198,6 +231,40 @@ class MarketState:
         )
 
         return metrics
+
+
+@dataclass
+class TimeframeBuffer:
+    """تجميع الأسعار على أطر زمنية مختلفة دون ضغط الأداء."""
+
+    name: str
+    seconds: int
+    bucket_start: float = 0.0
+    last_price: float = 0.0
+    last_bid: float = 0.0
+    last_ask: float = 0.0
+
+    def ingest(self, timestamp: float, price: float, bid_qty: float, ask_qty: float) -> Optional[Tuple[float, float, float]]:
+        # إطار tick لا يحتاج لتجميع
+        if self.seconds == 0:
+            return None
+
+        if self.bucket_start == 0:
+            self.bucket_start = timestamp
+
+        # تحديث آخر قيم لرسم الإغلاق عند نهاية الحاوية
+        self.last_price = price
+        self.last_bid = bid_qty
+        self.last_ask = ask_qty
+
+        if timestamp - self.bucket_start >= self.seconds:
+            aggregated = (self.last_price, self.last_bid, self.last_ask)
+            # تقدم الحاوية للأمام حتى لا نخسر الدقات المتأخرة
+            while timestamp - self.bucket_start >= self.seconds:
+                self.bucket_start += self.seconds
+            return aggregated
+
+        return None
 
 
 # ===============[ 📈 مؤشرات مساندة عالية السرعة ]=====================
@@ -216,13 +283,34 @@ class QuantumSniper:
     def __init__(self):
         # يتم إنشاء طابور الرسائل داخل حلقة الحدث النشطة لضمان توافق الحلقة
         # (تفادي خطأ "Future attached to a different loop").
-        self.msg_queue: asyncio.Queue | None = None
-        self.market_states: Dict[str, MarketState] = {}
-        self.alert_stats: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+        self.msg_queue: Optional[asyncio.Queue] = None
+        self.market_states: Dict[Tuple[str, str], MarketState] = {}
+        self.timeframe_buffers: Dict[str, Dict[str, TimeframeBuffer]] = defaultdict(dict)
+        self.alert_stats: Dict[Tuple[str, str], Dict[str, Dict[str, float]]] = defaultdict(
             lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
         )
         self.paused = False
         self.btc_trend = 0.0
+
+    def get_state(self, symbol: str, timeframe: str) -> MarketState:
+        key = (symbol, timeframe)
+        if key not in self.market_states:
+            bars = CONFIG["TIMEFRAME_BARS"].get(timeframe, CONFIG["TIMEFRAME_BARS"]["tick"])
+            self.market_states[key] = MarketState(
+                symbol,
+                timeframe,
+                window_size=bars,
+                returns_window=bars,
+                imbalance_window=max(30, bars // 2),
+            )
+        return self.market_states[key]
+
+    def get_buffer(self, symbol: str, timeframe: str) -> TimeframeBuffer:
+        tf_map = self.timeframe_buffers[symbol]
+        if timeframe not in tf_map:
+            seconds = CONFIG["TIMEFRAMES"].get(timeframe, 0)
+            tf_map[timeframe] = TimeframeBuffer(timeframe, seconds)
+        return tf_map[timeframe]
 
     async def ws_listener(self):
         url = "wss://stream.binance.com:9443/ws/!ticker@arr"
@@ -274,14 +362,29 @@ class QuantumSniper:
         bid_qty = float(ticker.get("B", 0.0))
         ask_qty = float(ticker.get("A", 0.0))
 
-        state = self.market_states.setdefault(symbol, MarketState(symbol))
-        metrics = state.update(price, bid_qty, ask_qty)
+        timestamp = float(ticker.get("E", time.time() * 1000)) / 1000.0
 
-        # إشارات كمية مركبة
-        await self.evaluate_signals(symbol, price, metrics)
+        # إطار tick الفوري
+        tick_state = self.get_state(symbol, "tick")
+        metrics = tick_state.update(price, bid_qty, ask_qty)
+        await self.evaluate_signals(symbol, "tick", price, metrics, tick_state)
 
-    async def evaluate_signals(self, symbol: str, price: float, m: Dict[str, float]):
-        entropy_buffer = list(self.market_states[symbol].returns)
+        # أطر زمنية مجمعة
+        for tf_name, seconds in CONFIG["TIMEFRAMES"].items():
+            if tf_name == "tick" or seconds <= 0:
+                continue
+            buffer = self.get_buffer(symbol, tf_name)
+            aggregated = buffer.ingest(timestamp, price, bid_qty, ask_qty)
+            if aggregated:
+                agg_price, agg_bid, agg_ask = aggregated
+                tf_state = self.get_state(symbol, tf_name)
+                tf_metrics = tf_state.update(agg_price, agg_bid, agg_ask)
+                await self.evaluate_signals(symbol, tf_name, agg_price, tf_metrics, tf_state)
+
+    async def evaluate_signals(
+        self, symbol: str, timeframe: str, price: float, m: Dict[str, float], state: MarketState
+    ):
+        entropy_buffer = list(state.returns)
         entropy_arr = np.fromiter(entropy_buffer, dtype=float)
         previous_entropy = float(pd_ema(entropy_arr, span=20)[-2]) if len(entropy_arr) > 2 else m["entropy"]
 
@@ -294,6 +397,7 @@ class QuantumSniper:
             await self.trigger_alert(
                 "📐 HURST PERSISTENCE",
                 symbol,
+                timeframe,
                 price,
                 extra={
                     "H": m["hurst"],
@@ -318,6 +422,7 @@ class QuantumSniper:
             await self.trigger_alert(
                 "🧠 ENTROPY COLLAPSE",
                 symbol,
+                timeframe,
                 price,
                 extra={
                     "ΔH": entropy_drop,
@@ -330,17 +435,19 @@ class QuantumSniper:
 
         # 3) بقايا كالمان مرتفعة = كسر هيكلي مفاجئ
         if CONFIG["ENABLE_KALMAN_BREAK"]:
-            residual_std = float(np.std(list(self.market_states[symbol].returns) or [0.0]))
+            residual_std = float(np.std(list(state.returns) or [0.0]))
             residual_std = residual_std if residual_std > 0 else 1e-6
             residual_z = m["kalman_residual"] / residual_std
             if abs(residual_z) >= CONFIG["KALMAN_RESIDUAL_Z"]:
                 await self.trigger_alert(
                     "🛰️ KALMAN STRUCTURAL BREAK",
                     symbol,
+                    timeframe,
                     price,
                     extra={
                         "z_res": residual_z,
                         "res": m["kalman_residual"],
+                        "μ_res": m["kalman_residual_mean"],
                     },
                     color=Term.YELLOW,
                     change=residual_z,
@@ -355,6 +462,7 @@ class QuantumSniper:
             await self.trigger_alert(
                 "⚡ ORDERFLOW ACCEL",
                 symbol,
+                timeframe,
                 price,
                 extra={
                     "∂I": m["imbalance_d1"],
@@ -364,8 +472,8 @@ class QuantumSniper:
                 change=m["imbalance_d2"] * 100,
             )
 
-    def update_alert_stats(self, symbol: str, strategy: str, change: float):
-        stats = self.alert_stats[symbol][strategy]
+    def update_alert_stats(self, symbol: str, timeframe: str, strategy: str, change: float):
+        stats = self.alert_stats[(symbol, timeframe)][strategy]
         stats["count"] += 1
         if CONFIG["ENABLE_CUMULATIVE_RISE"] and change > 0:
             stats["rise"] += change
@@ -373,16 +481,25 @@ class QuantumSniper:
             stats["drop"] += abs(change)
         return stats
 
-    async def trigger_alert(self, signal_type: str, symbol: str, price: float, extra: Dict[str, float], color: str, change: float):
+    async def trigger_alert(
+        self,
+        signal_type: str,
+        symbol: str,
+        timeframe: str,
+        price: float,
+        extra: Dict[str, float],
+        color: str,
+        change: float,
+    ):
         timestamp = time.strftime("%H:%M:%S")
-        stats = self.update_alert_stats(symbol, signal_type, change)
+        stats = self.update_alert_stats(symbol, timeframe, signal_type, change)
 
         counter_info = f"#{int(stats['count'])}" if CONFIG["SHOW_ALERT_COUNTERS"] else ""
         rise_info = f"🔺{stats['rise']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_RISE"] else ""
         drop_info = f"🔻{stats['drop']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_DROP"] else ""
         stats_parts = [part for part in [rise_info, drop_info] if part]
         stats_text = " | ".join(stats_parts) if stats_parts else "N/A"
-        symbol_display = f"{symbol} {counter_info} ({stats_text})".strip()
+        symbol_display = f"{symbol}[{timeframe}] {counter_info} ({stats_text})".strip()
 
         # نص رياضي مختصر بالعربية
         extra_lines = " | ".join([f"{k}:{v:.3f}" for k, v in extra.items()]) if extra else ""
@@ -396,7 +513,7 @@ class QuantumSniper:
 
         with open(CONFIG["LOG_FILE"], "a", newline="") as f:
             writer = csv.writer(f)
-            row = [timestamp, symbol, signal_type, price, change] + [f"{k}:{v}" for k, v in extra.items()]
+            row = [timestamp, f"{symbol}[{timeframe}]", signal_type, price, change] + [f"{k}:{v}" for k, v in extra.items()]
             writer.writerow(row)
 
     async def main(self):
