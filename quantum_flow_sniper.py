@@ -33,6 +33,9 @@ CONFIG = {
     "KALMAN_RESIDUAL_Z": 2.6,           # Z-Score لبقايا الكالمان لإعلان كسر هيكلي
     "IMBALANCE_ACCEL_THRESHOLD": 0.12,  # تسارع توازن الطلب/العرض المطلوب
 
+    # نوع التدفق (افتراضي عقود USDT-M الآجلة)
+    "USE_FUTURES_USDTM": True,
+
     # بارامترات الكالمان (1D)
     "KALMAN_PROCESS_NOISE": 1e-3,
     "KALMAN_MEAS_NOISE": 2e-2,
@@ -371,7 +374,12 @@ class QuantumSniper:
         return tf_map[timeframe]
 
     async def ws_listener(self):
-        url = "wss://stream.binance.com:9443/ws/!ticker@arr"
+        # تدفق العقود الآجلة USDT-M أسرع وأقل ضوضاء للأزواج المطلوبة فقط
+        url = (
+            "wss://fstream.binance.com/ws/!ticker@arr"
+            if CONFIG.get("USE_FUTURES_USDTM", True)
+            else "wss://stream.binance.com:9443/ws/!ticker@arr"
+        )
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(url, heartbeat=60) as ws:
                 async for msg in ws:
@@ -382,6 +390,9 @@ class QuantumSniper:
     async def market_analyzer(self):
         while True:
             tickers = await self.msg_queue.get()
+            # تدفق Binance USDT-M يرجع كائن {"stream":..., "data": [...]} أحيانًا
+            if isinstance(tickers, dict) and "data" in tickers:
+                tickers = tickers.get("data")
             if not isinstance(tickers, list):
                 continue
             for ticker in tickers:
@@ -407,6 +418,13 @@ class QuantumSniper:
         symbol = ticker.get("s")
         if not symbol or symbol.endswith("BUSD"):
             return
+
+        if CONFIG.get("USE_FUTURES_USDTM", True):
+            # فلترة صارمة لعقود USDT-M فقط
+            if not symbol.endswith("USDT"):
+                return
+            # تدفقات غير العقود الدائمة (مثل coin-m) لا تحتوي على USDT
+
 
         self.btc_guard(ticker)
         if self.paused:
