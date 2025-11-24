@@ -32,6 +32,10 @@ CONFIG = {
     "ENTROPY_DROP_RATIO": 0.18,         # مقدار الانخفاض النسبي المطلوب في الإنتروبيا
     "KALMAN_RESIDUAL_Z": 2.6,           # Z-Score لبقايا الكالمان لإعلان كسر هيكلي
     "IMBALANCE_ACCEL_THRESHOLD": 0.12,  # تسارع توازن الطلب/العرض المطلوب
+    "MIN_RETURNS_FOR_SIGNALS": 18,      # حد أدنى من العينات قبل السماح بإشارات كمية
+    "MIN_RESIDUALS_FOR_KALMAN": 12,     # حد أدنى من البقايا قبل تقييم ز-سكور الكالمان
+    "MAX_TICK_JUMP_PCT": 35,           # تجاهل الدقات التي تقفز فوق هذا الحد (٪) كضوضاء
+    "MAX_KALMAN_Z": 40,                # سقف للـ z-score لتجنب قيم غير منطقية في الطباعة
 
     # نوع التدفق (افتراضي عقود USDT-M الآجلة)
     "USE_FUTURES_USDTM": True,
@@ -78,6 +82,9 @@ CONFIG = {
     "ENABLE_CUMULATIVE_RISE": True,
     "ENABLE_CUMULATIVE_DROP": True,
     "SHOW_ALERT_COUNTERS": True,
+
+    # تقليم التغيّر المعروض لمنع تلوث العدادات بالقيم الشاذة
+    "MAX_ALERT_ABS_CHANGE": 500,        # % أو z-score بحسب الإستراتيجية
 
     # حماية السوق
     "BTC_PROTECTION": True,
@@ -204,6 +211,13 @@ class MarketState:
         metrics = {}
         if timestamp <= self.last_timestamp:
             return metrics
+        # رفض القفزات غير المنطقية كضوضاء بيانات
+        if self.prices:
+            last_price = self.prices[-1]
+            jump_pct = abs(price - last_price) / max(last_price, 1e-9) * 100
+            if jump_pct > CONFIG["MAX_TICK_JUMP_PCT"]:
+                return metrics
+
         self.last_timestamp = timestamp
         self.prices.append(price)
 
@@ -471,6 +485,9 @@ class QuantumSniper:
     async def evaluate_signals(
         self, symbol: str, timeframe: str, price: float, m: Dict[str, float], state: MarketState
     ):
+        if len(state.prices) < CONFIG["MIN_RETURNS_FOR_SIGNALS"]:
+            return
+
         entropy_buffer = list(state.returns)
         entropy_arr = np.fromiter(entropy_buffer, dtype=float)
         previous_entropy = float(pd_ema(entropy_arr, span=20)[-2]) if len(entropy_arr) > 2 else m["entropy"]
@@ -540,10 +557,11 @@ class QuantumSniper:
                 )
 
         # 3) بقايا كالمان مرتفعة = كسر هيكلي مفاجئ
-        if CONFIG["ENABLE_KALMAN_BREAK"]:
-            residual_std = float(np.std(list(state.returns) or [0.0]))
+        if CONFIG["ENABLE_KALMAN_BREAK"] and len(state.residuals) >= CONFIG["MIN_RESIDUALS_FOR_KALMAN"]:
+            residual_std = float(np.std(list(state.residuals) or [0.0]))
             residual_std = residual_std if residual_std > 0 else 1e-6
             residual_z = m["kalman_residual"] / residual_std
+            residual_z = max(min(residual_z, CONFIG["MAX_KALMAN_Z"]), -CONFIG["MAX_KALMAN_Z"])
             if abs(residual_z) >= CONFIG["KALMAN_RESIDUAL_Z"]:
                 if self.should_emit(
                     symbol,
@@ -694,6 +712,7 @@ class QuantumSniper:
         color: str,
         change: float,
     ):
+        change = max(min(change, CONFIG["MAX_ALERT_ABS_CHANGE"]), -CONFIG["MAX_ALERT_ABS_CHANGE"])
         timestamp = time.strftime("%H:%M:%S")
         stats = self.update_alert_stats(symbol, timeframe, signal_type, change)
 
