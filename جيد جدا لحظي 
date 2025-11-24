@@ -214,7 +214,9 @@ def pd_ema(series: np.ndarray, span: int) -> np.ndarray:
 # =====================[ 🚀 الكور الرئيسي ]=====================
 class QuantumSniper:
     def __init__(self):
-        self.msg_queue: asyncio.Queue = asyncio.Queue()
+        # يتم إنشاء طابور الرسائل داخل حلقة الحدث النشطة لضمان توافق الحلقة
+        # (تفادي خطأ "Future attached to a different loop").
+        self.msg_queue: asyncio.Queue | None = None
         self.market_states: Dict[str, MarketState] = {}
         self.alert_stats: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
             lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
@@ -400,6 +402,8 @@ class QuantumSniper:
     async def main(self):
         Term.print_banner()
         print(f"{Term.YELLOW}⏳ Initializing Statistical Engines...{Term.END}")
+        # إنشاء الطابور بعد بدء الحلقة لتوحيد الحلقة بين جميع المهام
+        self.msg_queue = asyncio.Queue()
         await asyncio.gather(self.ws_listener(), self.market_analyzer())
 
 
