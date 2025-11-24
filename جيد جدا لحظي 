@@ -20,6 +20,16 @@ CONFIG = {
     "SIGMA_THRESHOLD": 1.5,       # (Z-Score) الحساسية للشذوذ الإحصائي (3.5 = حدث نادر جداً)
     "ACCELERATION_FACTOR": 1.0,   # معامل تسارع السيولة المطلوب
     
+    # --- [ تفعيل/تعطيل الاستراتيجيات ] ---
+    "ENABLE_SIGMA_EVENT": True,          # استراتيجية "الحدث النووي"
+    "ENABLE_VELOCITY_BREAKOUT": True,    # استراتيجية "كسر الزخم"
+    "ENABLE_SILENT_ACCUMULATION": True,  # استراتيجية "التجميع المخفي"
+
+    # --- [ تفعيل/تعطيل القياسات التراكمية ] ---
+    "ENABLE_CUMULATIVE_RISE": True,      # حساب نسبة الارتفاع التراكمية
+    "ENABLE_CUMULATIVE_DROP": True,      # حساب نسبة الانخفاض التراكمية
+    "SHOW_ALERT_COUNTERS": True,         # إظهار عدد مرات تكرار التنبيه
+    
     # --- [ حماية السوق ] ---
     "BTC_PROTECTION": True,       # إيقاف الشراء إذا كان البيتكوين ينهار
     "BTC_DUMP_PERCENT": -0.4,     # نسبة هبوط البيتكوين في الدقيقة التي تفعل الحماية
@@ -119,6 +129,9 @@ class QuantumSniper:
         self.session = None
         self.btc_trend = 0.0
         self.paused = False
+        self.alert_stats: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(
+            lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
+        )
         
         # إعداد ملف اللوج
         if not os.path.exists(CONFIG["LOG_FILE"]):
@@ -233,14 +246,14 @@ class QuantumSniper:
         price_momentum = pulse.get_price_momentum()
         
         # 1. استراتيجية "الحدث النووي" (Sigma Event)
-        if z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
+        if CONFIG["ENABLE_SIGMA_EVENT"] and z_score > CONFIG["SIGMA_THRESHOLD"] and price_momentum > 0.2:
             await self.trigger_alert(
                 "☢️ STATISTICAL ANOMALY", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.RED
             )
             
         # 2. استراتيجية "التجميع المخفي" (Silent Accumulation)
-        elif z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
+        elif CONFIG["ENABLE_SILENT_ACCUMULATION"] and z_score > 2.5 and -0.05 <= price_momentum <= 0.05:
             await self.trigger_alert(
                 "🐳 SILENT ACCUMULATION", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.PURPLE
@@ -248,26 +261,48 @@ class QuantumSniper:
 
         # 3. استراتيجية "كسر الزخم" (Velocity Breakout)
         vol_acceleration = delta_vol / mean_vol if mean_vol > 0 else 0
-        if vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
+        if CONFIG["ENABLE_VELOCITY_BREAKOUT"] and vol_acceleration > CONFIG["ACCELERATION_FACTOR"] * 2 and price_momentum > 0.5:
             await self.trigger_alert(
                 "🚀 VELOCITY BREAKOUT", 
                 pulse.symbol, current_price, z_score, delta_vol, price_momentum, Term.YELLOW
             )
 
+    def update_alert_stats(self, symbol: str, strategy: str, change: float):
+        stats = self.alert_stats[symbol][strategy]
+        stats["count"] += 1
+
+        if CONFIG["ENABLE_CUMULATIVE_RISE"] and change > 0:
+            stats["rise"] += change
+
+        if CONFIG["ENABLE_CUMULATIVE_DROP"] and change < 0:
+            stats["drop"] += abs(change)
+
+        return stats
+
     async def trigger_alert(self, signal_type, symbol, price, z, vol, change, color):
         timestamp = time.strftime("%H:%M:%S")
-        
+
+        stats = self.update_alert_stats(symbol, signal_type, change)
+
         # تنسيق الحجم
         vol_str = f"${vol/1000:.1f}K" if vol < 1000000 else f"${vol/1000000:.2f}M"
-        
+
+        # تجهيز معلومات الإحصاءات التراكمية
+        counter_info = f"#{int(stats['count'])}" if CONFIG["SHOW_ALERT_COUNTERS"] else ""
+        rise_info = f"🔺{stats['rise']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_RISE"] else ""
+        drop_info = f"🔻{stats['drop']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_DROP"] else ""
+        stats_parts = [part for part in [rise_info, drop_info] if part]
+        stats_text = " | ".join(stats_parts) if stats_parts else "N/A"
+        symbol_display = f"{symbol} {counter_info} ({stats_text})".strip()
+
         # طباعة التنبيه
         print(f"{color}{Term.BOLD}╔══════════════════════════════════════════════════════════╗{Term.END}")
-        print(f"{color}║ {signal_type:<25} | {symbol:<10} ⏰ {timestamp}    ║{Term.END}")
+        print(f"{color}║ {signal_type:<25} | {symbol_display:<25} ⏰ {timestamp} ║{Term.END}")
         print(f"{color}╠══════════════════════════════════════════════════════════╣{Term.END}")
         print(f"{color}║ 📊 Z-Score: {z:.2f}σ (Rare!)     💎 Price: {price}       ║{Term.END}")
         print(f"{color}║ 🌊 Vol 1s:  {vol_str:<10}     📈 Change: {change:+.2f}%       ║{Term.END}")
         print(f"{color}╚══════════════════════════════════════════════════════════╝{Term.END}")
-        
+
         # حفظ في ملف CSV
         with open(CONFIG["LOG_FILE"], 'a', newline='') as f:
             writer = csv.writer(f)
