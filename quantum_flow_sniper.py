@@ -65,6 +65,7 @@ CONFIG = {
     "ENABLE_ENTROPY_IMBALANCE": True,
     "ENABLE_KALMAN_BREAK": True,
     "ENABLE_IMBALANCE_ACCEL": True,
+    "ENABLE_ICT_MODEL": True,
 
     # عرض المقاييس التراكمية
     "ENABLE_CUMULATIVE_RISE": True,
@@ -74,6 +75,12 @@ CONFIG = {
     # حماية السوق
     "BTC_PROTECTION": True,
     "BTC_DUMP_PERCENT": -0.4,
+
+    # منطق ICT (سيولة + نزوح سعري)
+    "ICT_SWEEP_LOOKBACK": 40,
+    "ICT_MIN_DISPLACEMENT": 0.6,  # %
+    "ICT_MIN_IMBALANCE": 0.04,
+    "ICT_FVG_TOLERANCE": 0.12,    # % فجوة قيمة عادلة تقريبية بين آخر 3 نقاط
 
     "LOG_FILE": "quantum_signals.csv",
 }
@@ -471,6 +478,78 @@ class QuantumSniper:
                 color=Term.GREEN,
                 change=m["imbalance_d2"] * 100,
             )
+
+        # 5) منطق ICT (سحب سيولة + نزوح سعري بفجوة قيمة عادلة)
+        if CONFIG["ENABLE_ICT_MODEL"]:
+            ict_ctx = self.ict_signal(state, price, m)
+            if ict_ctx:
+                await self.trigger_alert(
+                    "🎯 ICT LIQUIDITY SHIFT",
+                    symbol,
+                    timeframe,
+                    price,
+                    extra=ict_ctx,
+                    color=Term.BLUE,
+                    change=ict_ctx.get("disp", 0.0),
+                )
+
+    def ict_signal(self, state: MarketState, price: float, m: Dict[str, float]) -> Optional[Dict[str, float]]:
+        prices = np.fromiter(state.prices, dtype=float)
+        if prices.size < 6:
+            return None
+
+        lookback = min(CONFIG["ICT_SWEEP_LOOKBACK"], prices.size)
+        window = prices[-lookback:]
+        prev_high = float(np.max(window[:-1])) if window.size > 1 else window[-1]
+        prev_low = float(np.min(window[:-1])) if window.size > 1 else window[-1]
+
+        sweep_up = price > prev_high
+        sweep_down = price < prev_low
+
+        displacement = ((price - float(np.mean(window))) / float(np.mean(window))) * 100
+        last3 = prices[-3:]
+        upper_gap = max(last3[0], last3[1])
+        lower_gap = min(last3[1], last3[2])
+        if lower_gap <= 0:
+            fvg = 0.0
+        else:
+            fvg = ((upper_gap - lower_gap) / lower_gap) * 100 if upper_gap > lower_gap else 0.0
+
+        imbalance_ok = m.get("imbalance_d1", 0.0) > CONFIG["ICT_MIN_IMBALANCE"]
+        displacement_ok = abs(displacement) >= CONFIG["ICT_MIN_DISPLACEMENT"]
+        fvg_ok = fvg >= CONFIG["ICT_FVG_TOLERANCE"]
+
+        if sweep_up and displacement_ok and imbalance_ok:
+            return {
+                "sweep": 1.0,
+                "disp": displacement,
+                "imb": m.get("imbalance_d1", 0.0),
+                "fvg": fvg,
+                "dir": 1.0 if displacement > 0 else -1.0,
+                "σH": m.get("hurst", 0.0),
+            }
+
+        if sweep_down and displacement_ok and imbalance_ok and m.get("momentum", 0.0) > 0:
+            return {
+                "sweep": -1.0,
+                "disp": displacement,
+                "imb": m.get("imbalance_d1", 0.0),
+                "fvg": fvg,
+                "dir": 1.0 if displacement > 0 else -1.0,
+                "σH": m.get("hurst", 0.0),
+            }
+
+        if fvg_ok and imbalance_ok and displacement_ok:
+            return {
+                "sweep": 0.0,
+                "disp": displacement,
+                "imb": m.get("imbalance_d1", 0.0),
+                "fvg": fvg,
+                "dir": 1.0 if displacement > 0 else -1.0,
+                "σH": m.get("hurst", 0.0),
+            }
+
+        return None
 
     def update_alert_stats(self, symbol: str, timeframe: str, strategy: str, change: float):
         stats = self.alert_stats[(symbol, timeframe)][strategy]
