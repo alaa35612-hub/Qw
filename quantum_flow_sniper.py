@@ -87,6 +87,12 @@ CONFIG = {
     "ICT_FVG_TOLERANCE": 0.12,    # % فجوة قيمة عادلة تقريبية بين آخر 3 نقاط
 
     "LOG_FILE": "quantum_signals.csv",
+
+    # ترشيح الضوضاء وكبح التنبيهات السريعة
+    "ALERT_COOLDOWN_SEC": 12,      # حد أدنى بين إشارتين لنفس الاستراتيجية/الرمز/الإطار
+    "MIN_SIGNAL_CHANGE": 0.45,     # تجاهل التغيرات الصغيرة (٪ أو قيمة معيارية)
+    "MIN_POSITIVE_MOMENTUM": 0.8,  # أقل زخم إيجابي مسموح به لإظهار أن الأصل يتحرك فعلاً لأعلى
+    "MIN_CONFLUENCE_SCORE": 1.25,  # حد تماسك إشارات (زخم + إتزان + هيرست)
 }
 
 # =====================[ 🎨 واجهة التيرمينال الاحترافية ]=====================
@@ -304,8 +310,45 @@ class QuantumSniper:
             lambda: defaultdict(lambda: {"count": 0, "rise": 0.0, "drop": 0.0})
         )
         self.last_event_ts: Dict[str, float] = defaultdict(float)
+        self.last_alert_time: Dict[Tuple[str, str, str], float] = defaultdict(float)
         self.paused = False
         self.btc_trend = 0.0
+
+    @staticmethod
+    def confluence_score(metrics: Dict[str, float]) -> float:
+        """مؤشر بسيط لتماسك الإشارة يجمع الزخم مع تسارع الاتزان وهيرست."""
+        mom_term = max(metrics.get("momentum", 0.0), 0.0) / 2
+        imb_term = max(metrics.get("imbalance_d1", 0.0), 0.0) * 50
+        acc_term = max(metrics.get("imbalance_d2", 0.0), 0.0) * 100
+        hurst_term = max(metrics.get("hurst", 0.0) - CONFIG["HURST_MIN"], 0.0)
+        return mom_term + imb_term + acc_term + hurst_term
+
+    def should_emit(
+        self,
+        symbol: str,
+        timeframe: str,
+        strategy: str,
+        change: float,
+        metrics: Dict[str, float],
+        enforce_trend: bool = False,
+        confluence: Optional[float] = None,
+    ) -> bool:
+        key = (symbol, timeframe, strategy)
+        now = time.time()
+
+        if now - self.last_alert_time[key] < CONFIG["ALERT_COOLDOWN_SEC"]:
+            return False
+
+        if abs(change) < CONFIG["MIN_SIGNAL_CHANGE"]:
+            return False
+
+        if enforce_trend:
+            if metrics.get("momentum", 0.0) < CONFIG["MIN_POSITIVE_MOMENTUM"]:
+                return False
+            if confluence is not None and confluence < CONFIG["MIN_CONFLUENCE_SCORE"]:
+                return False
+
+        return True
 
     def get_state(self, symbol: str, timeframe: str) -> MarketState:
         key = (symbol, timeframe)
@@ -413,6 +456,7 @@ class QuantumSniper:
         entropy_buffer = list(state.returns)
         entropy_arr = np.fromiter(entropy_buffer, dtype=float)
         previous_entropy = float(pd_ema(entropy_arr, span=20)[-2]) if len(entropy_arr) > 2 else m["entropy"]
+        confluence = self.confluence_score(m)
 
         # 1) اتجاهية قوية وفق Hurst + زخم إيجابي
         if (
@@ -420,18 +464,27 @@ class QuantumSniper:
             and m["hurst"] > CONFIG["HURST_MIN"]
             and m["momentum"] > 0.25
         ):
-            await self.trigger_alert(
-                "📐 HURST PERSISTENCE",
+            if self.should_emit(
                 symbol,
                 timeframe,
-                price,
-                extra={
-                    "H": m["hurst"],
-                    "mom": m["momentum"],
-                },
-                color=Term.CYAN,
+                "📐 HURST PERSISTENCE",
                 change=m["momentum"],
-            )
+                metrics=m,
+                enforce_trend=True,
+                confluence=confluence,
+            ):
+                await self.trigger_alert(
+                    "📐 HURST PERSISTENCE",
+                    symbol,
+                    timeframe,
+                    price,
+                    extra={
+                        "H": m["hurst"],
+                        "mom": m["momentum"],
+                    },
+                    color=Term.CYAN,
+                    change=m["momentum"],
+                )
 
         # 2) انهيار إنتروبيا + تسارع توازن إيجابي (تزامن حيتان)
         entropy_drop = (
@@ -445,19 +498,28 @@ class QuantumSniper:
             and m["imbalance_d2"] > 0
             and m["imbalance_d1"] > 0
         ):
-            await self.trigger_alert(
-                "🧠 ENTROPY COLLAPSE",
+            if self.should_emit(
                 symbol,
                 timeframe,
-                price,
-                extra={
-                    "ΔH": entropy_drop,
-                    "∂I": m["imbalance_d1"],
-                    "∂²I": m["imbalance_d2"],
-                },
-                color=Term.PURPLE,
+                "🧠 ENTROPY COLLAPSE",
                 change=m["imbalance_d1"] * 100,
-            )
+                metrics=m,
+                enforce_trend=True,
+                confluence=confluence,
+            ):
+                await self.trigger_alert(
+                    "🧠 ENTROPY COLLAPSE",
+                    symbol,
+                    timeframe,
+                    price,
+                    extra={
+                        "ΔH": entropy_drop,
+                        "∂I": m["imbalance_d1"],
+                        "∂²I": m["imbalance_d2"],
+                    },
+                    color=Term.PURPLE,
+                    change=m["imbalance_d1"] * 100,
+                )
 
         # 3) بقايا كالمان مرتفعة = كسر هيكلي مفاجئ
         if CONFIG["ENABLE_KALMAN_BREAK"]:
@@ -465,19 +527,26 @@ class QuantumSniper:
             residual_std = residual_std if residual_std > 0 else 1e-6
             residual_z = m["kalman_residual"] / residual_std
             if abs(residual_z) >= CONFIG["KALMAN_RESIDUAL_Z"]:
-                await self.trigger_alert(
-                    "🛰️ KALMAN STRUCTURAL BREAK",
+                if self.should_emit(
                     symbol,
                     timeframe,
-                    price,
-                    extra={
-                        "z_res": residual_z,
-                        "res": m["kalman_residual"],
-                        "μ_res": m["kalman_residual_mean"],
-                    },
-                    color=Term.YELLOW,
+                    "🛰️ KALMAN STRUCTURAL BREAK",
                     change=residual_z,
-                )
+                    metrics=m,
+                ):
+                    await self.trigger_alert(
+                        "🛰️ KALMAN STRUCTURAL BREAK",
+                        symbol,
+                        timeframe,
+                        price,
+                        extra={
+                            "z_res": residual_z,
+                            "res": m["kalman_residual"],
+                            "μ_res": m["kalman_residual_mean"],
+                        },
+                        color=Term.YELLOW,
+                        change=residual_z,
+                    )
 
         # 4) تسارع مشتق ثاني موجب لتوازن العرض/الطلب (تدفق أوامر حقيقي)
         if (
@@ -485,32 +554,50 @@ class QuantumSniper:
             and m["imbalance_d2"] > CONFIG["IMBALANCE_ACCEL_THRESHOLD"]
             and m["imbalance_d1"] > 0
         ):
-            await self.trigger_alert(
-                "⚡ ORDERFLOW ACCEL",
+            if self.should_emit(
                 symbol,
                 timeframe,
-                price,
-                extra={
-                    "∂I": m["imbalance_d1"],
-                    "∂²I": m["imbalance_d2"],
-                },
-                color=Term.GREEN,
+                "⚡ ORDERFLOW ACCEL",
                 change=m["imbalance_d2"] * 100,
-            )
+                metrics=m,
+                enforce_trend=True,
+                confluence=confluence,
+            ):
+                await self.trigger_alert(
+                    "⚡ ORDERFLOW ACCEL",
+                    symbol,
+                    timeframe,
+                    price,
+                    extra={
+                        "∂I": m["imbalance_d1"],
+                        "∂²I": m["imbalance_d2"],
+                    },
+                    color=Term.GREEN,
+                    change=m["imbalance_d2"] * 100,
+                )
 
         # 5) منطق ICT (سحب سيولة + نزوح سعري بفجوة قيمة عادلة)
         if CONFIG["ENABLE_ICT_MODEL"]:
             ict_ctx = self.ict_signal(state, price, m)
             if ict_ctx:
-                await self.trigger_alert(
-                    "🎯 ICT LIQUIDITY SHIFT",
+                if self.should_emit(
                     symbol,
                     timeframe,
-                    price,
-                    extra=ict_ctx,
-                    color=Term.BLUE,
+                    "🎯 ICT LIQUIDITY SHIFT",
                     change=ict_ctx.get("disp", 0.0),
-                )
+                    metrics=m,
+                    enforce_trend=True,
+                    confluence=confluence,
+                ):
+                    await self.trigger_alert(
+                        "🎯 ICT LIQUIDITY SHIFT",
+                        symbol,
+                        timeframe,
+                        price,
+                        extra=ict_ctx,
+                        color=Term.BLUE,
+                        change=ict_ctx.get("disp", 0.0),
+                    )
 
     def ict_signal(self, state: MarketState, price: float, m: Dict[str, float]) -> Optional[Dict[str, float]]:
         prices = np.fromiter(state.prices, dtype=float)
@@ -591,6 +678,8 @@ class QuantumSniper:
     ):
         timestamp = time.strftime("%H:%M:%S")
         stats = self.update_alert_stats(symbol, timeframe, signal_type, change)
+
+        self.last_alert_time[(symbol, timeframe, signal_type)] = time.time()
 
         counter_info = f"#{int(stats['count'])}" if CONFIG["SHOW_ALERT_COUNTERS"] else ""
         rise_info = f"🔺{stats['rise']:.2f}%" if CONFIG["ENABLE_CUMULATIVE_RISE"] else ""
