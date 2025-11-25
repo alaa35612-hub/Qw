@@ -7390,6 +7390,8 @@ def _bulk_fetch_recent_ohlcv(
     symbols: Sequence[str],
     timeframe: str,
     candle_window: int,
+    *,
+    quiet: bool = False,
 ) -> Dict[str, Sequence[Sequence[Any]]]:
     """Fetch OHLC candles in parallel when possible to speed up filtering."""
 
@@ -7447,11 +7449,12 @@ def _bulk_fetch_recent_ohlcv(
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # pragma: no cover - network variability
-            print(
-                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
-                flush=True,
-            )
-            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
+            if not quiet:
+                print(
+                    f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
+                    flush=True,
+                )
+            return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window, quiet=quiet)
 
         if not isinstance(payload, list):
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
@@ -7468,9 +7471,10 @@ def _bulk_fetch_recent_ohlcv(
                 try:
                     results[symbol] = future.result()
                 except Exception as exc:  # pragma: no cover - defensive
-                    print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
+                    if not quiet:
+                        print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
                     results[symbol] = _fetch_recent_ohlcv(
-                        exchange, symbol, timeframe, candle_window
+                        exchange, symbol, timeframe, candle_window, quiet=quiet
                     )
     finally:
         session.close()
@@ -7483,6 +7487,8 @@ def _fetch_recent_ohlcv(
     symbol: str,
     timeframe: str,
     candle_window: int,
+    *,
+    quiet: bool = False,
 ) -> Sequence[Sequence[Any]]:
     """Fetch the most recent ``candle_window`` OHLC rows for ``symbol``."""
 
@@ -7491,7 +7497,8 @@ def _fetch_recent_ohlcv(
     try:
         return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
     except Exception as exc:
-        print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
+        if not quiet:
+            print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
         return []
 
 
@@ -7500,6 +7507,8 @@ def _binance_pick_symbols(
     limit: int,
     explicit: Optional[str],
     selector: BinanceSymbolSelectorConfig,
+    *,
+    quiet: bool = False,
 ) -> BinanceSymbolSelection:
     """Return Binance USDT-M symbols prioritised by performance metrics."""
 
@@ -7508,7 +7517,8 @@ def _binance_pick_symbols(
         try:
             markets = exchange.load_markets()
         except Exception as exc:
-            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
+            if not quiet:
+                print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
             return BinanceSymbolSelection([], [], False, False)
         valid: List[str] = []
         invalid: List[str] = []
@@ -7523,13 +7533,15 @@ def _binance_pick_symbols(
                 invalid.append(symbol)
         if invalid:
             invalid_sorted = sorted(dict.fromkeys(invalid))
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
+            if not quiet:
+                print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
     try:
         markets = exchange.load_markets()
     except Exception as exc:
-        print(f"فشل تحميل أسواق Binance: {exc}")
+        if not quiet:
+            print(f"فشل تحميل أسواق Binance: {exc}")
         return BinanceSymbolSelection([], [], False, False)
 
     usdtm_markets: List[Dict[str, Any]] = [
@@ -7538,13 +7550,15 @@ def _binance_pick_symbols(
         if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
     ]
     if not usdtm_markets:
-        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
+        if not quiet:
+            print("لم يتم العثور على عقود Binance USDT-M نشطة.")
         return BinanceSymbolSelection([], [], False, False)
 
     try:
         tickers = exchange.fetch_tickers()
     except Exception as exc:
-        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
+        if not quiet:
+            print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
         tickers = {}
 
     symbol_set = {
@@ -7583,18 +7597,20 @@ def _binance_pick_symbols(
     used_height_filter = have_height_requirements
 
     if selector.prioritize_top_gainers and not have_height_requirements:
-        print(
-            "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
+                flush=True,
+            )
 
     if have_height_requirements:
         timeframe_seconds = _parse_timeframe_to_seconds(scope, None)
         if timeframe_seconds is None:
-            print(
-                f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
-                flush=True,
-            )
+            if not quiet:
+                print(
+                    f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
+                    flush=True,
+                )
             have_height_requirements = False
             used_height_filter = False
         elif candle_window is None:
@@ -7602,15 +7618,17 @@ def _binance_pick_symbols(
             used_height_filter = False
 
     if have_height_requirements and candle_window:
-        print(
-            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
+                flush=True,
+            )
         candles_map = _bulk_fetch_recent_ohlcv(
             exchange,
             [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
             scope,
             candle_window,
+            quiet=quiet,
         )
         for market in usdtm_markets:
             symbol = market.get("symbol")
@@ -7629,12 +7647,12 @@ def _binance_pick_symbols(
         if prioritized_symbols:
             target_limit = limit if limit and limit > 0 else len(prioritized_symbols)
             limited_prioritized = prioritized_symbols[:target_limit]
-            if len(limited_prioritized) < len(prioritized_symbols):
+            if len(limited_prioritized) < len(prioritized_symbols) and not quiet:
                 print(
                     f"تم العثور على {len(prioritized_symbols)} رمزًا تجاوزت حد الارتفاع؛ سيتم مسح أول {len(limited_prioritized)} فقط.",
                     flush=True,
                 )
-            else:
+            elif not quiet:
                 print(
                     f"تم العثور على {len(prioritized_symbols)} رمزًا متوافقة مع حد الارتفاع وسيتم مسحها فقط.",
                     flush=True,
@@ -7646,10 +7664,11 @@ def _binance_pick_symbols(
                 True,
             )
 
-        print(
-            "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
+                flush=True,
+            )
         return BinanceSymbolSelection([], [], True, True)
 
     def volume_key(market_data: Dict[str, Any]) -> float:
@@ -7696,11 +7715,12 @@ def fetch_binance_usdtm_symbols(
     limit: Optional[int] = None,
     explicit: Optional[str] = None,
     selector: Optional[BinanceSymbolSelectorConfig] = None,
+    quiet: bool = False,
 ) -> List[str]:
     """Load Binance USDT-M symbols prioritising momentum if requested."""
 
     selector_cfg = selector or DEFAULT_BINANCE_SYMBOL_SELECTOR
-    selection = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg)
+    selection = _binance_pick_symbols(exchange, limit or 0, explicit, selector_cfg, quiet=quiet)
     if selection.symbols:
         return selection.symbols
     if selection.used_height_filter and selection.had_prioritization_data:
@@ -7771,6 +7791,91 @@ def fetch_ohlcv(exchange: Any, symbol: str, timeframe: str, limit: int) -> List[
             next_since = since + timeframe_ms
         since = next_since
     return candles
+
+
+def _latest_golden_zone_box(boxes: Sequence[Any]) -> Optional[Box]:
+    for candidate in reversed(boxes):
+        if isinstance(candidate, Box) and candidate.text == "Golden zone":
+            return candidate
+    return None
+
+
+def _golden_zone_first_touch(series: SeriesAccessor, box: Box) -> bool:
+    """Return True if the current bar is the first Golden zone interaction."""
+
+    if not series.time:
+        return False
+
+    lower = min(box.bottom, box.top)
+    upper = max(box.bottom, box.top)
+    if math.isnan(lower) or math.isnan(upper):
+        return False
+
+    start = bisect.bisect_left(series.time, box.left)
+    last_index = len(series.time) - 1
+    for idx in range(start, last_index):
+        high = series.high[idx]
+        low = series.low[idx]
+        if math.isnan(high) or math.isnan(low):
+            continue
+        if low <= upper and high >= lower:
+            return False
+    return True
+
+
+def scan_symbols_in_golden_zone(
+    *,
+    timeframe: str,
+    candle_limit: int,
+    max_symbols: Optional[int] = None,
+    selector: Optional[BinanceSymbolSelectorConfig] = None,
+) -> List[Tuple[str, float, float, float]]:
+    if ccxt is None:
+        raise RuntimeError("ccxt is not available")
+
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    selector_cfg = selector or BinanceSymbolSelectorConfig(prioritize_top_gainers=False)
+    symbols = fetch_binance_usdtm_symbols(
+        exchange,
+        limit=max_symbols,
+        selector=selector_cfg,
+        quiet=True,
+    )
+
+    indicator_inputs = IndicatorInputs()
+    matches: List[Tuple[str, float, float, float]] = []
+
+    for symbol in symbols:
+        try:
+            candles = fetch_ohlcv(exchange, symbol, timeframe, candle_limit)
+        except Exception:
+            continue
+        if not candles:
+            continue
+        runtime = SmartMoneyAlgoProE5(inputs=indicator_inputs, base_timeframe=timeframe)
+        runtime.process(candles)
+
+        golden_box = _latest_golden_zone_box(runtime.boxes)
+        if not golden_box:
+            continue
+
+        lower = min(golden_box.bottom, golden_box.top)
+        upper = max(golden_box.bottom, golden_box.top)
+        if math.isnan(lower) or math.isnan(upper):
+            continue
+
+        current_price = runtime.series.get("close", 0)
+        if not isinstance(current_price, (int, float)):
+            continue
+        price_val = float(current_price)
+        if math.isnan(price_val):
+            continue
+
+        if lower <= price_val <= upper and _golden_zone_first_touch(runtime.series, golden_box):
+            normalized_symbol = symbol.replace("/", "").upper()
+            matches.append((normalized_symbol, lower, upper, price_val))
+
+    return matches
 
 
 def _split_arguments(argument_string: str) -> List[str]:
@@ -10971,6 +11076,26 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
+def run_golden_zone_cli() -> int:
+    defaults = EDITOR_AUTORUN_DEFAULTS
+    try:
+        matches = scan_symbols_in_golden_zone(
+            timeframe=defaults.timeframe,
+            candle_limit=defaults.candle_limit,
+            max_symbols=defaults.max_symbols,
+        )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print("Symbols in Golden Zone:")
+    for symbol, lower, upper, price in matches:
+        print(
+            f"{symbol} | {format_price(lower)} – {format_price(upper)} | {format_price(price)}"
+        )
+    return 0
+
+
 def _main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -10995,6 +11120,5 @@ def _main(argv: Optional[List[str]] = None) -> None:
 
 
 if __name__ == "__main__":
-    # تشغيل تلقائي من المحرر بالقيم الإفتراضية أعلاه.
-    _main()
+    sys.exit(run_golden_zone_cli())
 # ============================ End of Integration ============================
