@@ -112,6 +112,34 @@ ANSI_HEADER_COLORS = [
 QUIET_MODE = True
 
 
+class _OptionalBoolAction(argparse.Action):
+    """argparse action allowing ``--flag`` or ``--flag true/false`` semantics."""
+
+    TRUE_VALUES = {"1", "true", "t", "yes", "y", "on"}
+    FALSE_VALUES = {"0", "false", "f", "no", "n", "off"}
+
+    def __init__(self, option_strings, dest, **kwargs):
+        kwargs.setdefault("nargs", "?")
+        kwargs.setdefault("const", True)
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if values is None:
+            setattr(namespace, self.dest, self.const)
+            return
+
+        token = str(values).strip().lower()
+        if token in self.TRUE_VALUES:
+            result = True
+        elif token in self.FALSE_VALUES:
+            result = False
+        else:
+            parser.error(f"{option_string or self.dest} expects a boolean (true/false)")
+            return
+
+        setattr(namespace, self.dest, result)
+
+
 def _maybe_print(*args: Any, **kwargs: Any) -> None:
     if QUIET_MODE:
         return
