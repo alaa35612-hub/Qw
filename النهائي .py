@@ -39,6 +39,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
+
+# إعدادات التحكم في عرض أحدث الإشارات (Top-level user-requested defaults)
+# Increased the console latest-event retention default to 50 bars so ICT alerts stay
+# visible beyond a single candle by default.
+# Updated latest-event collection to preserve the newest instance of each label or box
+# even when outside the freshness window, ensuring أحدث requested ICT events always
+# populate the "الإشارات" display.
+CONSOLE_LATEST_EVENT_MAX_AGE_BARS = 50
+CONSOLE_LATEST_EVENT_PRESERVE_NEWEST = True
+
 try:
     import ccxt  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -888,7 +898,7 @@ class CandleInputs:
 
 @dataclass
 class ConsoleInputs:
-    max_age_bars: int = 1
+    max_age_bars: int = 50
 
 
 @dataclass
@@ -1338,13 +1348,17 @@ class SmartMoneyAlgoProE5:
         self.console_box_status_tally: Dict[str, Counter[str]] = defaultdict(Counter)
         console_inputs = getattr(self.inputs, "console", None)
         if console_inputs is None:
-            max_age = 1
+            max_age = CONSOLE_LATEST_EVENT_MAX_AGE_BARS
         else:
             try:
-                max_age = int(getattr(console_inputs, "max_age_bars", 1) or 1)
+                max_age = int(
+                    getattr(console_inputs, "max_age_bars", CONSOLE_LATEST_EVENT_MAX_AGE_BARS)
+                    or CONSOLE_LATEST_EVENT_MAX_AGE_BARS
+                )
             except (TypeError, ValueError):
-                max_age = 1
+                max_age = CONSOLE_LATEST_EVENT_MAX_AGE_BARS
         self.console_max_age_bars = max(1, max_age)
+        self.console_preserve_stale_latest = bool(CONSOLE_LATEST_EVENT_PRESERVE_NEWEST)
 
         # Mirrors for Pine ``var``/``array`` state ---------------------------
         self.pullback_state = PullbackStateMirror()
@@ -1621,7 +1635,43 @@ class SmartMoneyAlgoProE5:
             "source": "confirmed",
         }
 
-    def _register_box_event(self, box: Box, *, status: str = "active", event_time: Optional[int] = None) -> None:
+    def _log_console_event(
+        self,
+        key: str,
+        *,
+        price: Any = None,
+        timestamp: Optional[int] = None,
+        display: Optional[str] = None,
+        text: Optional[str] = None,
+        status: Optional[str] = None,
+        direction: Optional[str] = None,
+        direction_display: Optional[str] = None,
+    ) -> None:
+        ts = timestamp if isinstance(timestamp, int) else self.series.get_time()
+        payload: Dict[str, Any] = {
+            "text": text if text is not None else key,
+            "price": price,
+            "time": ts,
+            "time_display": format_timestamp(ts),
+        }
+        if display is not None:
+            payload["display"] = display
+        if status is not None:
+            payload["status"] = status
+            payload["status_display"] = self.BOX_STATUS_LABELS.get(status, status)
+        if direction is not None:
+            payload["direction"] = direction
+            payload["direction_display"] = direction_display or ("صاعد" if direction == "bullish" else "هابط")
+        self.console_event_log[key] = payload
+
+    def _register_box_event(
+        self,
+        box: Box,
+        *,
+        status: str = "active",
+        event_time: Optional[int] = None,
+        direction: Optional[str] = None,
+    ) -> None:
         text = box.text.strip()
         key: Optional[str] = None
         if text == "IDM OB":
@@ -1636,24 +1686,36 @@ class SmartMoneyAlgoProE5:
             key = "GOLDEN_ZONE"
         if key:
             ts = event_time if isinstance(event_time, int) else box.left
-            status_label = self.BOX_STATUS_LABELS.get(status, status)
             status_key = status if isinstance(status, str) and status else "active"
             tally = self.console_box_status_tally[key]
             tally[status_key] += 1
-            self.console_event_log[key] = {
-                "text": box.text,
-                "price": (box.bottom, box.top),
-                "time": ts,
-                "time_display": format_timestamp(ts),
-                "display": f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}",
-                "status": status,
-                "status_display": status_label,
-            }
+            payload_display = f"{box.text} {format_price(box.bottom)} → {format_price(box.top)}"
+            self._log_console_event(
+                key,
+                price=(box.bottom, box.top),
+                timestamp=ts,
+                display=payload_display,
+                text=box.text,
+                status=status,
+                direction=direction,
+            )
+            direction_key = None
+            if key in {"IDM_OB", "EXT_OB"} and direction in {"bullish", "bearish"}:
+                direction_key = f"{'BULLISH' if direction == 'bullish' else 'BEARISH'}_{'IDM' if key == 'IDM_OB' else 'EXT'}_OB"
+                self._log_console_event(
+                    direction_key,
+                    price=(box.bottom, box.top),
+                    timestamp=ts,
+                    display=payload_display,
+                    text=box.text,
+                    status=status,
+                    direction=direction,
+                )
             self._trace(
                 "box",
                 "register",
                 timestamp=box.right,
-                key=key,
+                key=direction_key or key,
                 text=box.text,
                 top=box.top,
                 bottom=box.bottom,
@@ -1673,13 +1735,23 @@ class SmartMoneyAlgoProE5:
 
     def _collect_latest_console_events(self) -> Dict[str, Dict[str, Any]]:
         events: Dict[str, Dict[str, Any]] = {}
+        stale: Dict[str, Dict[str, Any]] = {}
+
+        def _ts(payload: Dict[str, Any]) -> int:
+            ts = payload.get("time") or payload.get("timestamp") or payload.get("ts")
+            return int(ts) if isinstance(ts, (int, float)) else 0
+
+        def _store(target: Dict[str, Dict[str, Any]], key: str, payload: Dict[str, Any]) -> None:
+            existing = target.get(key)
+            if existing is None or _ts(payload) >= _ts(existing):
+                target[key] = payload
+
         for key, value in self.console_event_log.items():
             payload = value.copy()
             if "time" in payload and "time_display" not in payload:
                 payload["time_display"] = format_timestamp(payload.get("time"))
-            if not self._console_event_within_age(payload.get("time")):
-                continue
-            events[key] = payload
+            target = events if self._console_event_within_age(payload.get("time")) else stale
+            _store(target, key, payload)
 
         def record_label(
             key: str,
@@ -1689,17 +1761,17 @@ class SmartMoneyAlgoProE5:
             for lbl in reversed(self.labels):
                 if not isinstance(lbl, Label):
                     continue
-                if not self._console_event_within_age(lbl.x):
-                    continue
                 if predicate(lbl):
                     display = formatter(lbl) if formatter else f"{lbl.text} @ {format_price(lbl.y)}"
-                    events[key] = {
+                    payload = {
                         "text": lbl.text,
                         "price": lbl.y,
                         "display": display,
                         "time": lbl.x,
                         "time_display": format_timestamp(lbl.x),
                     }
+                    target = events if self._console_event_within_age(lbl.x) else stale
+                    _store(target, key, payload)
                     break
 
         def record_box(
@@ -1718,10 +1790,8 @@ class SmartMoneyAlgoProE5:
                 for bx in reversed(seq):
                     if not isinstance(bx, Box):
                         continue
-                    if not self._console_event_within_age(bx.left):
-                        continue
                     if predicate(bx):
-                        events[key] = {
+                        payload = {
                             "text": bx.text,
                             "price": (bx.bottom, bx.top),
                             "display": f"{bx.text} {format_price(bx.bottom)} → {format_price(bx.top)}",
@@ -1733,6 +1803,8 @@ class SmartMoneyAlgoProE5:
                                 self.BOX_STATUS_LABELS.get("active", "active"),
                             ),
                         }
+                        target = events if self._console_event_within_age(bx.left) else stale
+                        _store(target, key, payload)
                         return
 
         bull_color = self.inputs.structure.bull
@@ -1788,6 +1860,11 @@ class SmartMoneyAlgoProE5:
             sources=(self.hist_ext_boxes, self.boxes),
         )
         record_box("GOLDEN_ZONE", lambda bx: bx.text == "Golden zone")
+
+        if self.console_preserve_stale_latest:
+            for key, payload in stale.items():
+                if key not in events:
+                    events[key] = payload
 
         return events
 
@@ -3490,6 +3567,63 @@ class SmartMoneyAlgoProE5:
                 self.high_eqh_pre = high_value
                 self.eq_top_x = eq_high[0]
 
+        if bull_mss:
+            self._log_console_event(
+                "BULLISH_MSS",
+                price=self.internal_y_up,
+                text="Bullish MSS",
+                direction="bullish",
+            )
+        if bear_mss:
+            self._log_console_event(
+                "BEARISH_MSS",
+                price=self.internal_y_dn,
+                text="Bearish MSS",
+                direction="bearish",
+            )
+        if bull_bos:
+            self._log_console_event(
+                "BULLISH_BOS",
+                price=self.internal_y_up,
+                text="Bullish BOS",
+                direction="bullish",
+            )
+        if bear_bos:
+            self._log_console_event(
+                "BEARISH_BOS",
+                price=self.internal_y_dn,
+                text="Bearish BOS",
+                direction="bearish",
+            )
+        if bull_mss_ext:
+            self._log_console_event(
+                "BULLISH_MSS_PLUS",
+                price=self.y_up,
+                text="Bullish MSS+",
+                direction="bullish",
+            )
+        if bear_mss_ext:
+            self._log_console_event(
+                "BEARISH_MSS_PLUS",
+                price=self.y_dn,
+                text="Bearish MSS+",
+                direction="bearish",
+            )
+        if bull_bos_ext:
+            self._log_console_event(
+                "BULLISH_BOS_PLUS",
+                price=self.y_up,
+                text="Bullish BOS+",
+                direction="bullish",
+            )
+        if bear_bos_ext:
+            self._log_console_event(
+                "BEARISH_BOS_PLUS",
+                price=self.y_dn,
+                text="Bearish BOS+",
+                direction="bearish",
+            )
+
         self.alertcondition(bull_mss, "Bullish MSS", "Bullish MSS Found Ez-SMC")
         self.alertcondition(bear_mss, "Bearish MSS", "Bearish MSS Found Ez-SMC")
         self.alertcondition(bull_bos, "Bullish BOS", "Bullish BOS Found Ez-SMC")
@@ -4708,6 +4842,20 @@ class SmartMoneyAlgoProE5:
 
         self.bullish_OB_Break = bull_base or bull_mtf
         self.bearish_OB_Break = bear_base or bear_mtf
+        if self.bullish_OB_Break:
+            self._log_console_event(
+                "BULLISH_OB_BREAK",
+                price=self.series.get("close"),
+                text="Bullish OB Break",
+                direction="bullish",
+            )
+        if self.bearish_OB_Break:
+            self._log_console_event(
+                "BEARISH_OB_BREAK",
+                price=self.series.get("close"),
+                text="Bearish OB Break",
+                direction="bearish",
+            )
         self.alertcondition(self.bullish_OB_Break, "Bullish OB Break", "Bullish OB Broken Ez-SMC")
         self.alertcondition(self.bearish_OB_Break, "Bearish OB Break", "Bearish OB Broken Ez-SMC")
 
@@ -4978,6 +5126,7 @@ class SmartMoneyAlgoProE5:
         if self.series.length() < 3:
             return
         self.fvg_gap = 0
+        new_fvg_event: Optional[Tuple[str, float, int, Tuple[float, float], str, str]] = None
         timeframe = fvg.i_tf
         use_htf = fvg.i_mtf in ("Current + HTF", "HTF") and timeframe != ""
         if use_htf and self._is_newbar(timeframe):
@@ -5017,6 +5166,14 @@ class SmartMoneyAlgoProE5:
                                 True,
                             )
                             self.fvg_gap = 1
+                            new_fvg_event = (
+                                "BULLISH_FVG",
+                                mid,
+                                self.series.get_time(0),
+                                (high2, low0),
+                                "Bullish FVG",
+                                "bullish",
+                            )
                     elif open1 < close1 and high0 < low2:
                         if (not fvg.remove_small) or abs(low2 - high0) > thold:
                             mid = high0 + (low2 - high0) / 2.0
@@ -5036,6 +5193,14 @@ class SmartMoneyAlgoProE5:
                                 True,
                             )
                             self.fvg_gap = -1
+                            new_fvg_event = (
+                                "BEARISH_FVG",
+                                mid,
+                                self.series.get_time(0),
+                                (low2, high0),
+                                "Bearish FVG",
+                                "bearish",
+                            )
 
         high = self.series.get("high")
         low = self.series.get("low")
@@ -5045,8 +5210,33 @@ class SmartMoneyAlgoProE5:
         removed_bear = self._fvg_validate_side(high, low, close, False)
         if removed_bull == 1:
             self.fvg_removed = 1
+            self._log_console_event(
+                "BULLISH_FVG_BREAK",
+                price=close,
+                direction="bearish",
+                text="Bullish FVG Break",
+            )
         if removed_bear == -1:
             self.fvg_removed = -1 if self.fvg_removed == 0 else self.fvg_removed
+            self._log_console_event(
+                "BEARISH_FVG_BREAK",
+                price=close,
+                direction="bullish",
+                text="Bearish FVG Break",
+            )
+
+        if new_fvg_event is not None:
+            key, mid_price, ts, bounds, text, direction = new_fvg_event
+            top, bottom = bounds
+            display_text = f"{text} {format_price(top)} → {format_price(bottom)}"
+            self._log_console_event(
+                key,
+                price=(top, bottom, mid_price),
+                timestamp=ts,
+                display=display_text,
+                text=text,
+                direction=direction,
+            )
 
         self._fvg_trim(self.bullish_gap_holder, fvg.max_fvg)
         self._fvg_trim(self.bullish_gap_fill_holder, fvg.max_fvg)
@@ -5474,6 +5664,22 @@ class SmartMoneyAlgoProE5:
 
         self.alertcondition(bullishSFP, "Bullish Sweep", "{{ticker}} Bullish Sweep, Price:{{close}}")
         self.alertcondition(bearishSFP, "Bearish Sweep", "{{ticker}} Bearish Sweep, Price:{{close}}")
+        if bullishSFP:
+            self._log_console_event(
+                "BULLISH_SWEEP",
+                price=current_p_low,
+                timestamp=time_val,
+                text="Bullish Sweep",
+                direction="bullish",
+            )
+        if bearishSFP:
+            self._log_console_event(
+                "BEARISH_SWEEP",
+                price=current_p_high,
+                timestamp=time_val,
+                text="Bearish Sweep",
+                direction="bearish",
+            )
 
     def _update_candlestick_patterns(self) -> None:
         if self.series.length() < 2:
@@ -6177,7 +6383,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbulliem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbulliembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6203,7 +6409,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("IDM OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbeariem)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbeariembg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6260,7 +6466,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbull)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbullbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bullish")
                     self.demandZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.demandZone, self.demandZone.get(idx), self.demandZoneIsMit, True)
@@ -6286,7 +6492,7 @@ class SmartMoneyAlgoProE5:
                     zone.set_text("EXT OB")
                     zone.set_text_color(self.inputs.order_block.clrtxtextbear)
                     zone.set_bgcolor(self.inputs.order_block.clrtxtextbearbg)
-                    self._register_box_event(zone, status="new")
+                    self._register_box_event(zone, status="new", direction="bearish")
                     self.supplyZoneIsMit.set(idx, 1)
                 else:
                     self.removeZone(self.supplyZone, self.supplyZone.get(idx), self.supplyZoneIsMit, False)
@@ -6638,7 +6844,12 @@ class SmartMoneyAlgoProE5:
                         zone.set_border_color(self.inputs.order_block.colorMitigated)
                     zonesmit.set(i, 3 if zonesmit.get(i) == 1 else 2)
                 status = "retest" if prev_state == 1 else "touched"
-                self._register_box_event(zone, status=status, event_time=self.series.get_time())
+                self._register_box_event(
+                    zone,
+                    status=status,
+                    event_time=self.series.get_time(),
+                    direction="bearish" if isSupply else "bullish",
+                )
                 if self.inputs.order_block.showBrkob:
                     zones.remove(i)
                     zonesmit.remove(i)
@@ -8688,6 +8899,26 @@ METRIC_LABELS = [
 
 
 EVENT_DISPLAY_ORDER = [
+    ("BULLISH_FVG", "Bullish FVG"),
+    ("BEARISH_FVG", "Bearish FVG"),
+    ("BULLISH_FVG_BREAK", "Bullish FVG Break"),
+    ("BEARISH_FVG_BREAK", "Bearish FVG Break"),
+    ("BULLISH_EXT_OB", "Bullish External OB"),
+    ("BEARISH_EXT_OB", "Bearish External OB"),
+    ("BULLISH_IDM_OB", "Bullish Internal OB"),
+    ("BEARISH_IDM_OB", "Bearish Internal OB"),
+    ("BULLISH_OB_BREAK", "Bullish OB Break"),
+    ("BEARISH_OB_BREAK", "Bearish OB Break"),
+    ("BULLISH_SWEEP", "Bullish Sweep"),
+    ("BEARISH_SWEEP", "Bearish Sweep"),
+    ("BULLISH_MSS", "Bullish MSS"),
+    ("BEARISH_MSS", "Bearish MSS"),
+    ("BULLISH_BOS", "Bullish BOS"),
+    ("BEARISH_BOS", "Bearish BOS"),
+    ("BULLISH_MSS_PLUS", "Bullish MSS+"),
+    ("BEARISH_MSS_PLUS", "Bearish MSS+"),
+    ("BULLISH_BOS_PLUS", "Bullish BOS+"),
+    ("BEARISH_BOS_PLUS", "Bearish BOS+"),
     ("BOS", "BOS"),
     ("BOS_PLUS", "BOS+"),
     ("CHOCH", "CHOCH"),
@@ -9440,6 +9671,26 @@ _AR_KEYS = {
 }
 # Buckets for "latest per logic"
 _LAST_BUCKETS = {
+    "Bullish FVG": ["bullish fvg", "fvg up", "fvg صاعدة"],
+    "Bearish FVG": ["bearish fvg", "fvg down", "fvg هابطة"],
+    "Bullish FVG Break": ["bullish fvg break", "fvg break up"],
+    "Bearish FVG Break": ["bearish fvg break", "fvg break down"],
+    "Bullish External OB": ["bullish external ob", "ext ob bull"],
+    "Bearish External OB": ["bearish external ob", "ext ob bear"],
+    "Bullish Internal OB": ["bullish internal ob", "idm ob bull"],
+    "Bearish Internal OB": ["bearish internal ob", "idm ob bear"],
+    "Bullish OB Break": ["bullish ob break"],
+    "Bearish OB Break": ["bearish ob break"],
+    "Bullish Sweep": ["bullish sweep"],
+    "Bearish Sweep": ["bearish sweep"],
+    "Bullish MSS": ["bullish mss"],
+    "Bearish MSS": ["bearish mss"],
+    "Bullish BOS": ["bullish bos"],
+    "Bearish BOS": ["bearish bos"],
+    "Bullish MSS+": ["bullish mss+", "bullish mss plus"],
+    "Bearish MSS+": ["bearish mss+", "bearish mss plus"],
+    "Bullish BOS+": ["bullish bos+", "bullish bos plus"],
+    "Bearish BOS+": ["bearish bos+", "bearish bos plus"],
     "BOS": ["bos", "b 0 s"],
     "CHOCH": ["choch", "ch o ch"],
     "Golden zone": ["golden zone"],
@@ -9453,6 +9704,26 @@ _LAST_BUCKETS = {
 }
 # ---- Bind to indicator metrics if available ----
 _METRIC_MAP = {
+    "Bullish FVG": ["BULLISH_FVG", "bullish_fvg"],
+    "Bearish FVG": ["BEARISH_FVG", "bearish_fvg"],
+    "Bullish FVG Break": ["BULLISH_FVG_BREAK", "bullish_fvg_break"],
+    "Bearish FVG Break": ["BEARISH_FVG_BREAK", "bearish_fvg_break"],
+    "Bullish External OB": ["BULLISH_EXT_OB", "bullish_ext_ob"],
+    "Bearish External OB": ["BEARISH_EXT_OB", "bearish_ext_ob"],
+    "Bullish Internal OB": ["BULLISH_IDM_OB", "bullish_idm_ob"],
+    "Bearish Internal OB": ["BEARISH_IDM_OB", "bearish_idm_ob"],
+    "Bullish OB Break": ["BULLISH_OB_BREAK", "bullish_ob_break"],
+    "Bearish OB Break": ["BEARISH_OB_BREAK", "bearish_ob_break"],
+    "Bullish Sweep": ["BULLISH_SWEEP", "bullish_sweep"],
+    "Bearish Sweep": ["BEARISH_SWEEP", "bearish_sweep"],
+    "Bullish MSS": ["BULLISH_MSS", "bullish_mss"],
+    "Bearish MSS": ["BEARISH_MSS", "bearish_mss"],
+    "Bullish BOS": ["BULLISH_BOS", "bullish_bos"],
+    "Bearish BOS": ["BEARISH_BOS", "bearish_bos"],
+    "Bullish MSS+": ["BULLISH_MSS_PLUS", "bullish_mss_plus"],
+    "Bearish MSS+": ["BEARISH_MSS_PLUS", "bearish_mss_plus"],
+    "Bullish BOS+": ["BULLISH_BOS_PLUS", "bullish_bos_plus"],
+    "Bearish BOS+": ["BEARISH_BOS_PLUS", "bearish_bos_plus"],
     "BOS": ["BOS", "bos"],
     "CHOCH": ["CHOCH", "choch"],
     "Golden zone": ["GOLDEN_ZONE", "golden_zone", "GZ"],
@@ -9624,11 +9895,11 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     print("شموع SCOB       :", c("SCOB"))
 
     print("\nأحدث الإشارات مع الأسعار")
-    if not recent_alerts:
+    latest = _extract_latest_from_runtime(runtime)
+    if not latest:
         print("—")
     else:
         # Latest per logic bucket
-        latest = _extract_latest_from_runtime(runtime)
         for name in _LAST_BUCKETS.keys():
             item = latest.get(name)
             if not item:
@@ -9839,6 +10110,26 @@ _AR_KEYS = {
 
 # منطق “آخر حدث لكل بند” / أسماء عربية مطلوبة
 _LAST_BUCKETS = {
+    "Bullish FVG": ["bullish fvg","fvg up","fvg صاعدة"],
+    "Bearish FVG": ["bearish fvg","fvg down","fvg هابطة"],
+    "Bullish FVG Break": ["bullish fvg break","fvg break up"],
+    "Bearish FVG Break": ["bearish fvg break","fvg break down"],
+    "Bullish External OB": ["bullish external ob","ext ob bull"],
+    "Bearish External OB": ["bearish external ob","ext ob bear"],
+    "Bullish Internal OB": ["bullish internal ob","idm ob bull"],
+    "Bearish Internal OB": ["bearish internal ob","idm ob bear"],
+    "Bullish OB Break": ["bullish ob break"],
+    "Bearish OB Break": ["bearish ob break"],
+    "Bullish Sweep": ["bullish sweep"],
+    "Bearish Sweep": ["bearish sweep"],
+    "Bullish MSS": ["bullish mss"],
+    "Bearish MSS": ["bearish mss"],
+    "Bullish BOS": ["bullish bos"],
+    "Bearish BOS": ["bearish bos"],
+    "Bullish MSS+": ["bullish mss+","bullish mss plus"],
+    "Bearish MSS+": ["bearish mss+","bearish mss plus"],
+    "Bullish BOS+": ["bullish bos+","bullish bos plus"],
+    "Bearish BOS+": ["bearish bos+","bearish bos plus"],
     "BOS": ["bos","b 0 s"],
     "CHOCH": ["choch","ch o ch"],
     "Golden zone": ["golden zone","gz"],
@@ -9892,6 +10183,26 @@ _INT_KEYS = [
 ]
 
 _METRIC_MAP = {
+    "Bullish FVG": ["BULLISH_FVG","bullish_fvg"],
+    "Bearish FVG": ["BEARISH_FVG","bearish_fvg"],
+    "Bullish FVG Break": ["BULLISH_FVG_BREAK","bullish_fvg_break"],
+    "Bearish FVG Break": ["BEARISH_FVG_BREAK","bearish_fvg_break"],
+    "Bullish External OB": ["BULLISH_EXT_OB","bullish_ext_ob"],
+    "Bearish External OB": ["BEARISH_EXT_OB","bearish_ext_ob"],
+    "Bullish Internal OB": ["BULLISH_IDM_OB","bullish_idm_ob"],
+    "Bearish Internal OB": ["BEARISH_IDM_OB","bearish_idm_ob"],
+    "Bullish OB Break": ["BULLISH_OB_BREAK","bullish_ob_break"],
+    "Bearish OB Break": ["BEARISH_OB_BREAK","bearish_ob_break"],
+    "Bullish Sweep": ["BULLISH_SWEEP","bullish_sweep"],
+    "Bearish Sweep": ["BEARISH_SWEEP","bearish_sweep"],
+    "Bullish MSS": ["BULLISH_MSS","bullish_mss"],
+    "Bearish MSS": ["BEARISH_MSS","bearish_mss"],
+    "Bullish BOS": ["BULLISH_BOS","bullish_bos"],
+    "Bearish BOS": ["BEARISH_BOS","bearish_bos"],
+    "Bullish MSS+": ["BULLISH_MSS_PLUS","bullish_mss_plus"],
+    "Bearish MSS+": ["BEARISH_MSS_PLUS","bearish_mss_plus"],
+    "Bullish BOS+": ["BULLISH_BOS_PLUS","bullish_bos_plus"],
+    "Bearish BOS+": ["BEARISH_BOS_PLUS","bearish_bos_plus"],
     "BOS": ["BOS","bos","b 0 s"],
     "CHOCH": ["CHOCH","choch","ch o ch"],
     "Golden zone": ["GOLDEN_ZONE","golden_zone","gz","golden zone"],
