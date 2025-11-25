@@ -1504,8 +1504,8 @@ class SmartMoneyAlgoProE5:
         )
         return result
 
-    def _trace(self, section: str, message: str, *, timestamp: Optional[int], **payload: Any) -> None:
-        self.tracer.log(section, message, timestamp=timestamp, **payload)
+    def _trace(self, section: str, event: str, *, timestamp: Optional[int], **payload: Any) -> None:
+        self.tracer.log(section, event, timestamp=timestamp, **payload)
 
     def _bars_ago_from_time(self, timestamp: Any) -> Optional[int]:
         if self.series.length() == 0:
