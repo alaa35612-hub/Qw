@@ -10552,7 +10552,10 @@ def __router_main__():
     return _android_cli_entry()
 
 # ---------- Main ----------
-if __name__ == "__main__":
+# Keep the legacy router opt-in to avoid duplicate console output during the
+# Golden zone scanner workflow.  Set ENABLE_LEGACY_ROUTER=1 to restore the
+# previous Android-friendly routing behaviour.
+if __name__ == "__main__" and os.environ.get("ENABLE_LEGACY_ROUTER") == "1":
     __router_main__()
 
 
