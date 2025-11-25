@@ -1445,8 +1445,18 @@ class SmartMoneyAlgoProE5:
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
-        # تم تعطيل منطق التنبيهات بناءً على الطلب الأخير.
-        return None
+        if not condition:
+            return None
+
+        timestamp = self.series.get_time()
+        self.alerts.append((timestamp, title))
+        self._trace(
+            "alertcondition",
+            "alert",
+            timestamp=timestamp,
+            title=title,
+            message=message,
+        )
 
     def _eval_condition(
         self,
