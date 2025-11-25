@@ -112,7 +112,7 @@ class _EditorAutorunDefaults:
     timeframe: str = "1m"
     candle_limit: int = 500
     max_symbols: int = 600
-    recent_bars: int = 2
+    recent_bars: int = 100
     continuous_scan: bool = False
     scan_interval: float = 0.0
     height_metric: str = "percentage"
@@ -123,7 +123,7 @@ class _EditorAutorunDefaults:
 
 # لتفعيل التشغيل المستمر افتراضيًا يمكنك تعديل المتغير التالي إلى True
 # كما يمكن تحديد فترة الانتظار بين الدورات من المتغير الذي يليه.
-AUTORUN_CONTINUOUS_SCAN = True
+AUTORUN_CONTINUOUS_SCAN = False
 AUTORUN_SCAN_INTERVAL = 0.0
 
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
@@ -7438,10 +7438,6 @@ def _bulk_fetch_recent_ohlcv(
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:  # pragma: no cover - network variability
-            print(
-                f"تعذر جلب شموع {symbol} عبر واجهة Binance السريعة: {exc}",
-                flush=True,
-            )
             return _fetch_recent_ohlcv(exchange, symbol, timeframe, candle_window)
 
         if not isinstance(payload, list):
@@ -7459,7 +7455,6 @@ def _bulk_fetch_recent_ohlcv(
                 try:
                     results[symbol] = future.result()
                 except Exception as exc:  # pragma: no cover - defensive
-                    print(f"تعذر جلب شموع {symbol}: {exc}", flush=True)
                     results[symbol] = _fetch_recent_ohlcv(
                         exchange, symbol, timeframe, candle_window
                     )
@@ -7482,7 +7477,6 @@ def _fetch_recent_ohlcv(
     try:
         return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=candle_window)
     except Exception as exc:
-        print(f"تعذر جلب شموع {symbol} على إطار {timeframe}: {exc}", flush=True)
         return []
 
 
@@ -7499,7 +7493,6 @@ def _binance_pick_symbols(
         try:
             markets = exchange.load_markets()
         except Exception as exc:
-            print(f"فشل تحميل الأسواق للتحقق من الرموز المحددة يدويًا: {exc}")
             return BinanceSymbolSelection([], [], False, False)
         valid: List[str] = []
         invalid: List[str] = []
@@ -7512,15 +7505,11 @@ def _binance_pick_symbols(
                 valid.append(canonical)
             else:
                 invalid.append(symbol)
-        if invalid:
-            invalid_sorted = sorted(dict.fromkeys(invalid))
-            print(f"تحذير: سيتم تجاهل الرموز غير الصحيحة: {', '.join(invalid_sorted)}")
         return BinanceSymbolSelection(valid, [], False, False)
 
     try:
         markets = exchange.load_markets()
     except Exception as exc:
-        print(f"فشل تحميل أسواق Binance: {exc}")
         return BinanceSymbolSelection([], [], False, False)
 
     usdtm_markets: List[Dict[str, Any]] = [
@@ -7529,13 +7518,11 @@ def _binance_pick_symbols(
         if market.get("linear") and market.get("quote") == "USDT" and market.get("type") == "swap" and market.get("active")
     ]
     if not usdtm_markets:
-        print("لم يتم العثور على عقود Binance USDT-M نشطة.")
         return BinanceSymbolSelection([], [], False, False)
 
     try:
         tickers = exchange.fetch_tickers()
     except Exception as exc:
-        print(f"تعذر جلب بيانات التيكر، سيتم استخدام فرز افتراضي: {exc}")
         tickers = {}
 
     symbol_set = {
@@ -7573,19 +7560,9 @@ def _binance_pick_symbols(
     )
     used_height_filter = have_height_requirements
 
-    if selector.prioritize_top_gainers and not have_height_requirements:
-        print(
-            "تعذر تشغيل فلتر الارتفاع: يرجى ضبط حد النسبة، الإطار الزمني، وعدد الشموع.",
-            flush=True,
-        )
-
     if have_height_requirements:
         timeframe_seconds = _parse_timeframe_to_seconds(scope, None)
         if timeframe_seconds is None:
-            print(
-                f"تعذر تفسير الإطار الزمني '{scope}' لفلتر الارتفاع؛ سيتم تجاهل التصفية.",
-                flush=True,
-            )
             have_height_requirements = False
             used_height_filter = False
         elif candle_window is None:
@@ -7593,10 +7570,6 @@ def _binance_pick_symbols(
             used_height_filter = False
 
     if have_height_requirements and candle_window:
-        print(
-            f"تحديد أولوية الرابحين الأعلى باستخدام المقياس '{metric}' وحد أدنى {threshold:.2f} على إطار {scope} مع {candle_window} شموع.",
-            flush=True,
-        )
         candles_map = _bulk_fetch_recent_ohlcv(
             exchange,
             [market.get("symbol") for market in usdtm_markets if isinstance(market.get("symbol"), str)],
@@ -7620,16 +7593,6 @@ def _binance_pick_symbols(
         if prioritized_symbols:
             target_limit = limit if limit and limit > 0 else len(prioritized_symbols)
             limited_prioritized = prioritized_symbols[:target_limit]
-            if len(limited_prioritized) < len(prioritized_symbols):
-                print(
-                    f"تم العثور على {len(prioritized_symbols)} رمزًا تجاوزت حد الارتفاع؛ سيتم مسح أول {len(limited_prioritized)} فقط.",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"تم العثور على {len(prioritized_symbols)} رمزًا متوافقة مع حد الارتفاع وسيتم مسحها فقط.",
-                    flush=True,
-                )
             return BinanceSymbolSelection(
                 limited_prioritized,
                 limited_prioritized,
@@ -7637,10 +7600,6 @@ def _binance_pick_symbols(
                 True,
             )
 
-        print(
-            "لم يتم العثور على رموز تتجاوز حد فلتر الارتفاع المحدد؛ لن يتم فحص أي رموز.",
-            flush=True,
-        )
         return BinanceSymbolSelection([], [], True, True)
 
     def volume_key(market_data: Dict[str, Any]) -> float:
@@ -8723,6 +8682,47 @@ def _collect_recent_event_hits(
     return hits, recent_times
 
 
+def _coerce_price_value(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number):
+        return None
+    return number
+
+
+def _latest_golden_zone_box(boxes: Sequence[Box]) -> Optional[Box]:
+    for box in reversed(list(boxes)):
+        if isinstance(box.text, str) and box.text.strip().lower() == "golden zone":
+            return box
+    return None
+
+
+def _detect_golden_zone_hit(
+    symbol: str, runtime: "SmartMoneyAlgoProE5", metrics: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    current_price = _coerce_price_value(metrics.get("current_price"))
+    if current_price is None:
+        return None
+    zone_box = _latest_golden_zone_box(runtime.boxes)
+    if zone_box is None:
+        return None
+    top_val = _coerce_price_value(zone_box.top)
+    bottom_val = _coerce_price_value(zone_box.bottom)
+    if top_val is None or bottom_val is None:
+        return None
+    low, high = (bottom_val, top_val) if bottom_val <= top_val else (top_val, bottom_val)
+    if low <= current_price <= high:
+        return {
+            "symbol": symbol,
+            "zone_low": low,
+            "zone_high": high,
+            "current_price": current_price,
+        }
+    return None
+
+
 def scan_binance(
     timeframe: str,
     limit: int,
@@ -8735,7 +8735,7 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
-) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
+    ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
     exchange = ccxt.binanceusdm({"enableRateLimit": True})
@@ -8747,34 +8747,23 @@ def scan_binance(
     if max_symbols and max_symbols > 0:
         all_symbols = all_symbols[: int(max_symbols)]
     summaries: List[Dict[str, Any]] = []
+    golden_zone_hits: List[Dict[str, Any]] = []
     primary_runtime: Optional[SmartMoneyAlgoProE5] = None
-    window = recent_window_bars
-    if window is None:
-        console_inputs = getattr(inputs, "console", None) if inputs else None
-        if console_inputs is not None and getattr(console_inputs, "max_age_bars", None) is not None:
-            try:
-                window = int(console_inputs.max_age_bars) + 1
-            except Exception:
-                window = 2
-        else:
-            window = 2
-    window = max(1, int(window))
     for idx, symbol in enumerate(all_symbols):
         try:
             ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
-            print(
-                f"تخطي {_format_symbol(symbol)} بسبب فشل fetch_ticker: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
+            if tracer and tracer.enabled:
+                tracer.log(
+                    "scan",
+                    "symbol_fetch_failed",
+                    timestamp=None,
+                    symbol=symbol,
+                    error=str(exc),
+                )
             continue
         daily_change = _extract_daily_change_percent(ticker)
         if min_daily_change > 0.0 and daily_change is not None and daily_change <= min_daily_change:
-            print(
-                f"تخطي {_format_symbol(symbol)} (تغير 24 ساعة {daily_change:.2f}% ≤ الحد الأدنى {min_daily_change:.2f}%)",
-                flush=True,
-            )
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
@@ -8789,28 +8778,10 @@ def scan_binance(
         runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
         runtime.process(candles)
         metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
-            )
-            if tracer and tracer.enabled:
-                tracer.log(
-                    "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
-                )
-            continue
-
         metrics["daily_change_percent"] = daily_change
+        golden_hit = _detect_golden_zone_hit(symbol, runtime, metrics)
+        if golden_hit:
+            golden_zone_hits.append(golden_hit)
         summaries.append(
             {
                 "symbol": symbol,
@@ -8821,7 +8792,6 @@ def scan_binance(
                 "metrics": metrics,
             }
         )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
         if tracer and tracer.enabled:
             tracer.log(
                 "scan",
@@ -8836,7 +8806,7 @@ def scan_binance(
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
-    return primary_runtime, summaries
+    return primary_runtime, summaries, golden_zone_hits
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -8911,7 +8881,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--scan-interval يجب أن يكون رقمًا غير سالب")
 
     def log(stage: str) -> None:
-        print(stage, flush=True)
+        return None
 
     tracer = ExecutionTracer(enabled=args.trace, outfile=args.trace_file)
 
@@ -8924,59 +8894,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     indicator_inputs.console.max_age_bars = args.max_age_bars
 
     if args.pullback_report:
-        log("Foundation")
         pine_text = args.pine_source.read_text(encoding="utf-8")
         python_text = Path(__file__).read_text(encoding="utf-8")
-        log("Inventory")
         runtime = SmartMoneyAlgoProE5(
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
         )
-        log("Timeline")
         runtime.process([])
-        log("Rendering")
         report_text = generate_pullback_report(pine_text, python_text, runtime)
         args.outfile.write_text(report_text, encoding="utf-8")
-        print(f"Pullback report written to {args.outfile}")
-        log("Coverage")
         tracer.emit()
         return 0
 
     if args.data:
-        log("Foundation")
         candles = json.loads(args.data.read_text())
         if args.bars > 0:
             candles = candles[-args.bars :]
-        log("Inventory")
         runtime = SmartMoneyAlgoProE5(
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
         )
-        log("Timeline")
         runtime.process(candles)
         perform_comparison()
-        log("Rendering")
         render_report(runtime, args.outfile)
-        log("Coverage")
         tracer.emit()
         return 0
 
     if args.no_scan:
-        log("Foundation")
-        log("Inventory")
         runtime = SmartMoneyAlgoProE5(
             inputs=indicator_inputs,
             base_timeframe=args.analysis_timeframe or None,
             tracer=tracer,
         )
-        log("Timeline")
         runtime.process([])
         perform_comparison()
-        log("Rendering")
         render_report(runtime, args.outfile)
-        log("Coverage")
         tracer.emit()
         return 0
 
@@ -8987,13 +8941,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         while True:
             iteration += 1
             tracer.clear()
-            start = time.time()
-            if args.continuous_scan and iteration > 1:
-                print(f"\nإعادة تشغيل المسح (الدورة {iteration})", flush=True)
-            log("Foundation")
-            log("Inventory")
-            log("Timeline")
-            runtime, summaries = scan_binance(
+            runtime, summaries, golden_zone_hits = scan_binance(
                 args.timeframe,
                 args.lookback,
                 manual_symbols,
@@ -9003,27 +8951,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 inputs=indicator_inputs,
             )
             perform_comparison()
-            log("Rendering")
             render_report(runtime, args.outfile, summaries)
-            elapsed = time.time() - start
-            log(f"Coverage ({elapsed:.2f}s)")
+            if golden_zone_hits:
+                print("Symbols in Golden Zone:", flush=True)
+                for entry in golden_zone_hits:
+                    zone_low = format_price(entry.get("zone_low"))
+                    zone_high = format_price(entry.get("zone_high"))
+                    price_text = format_price(entry.get("current_price"))
+                    print(
+                        f"{entry['symbol']} | {zone_low} – {zone_high} | {price_text}",
+                        flush=True,
+                    )
+            else:
+                print("Symbols in Golden Zone:", flush=True)
             tracer.emit()
             if not args.continuous_scan:
-                print(
-                    "اكتمل المسح بعد دورة واحدة لأن خيار التشغيل المستمر غير مُفعّل."
-                    " لتفعيل الحلقة استخدم --continuous-scan=true أو فعّل المتغير"
-                    " AUTORUN_CONTINUOUS_SCAN في أعلى الملف.",
-                    flush=True,
-                )
                 break
             if args.scan_interval > 0.0:
-                print(
-                    f"انتظار {args.scan_interval:.2f} ثانية قبل تشغيل المسح التالي",
-                    flush=True,
-                )
                 time.sleep(args.scan_interval)
     except KeyboardInterrupt:
-        print("تم إيقاف المسح من قبل المستخدم.", flush=True)
+        return 0
     return 0
 
 # تمت إزالة محرّك الاستراتيجيات النصي والتنبيهات المرتبطة به بناءً على التعليمات الأخيرة.
