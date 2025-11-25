@@ -7852,8 +7852,29 @@ def scan_symbols_in_golden_zone(
             continue
         if not candles:
             continue
+        normalized_candles: List[Dict[str, float]] = []
+        for candle in candles:
+            if isinstance(candle, dict):
+                if {"time", "open", "high", "low", "close"}.issubset(candle):
+                    normalized_candles.append(candle)
+                continue
+            if isinstance(candle, (list, tuple)) and len(candle) >= 5:
+                time_val = int(candle[0]) if len(candle) > 0 else 0
+                volume_val = candle[5] if len(candle) > 5 else NA
+                normalized_candles.append(
+                    {
+                        "time": time_val,
+                        "open": float(candle[1]),
+                        "high": float(candle[2]),
+                        "low": float(candle[3]),
+                        "close": float(candle[4]),
+                        "volume": float(volume_val),
+                    }
+                )
+        if not normalized_candles:
+            continue
         runtime = SmartMoneyAlgoProE5(inputs=indicator_inputs, base_timeframe=timeframe)
-        runtime.process(candles)
+        runtime.process(normalized_candles)
 
         golden_box = _latest_golden_zone_box(runtime.boxes)
         if not golden_box:
