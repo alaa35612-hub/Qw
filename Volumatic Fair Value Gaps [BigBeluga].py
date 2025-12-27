@@ -68,11 +68,11 @@ def format_volume_tv_like(v: float) -> str:
         return "na"
     av = abs(float(v))
     if av >= 1e9:
-        return f"{v/1e9:.3f}B"
+        return f"{v/1e9:.2f}B"
     if av >= 1e6:
-        return f"{v/1e6:.3f}M"
+        return f"{v/1e6:.2f}M"
     if av >= 1e3:
-        return f"{v/1e3:.3f}K"
+        return f"{v/1e3:.2f}K"
     return f"{v:.0f}"
 
 def format_percent_tv_like(v: float) -> str:
@@ -237,7 +237,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             created_id[i] = next_id
             next_id += 1
 
-        # ---- REMOVE CROSSED + UPDATE (Pine loops over fvgs and may remove; we emulate safely via snapshot)
+        # ---- REMOVE CROSSED + UPDATE (emulate Pine array iteration + removals)
         snapshot = list(active)
         for fvg in snapshot:
             body = fvg["body"]
@@ -322,8 +322,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     removed_count[i] += 1.0
                     break
 
-        # ---- CONTROL SIZE (shift oldest)
-        while len(active) > max_fvgs:
+        # ---- CONTROL SIZE (shift oldest once)
+        if len(active) > max_fvgs:
             old = active.pop(0)
             old["body"]["deleted"] = True
             old["bullBar"]["deleted"] = True
