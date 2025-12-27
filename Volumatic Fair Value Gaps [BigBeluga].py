@@ -16,7 +16,7 @@ POLL_SECONDS = 60
 
 # Pine inputs
 PARAMS = {
-    "mitigationSrc": "high/low",   # "close" أو "high/low"
+    "mitigationSrc": "close",   # "close" أو "high/low"
     "bullGaps": True,
     "bearGaps": True,
     "volumeBars": True,
@@ -71,6 +71,11 @@ def format_volume_tv_like(v: float) -> str:
         return f"{v/1e3:.3f}K"
     return f"{v:.0f}"
 
+def format_percent_tv_like(v: float) -> str:
+    if pd.isna(v):
+        return "na"
+    return f"{int(v)}"
+
 # =========================
 # Rolling helpers
 # =========================
@@ -120,10 +125,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         if pd.isna(c[i-1]) or pd.isna(o[i-1]):
             continue
         if c[i-1] > o[i-1]:
-            if not pd.isna(l[i]) and not pd.isna(h[i-2]) and l[i] != 0:
+            if not pd.isna(l[i]) and not pd.isna(h[i-2]):
                 diff[i] = (l[i] - h[i-2]) / l[i] * 100.0
         else:
-            if not pd.isna(l[i-2]) and not pd.isna(h[i]) and h[i] != 0:
+            if not pd.isna(l[i-2]) and not pd.isna(h[i]):
                 diff[i] = (l[i-2] - h[i]) / h[i] * 100.0
 
     # percentile_nearest_rank(diff, 1000, 100) == rolling max
@@ -158,10 +163,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
     removed_count = np.zeros(n, float)
     active_count = np.zeros(n, float)
 
-    def pct_int(num: float, den: float) -> int:
+    def pct_int_or_nan(num: float, den: float) -> float:
         if pd.isna(num) or pd.isna(den) or den == 0:
-            return 0
-        return int((num / den) * 100.0)
+            return float("nan")
+        return float(int((num / den) * 100.0))
 
     for i in range(n):
         if not (i > min_bar_index):
@@ -172,8 +177,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         prev_total = totalVol[i-1] if i >= 1 else np.nan
         prev_bull = sumBull[i-1] if i >= 1 else np.nan
         prev_bear = sumBear[i-1] if i >= 1 else np.nan
-        bullPct = pct_int(prev_bull, prev_total)
-        bearPct = pct_int(prev_bear, prev_total)
+        bullPct = pct_int_or_nan(prev_bull, prev_total)
+        bearPct = pct_int_or_nan(prev_bear, prev_total)
         totalV = float(prev_total) if not pd.isna(prev_total) else np.nan
 
         # ---- CREATE BULL
@@ -185,8 +190,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": True,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -211,8 +216,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": False,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -276,8 +281,14 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     size = width / 200.0
                     fvg["bullBar"]["right"] = left + size * float(fvg["bull"])
                     fvg["bearBar"]["right"] = left + size * float(fvg["bear"])
-                    fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
-                    fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
+                    if pd.isna(fvg["bull"]):
+                        fvg["bullBar"]["text"] = "na"
+                    else:
+                        fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
+                    if pd.isna(fvg["bear"]):
+                        fvg["bearBar"]["text"] = "na"
+                    else:
+                        fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
                 else:
                     fvg["bullBar"]["text"] = ""
                     fvg["bearBar"]["text"] = ""
@@ -524,8 +535,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         })
                     seen[key] = last_bar
@@ -549,8 +560,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                         "reason": f["removed_reason"],
                         "top": float(f["body"]["top"]),
                         "bottom": float(f["body"]["bottom"]),
-                        "bull%": int(f["bull"]),
-                        "bear%": int(f["bear"]),
+                        "bull%": format_percent_tv_like(f["bull"]),
+                        "bear%": format_percent_tv_like(f["bear"]),
                         "totalVol": format_volume_tv_like(f["totalVol"]),
                     })
                     seen[key] = last_bar
@@ -577,8 +588,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         }
                         for f in active_now
