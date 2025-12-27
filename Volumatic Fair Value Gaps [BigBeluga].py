@@ -1,22 +1,29 @@
 import math
 import time
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Optional, Tuple
 
 # =========================
-# SETTINGS (1h)
+# SETTINGS (1h baseline)
 # =========================
 EXCHANGE_ID = "binanceusdm"
 TIMEFRAME = "1h"         # <-- طلبك
-NUM_CANDLES = 300        # على 1h: 300 شمعة => تحتاج ~18000 شمعة 1m (معقول على الموبايل)
+BASE_CANDLES_1H = 300    # على 1h: 300 شمعة => تحتاج ~18000 شمعة 1m (معقول على الموبايل)
 SYMBOLS = None           # None = كل USDT-M
 POLL_SECONDS = 60
 
+# Touch detection (last N candles)
+TOUCH_LOOKBACK = 10
+PRINT_TOUCH_EVENTS = True
+SHOW_ONLY_TOUCH_EVENTS = True
+
 # Pine inputs
 PARAMS = {
-    "mitigationSrc": "high/low",   # "close" أو "high/low"
+    "mitigationSrc": "close",   # "close" أو "high/low"
     "bullGaps": True,
     "bearGaps": True,
     "volumeBars": True,
@@ -32,6 +39,17 @@ PARAMS = {
 PRINT_EVENTS = True          # إنشاء/حذف
 PRINT_ACTIVE_SUMMARY = True  # ملخص الفجوات النشطة آخر بار
 ACTIVE_TOP_N = 8
+PRINT_SYMBOL_DONE = True     # اطبع عند انتهاء تحليل كل عملة
+PRINT_TOUCH_PRETTY = True    # عرض منسق لأحداث اللمس
+PRINT_CREATE_PRETTY = True   # عرض منسق لإنشاء FVG
+MAX_WORKERS = 8              # تسريع المسح عبر التوازي
+
+# Fast pre-filter (skip symbols that already moved)
+PRICE_CHANGE_FILTER_ENABLED = True
+PRICE_CHANGE_LOOKBACK = 12   # عدد الشموع لحساب نسبة التغير
+PRICE_CHANGE_MIN_PCT = 5.0   # تخطّي العملات التي ارتفعت >= هذه النسبة
+PRICE_CHANGE_SIDE = "up"     # "up" أو "down"
+SUPPRESS_PREVIOUSLY_TOUCHED_SYMBOLS = True
 
 # =========================
 # Timeframe helpers (TV-like)
@@ -71,12 +89,29 @@ def format_volume_tv_like(v: float) -> str:
         return f"{v/1e3:.3f}K"
     return f"{v:.0f}"
 
+def format_percent_tv_like(v: float) -> str:
+    if pd.isna(v):
+        return "na"
+    return f"{int(v)}"
+
+def color_text(text: str, color: str) -> str:
+    colors = {
+        "green": "\033[92m",
+        "red": "\033[91m",
+        "reset": "\033[0m",
+    }
+    return f"{colors.get(color, '')}{text}{colors['reset']}"
+
+def format_touch_line(sym: str, fvg_type: str, top: float, bottom: float) -> str:
+    color = "green" if fvg_type == "BULL" else "red"
+    return f"{color_text(sym, color)} | {fvg_type} | top={top} bottom={bottom}"
+
 # =========================
 # Rolling helpers
 # =========================
 def rolling_max_full(series: np.ndarray, length: int) -> np.ndarray:
     s = pd.Series(series, dtype="float64")
-    return s.rolling(length, min_periods=length).max().to_numpy(dtype=float)
+    return s.rolling(length, min_periods=1).max().to_numpy(dtype=float)
 
 # ============================================================
 # Core indicator (matches Pine v6 logic)
@@ -120,10 +155,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         if pd.isna(c[i-1]) or pd.isna(o[i-1]):
             continue
         if c[i-1] > o[i-1]:
-            if not pd.isna(l[i]) and not pd.isna(h[i-2]) and l[i] != 0:
+            if not pd.isna(l[i]) and not pd.isna(h[i-2]):
                 diff[i] = (l[i] - h[i-2]) / l[i] * 100.0
         else:
-            if not pd.isna(l[i-2]) and not pd.isna(h[i]) and h[i] != 0:
+            if not pd.isna(l[i-2]) and not pd.isna(h[i]):
                 diff[i] = (l[i-2] - h[i]) / h[i] * 100.0
 
     # percentile_nearest_rank(diff, 1000, 100) == rolling max
@@ -132,7 +167,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
     sizeFVG = np.full(n, np.nan, float)
     filterFVG = np.full(n, np.nan, float)
     for i in range(n):
-        if pd.isna(diff[i]) or pd.isna(p100[i]) or p100[i] == 0:
+        if pd.isna(diff[i]) or pd.isna(p100[i]):
             continue
         sizeFVG[i] = diff[i] / p100[i] * 100.0
         filterFVG[i] = 1.0 if (sizeFVG[i] > filter_threshold) else 0.0
@@ -158,10 +193,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
     removed_count = np.zeros(n, float)
     active_count = np.zeros(n, float)
 
-    def pct_int(num: float, den: float) -> int:
+    def pct_int_or_nan(num: float, den: float) -> float:
         if pd.isna(num) or pd.isna(den) or den == 0:
-            return 0
-        return int((num / den) * 100.0)
+            return float("nan")
+        return float(int((num / den) * 100.0))
 
     for i in range(n):
         if not (i > min_bar_index):
@@ -172,8 +207,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         prev_total = totalVol[i-1] if i >= 1 else np.nan
         prev_bull = sumBull[i-1] if i >= 1 else np.nan
         prev_bear = sumBear[i-1] if i >= 1 else np.nan
-        bullPct = pct_int(prev_bull, prev_total)
-        bearPct = pct_int(prev_bear, prev_total)
+        bullPct = pct_int_or_nan(prev_bull, prev_total)
+        bearPct = pct_int_or_nan(prev_bear, prev_total)
         totalV = float(prev_total) if not pd.isna(prev_total) else np.nan
 
         # ---- CREATE BULL
@@ -185,8 +220,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": True,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -211,8 +246,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": False,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -276,20 +311,29 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     size = width / 200.0
                     fvg["bullBar"]["right"] = left + size * float(fvg["bull"])
                     fvg["bearBar"]["right"] = left + size * float(fvg["bear"])
-                    fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
-                    fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
+                    if pd.isna(fvg["bull"]):
+                        fvg["bullBar"]["text"] = "na"
+                    else:
+                        fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
+                    if pd.isna(fvg["bear"]):
+                        fvg["bearBar"]["text"] = "na"
+                    else:
+                        fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
                 else:
                     fvg["bullBar"]["text"] = ""
                     fvg["bearBar"]["text"] = ""
 
         # ---- REMOVE OVERLAP (matches Pine condition top1 < top and top1 > bot)
-        i_idx = 0
-        while i_idx < len(active):
+        initial_size = len(active)
+        for i_idx in range(initial_size):
+            if i_idx >= len(active):
+                break
             fvg = active[i_idx]
             top = float(fvg["body"]["top"])
             bot = float(fvg["body"]["bottom"])
-            removed_here = False
-            for j_idx in range(len(active)):
+            for j_idx in range(initial_size):
+                if j_idx >= len(active):
+                    continue
                 if i_idx == j_idx:
                     continue
                 other = active[j_idx]
@@ -302,10 +346,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     fvg["removed_reason"] = "overlap"
                     active.pop(i_idx)
                     removed_count[i] += 1.0
-                    removed_here = True
                     break
-            if not removed_here:
-                i_idx += 1
 
         # ---- CONTROL SIZE (shift oldest)
         while len(active) > max_fvgs:
@@ -427,14 +468,18 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
     lowtf["bull_v"] = np.where(lowtf["close"] > lowtf["open"], lowtf["volume"], 0.0)
     lowtf["bear_v"] = np.where(lowtf["close"] < lowtf["open"], lowtf["volume"], 0.0)
 
-    # bucket into 1h by epoch floor
-    low_ts = (lowtf.index.view("int64") // 10**9).astype(np.int64)
-    high_ts = (pd.to_datetime(df_high["time"], utc=True).view("int64") // 10**9).astype(np.int64)
+    # align lower-tf bars into chart bars using actual chart open times
+    high_ns = df_high["time"].view("int64").to_numpy()
+    low_ns = lowtf.index.view("int64")
 
-    low_bucket = (low_ts // high_sec)
-    high_bucket = (high_ts // high_sec)
+    idx = np.searchsorted(high_ns, low_ns, side="right") - 1
+    high_window_ns = np.int64(high_sec) * np.int64(1_000_000_000)
+    valid = (idx >= 0) & (idx < len(high_ns))
+    valid = valid & (low_ns < (high_ns[idx] + high_window_ns))
+    lowtf = lowtf.loc[valid]
+    idx = idx[valid]
 
-    lowtf["bucket"] = low_bucket
+    lowtf["bucket"] = idx
     grp = lowtf.groupby("bucket", sort=False)
 
     sb = grp["bull_v"].sum().to_dict()
@@ -442,9 +487,9 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
 
     sumBull = np.zeros(len(df_high), float)
     sumBear = np.zeros(len(df_high), float)
-    for i, b in enumerate(high_bucket):
-        sumBull[i] = float(sb.get(int(b), 0.0))
-        sumBear[i] = float(sr.get(int(b), 0.0))
+    for i in range(len(df_high)):
+        sumBull[i] = float(sb.get(int(i), 0.0))
+        sumBear[i] = float(sr.get(int(i), 0.0))
 
     df_high["sumBull"] = sumBull
     df_high["sumBear"] = sumBear
@@ -467,23 +512,43 @@ def list_usdtm_symbols(ex) -> List[str]:
 def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     state = state or {}
     seen = state.get("seen", {})  # (symbol,event,fvg_id) -> last_bar
-
-    ex = _make_exchange()
-    symbols = SYMBOLS if SYMBOLS is not None else list_usdtm_symbols(ex)
+    touched_symbols = set(state.get("touched_symbols", []))
+    lock = threading.Lock()
+    base_ex = _make_exchange()
+    symbols = SYMBOLS if SYMBOLS is not None else list_usdtm_symbols(base_ex)
 
     high_sec = tf_to_seconds(TIMEFRAME)
     lower_tf = tv_lower_tf_string_from_chart_tf(TIMEFRAME)  # "6" on 1h
+    base_history_sec = BASE_CANDLES_1H * 3600
+    num_candles = max(150, int(math.ceil(base_history_sec / high_sec)))
     # need 1m bars to cover high window:
-    need_1m = int(NUM_CANDLES * (high_sec / 60)) + 500  # buffer
+    need_1m = int(num_candles * (high_sec / 60)) + 500  # buffer
 
-    for sym in symbols:
+    def process_symbol(sym: str):
+        last_time = None
+        status = "ok"
+        emitted_any = False
         try:
-            # fetch 1h candles (last NUM_CANDLES)
-            df_high = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=NUM_CANDLES)
+            ex = _make_exchange()
+            # fetch chart tf candles
+            df_high = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=num_candles)
             if not df_high or len(df_high) < 150:
-                continue
+                status = "skip_short"
+                return
             df_high = pd.DataFrame(np.array(df_high, float), columns=["time","open","high","low","close","volume"])
             df_high["time"] = pd.to_datetime(df_high["time"], unit="ms", utc=True)
+
+            # fast pre-filter to skip symbols with strong move (saves lower-tf fetch)
+            if PRICE_CHANGE_FILTER_ENABLED and len(df_high) > PRICE_CHANGE_LOOKBACK:
+                last_close = float(df_high["close"].iloc[-1])
+                past_close = float(df_high["close"].iloc[-1 - PRICE_CHANGE_LOOKBACK])
+                if past_close != 0:
+                    pct_change = ((last_close - past_close) / past_close) * 100.0
+                    side = str(PRICE_CHANGE_SIDE).strip().lower()
+                    if side == "up" and pct_change >= PRICE_CHANGE_MIN_PCT:
+                        status = f"moved_up({pct_change:.2f}%)"
+                    if side == "down" and pct_change <= -PRICE_CHANGE_MIN_PCT:
+                        status = f"moved_down({pct_change:.2f}%)"
 
             start_ms = int(df_high["time"].iloc[0].value // 10**6)
             end_ms = int((df_high["time"].iloc[-1].value // 10**6) + high_sec * 1000)
@@ -491,7 +556,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             # fetch 1m bars covering the same range (paged)
             df_1m = fetch_ohlcv_paged(ex, sym, "1m", since_ms=start_ms, limit=1500, max_bars=need_1m)
             if df_1m.empty:
-                continue
+                status = "skip_no_1m"
+                return
 
             # attach lower tf sums (1h -> 6m)
             df_hi2 = attach_lower_tf_volume_sums_1h(df_high, df_1m, TIMEFRAME)
@@ -503,15 +569,21 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             last_time = str(df_hi2["time"].iloc[-1])
 
             def emit(payload: Dict[str, Any]):
+                nonlocal emitted_any
                 if PRINT_EVENTS:
+                    if SHOW_ONLY_TOUCH_EVENTS and payload.get("event") != "FVG_TOUCHED":
+                        return
                     print("[OUT] " + json.dumps(payload, ensure_ascii=False))
+                    emitted_any = True
 
             # أحداث آخر شمعة (إنشاء/حذف)
             cid = res["created_id"].iloc[last_bar]
             if not pd.isna(cid):
                 fvg_id = int(cid)
                 key = (sym, "CREATE", fvg_id)
-                if key not in seen:
+                with lock:
+                    already = key in seen
+                if not already:
                     f = next((x for x in fvgs if int(x["id"]) == fvg_id), None)
                     if f:
                         emit({
@@ -524,11 +596,15 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         })
-                    seen[key] = last_bar
+                        if PRINT_CREATE_PRETTY and not SHOW_ONLY_TOUCH_EVENTS:
+                            print("[CREATE] " + format_touch_line(sym, "BULL" if f["isBull"] else "BEAR", f["body"]["top"], f["body"]["bottom"]))
+                            emitted_any = True
+                    with lock:
+                        seen[key] = last_bar
 
             rc = float(res["removed_count"].iloc[last_bar])
             if rc > 0:
@@ -536,8 +612,9 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 removed_now = [x for x in fvgs if x["removed_at_bar"] == last_bar]
                 for f in removed_now:
                     key = (sym, "REMOVE", int(f["id"]))
-                    if key in seen:
-                        continue
+                    with lock:
+                        if key in seen:
+                            continue
                     emit({
                         "symbol": sym,
                         "event": "FVG_REMOVE",
@@ -549,11 +626,12 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                         "reason": f["removed_reason"],
                         "top": float(f["body"]["top"]),
                         "bottom": float(f["body"]["bottom"]),
-                        "bull%": int(f["bull"]),
-                        "bear%": int(f["bear"]),
+                        "bull%": format_percent_tv_like(f["bull"]),
+                        "bear%": format_percent_tv_like(f["bear"]),
                         "totalVol": format_volume_tv_like(f["totalVol"]),
                     })
-                    seen[key] = last_bar
+                    with lock:
+                        seen[key] = last_bar
 
             # ملخص الفجوات النشطة (مثل ما تراه على الشارت)
             if PRINT_ACTIVE_SUMMARY and dash is not None:
@@ -577,18 +655,76 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         }
                         for f in active_now
                     ]
                 })
 
+            # لمس المنطقة خلال آخر شموع قابلة للتخصيص
+            if PRINT_TOUCH_EVENTS and TOUCH_LOOKBACK > 0:
+                if SUPPRESS_PREVIOUSLY_TOUCHED_SYMBOLS and sym in touched_symbols:
+                    return
+                active_now = [x for x in fvgs if x["removed_at_bar"] is None]
+                if active_now:
+                    end_idx = len(df_hi2)
+                    start_idx = max(0, end_idx - TOUCH_LOOKBACK)
+                    highs = df_hi2["high"].to_numpy(float)[start_idx:end_idx]
+                    lows = df_hi2["low"].to_numpy(float)[start_idx:end_idx]
+                    touched = []
+                    for f in active_now:
+                        touch_key = (sym, "TOUCH", int(f["id"]))
+                        with lock:
+                            if touch_key in seen:
+                                continue
+                        top = float(f["body"]["top"])
+                        bottom = float(f["body"]["bottom"])
+                        hit = np.any((lows <= top) & (highs >= bottom))
+                        if hit:
+                            with lock:
+                                seen[touch_key] = last_bar
+                                touched_symbols.add(sym)
+                            touched.append({
+                                "id": int(f["id"]),
+                                "type": "BULL" if f["isBull"] else "BEAR",
+                                "top": float(f["body"]["top"]),
+                                "bottom": float(f["body"]["bottom"]),
+                                "bull%": format_percent_tv_like(f["bull"]),
+                                "bear%": format_percent_tv_like(f["bear"]),
+                                "totalVol": format_volume_tv_like(f["totalVol"]),
+                            })
+                    if touched:
+                        emit({
+                            "symbol": sym,
+                            "event": "FVG_TOUCHED",
+                            "tf": TIMEFRAME,
+                            "lower_tf": lower_tf,
+                            "time": last_time,
+                            "lookback": TOUCH_LOOKBACK,
+                            "count": len(touched),
+                            "fvgs": touched,
+                        })
+                        if PRINT_TOUCH_PRETTY:
+                            for f in touched:
+                                print("[TOUCH] " + format_touch_line(sym, f["type"], f["top"], f["bottom"]))
+                                emitted_any = True
+
         except Exception as e:
+            status = "error"
             print(f"[WARN] {sym}: {e}")
+        finally:
+            if PRINT_SYMBOL_DONE and emitted_any:
+                print(f"[DONE] {sym} tf={TIMEFRAME} lower_tf={lower_tf} candles={num_candles} status={status} last={last_time}")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(process_symbol, sym) for sym in symbols]
+        for f in as_completed(futures):
+            _ = f.result()
 
     state["seen"] = seen
+    state["touched_symbols"] = list(touched_symbols)
     return state
 
 def scan_loop():
