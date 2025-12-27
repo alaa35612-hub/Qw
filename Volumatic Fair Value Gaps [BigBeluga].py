@@ -294,13 +294,16 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     fvg["bearBar"]["text"] = ""
 
         # ---- REMOVE OVERLAP (matches Pine condition top1 < top and top1 > bot)
-        i_idx = 0
-        while i_idx < len(active):
+        initial_size = len(active)
+        for i_idx in range(initial_size):
+            if i_idx >= len(active):
+                break
             fvg = active[i_idx]
             top = float(fvg["body"]["top"])
             bot = float(fvg["body"]["bottom"])
-            removed_here = False
-            for j_idx in range(len(active)):
+            for j_idx in range(initial_size):
+                if j_idx >= len(active):
+                    continue
                 if i_idx == j_idx:
                     continue
                 other = active[j_idx]
@@ -313,10 +316,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     fvg["removed_reason"] = "overlap"
                     active.pop(i_idx)
                     removed_count[i] += 1.0
-                    removed_here = True
                     break
-            if not removed_here:
-                i_idx += 1
 
         # ---- CONTROL SIZE (shift oldest)
         while len(active) > max_fvgs:
@@ -438,14 +438,21 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
     lowtf["bull_v"] = np.where(lowtf["close"] > lowtf["open"], lowtf["volume"], 0.0)
     lowtf["bear_v"] = np.where(lowtf["close"] < lowtf["open"], lowtf["volume"], 0.0)
 
-    # bucket into 1h by epoch floor
-    low_ts = (lowtf.index.view("int64") // 10**9).astype(np.int64)
-    high_ts = (pd.to_datetime(df_high["time"], utc=True).view("int64") // 10**9).astype(np.int64)
+    # align lower-tf bars into chart bars using actual chart open times
+    high_times = pd.to_datetime(df_high["time"], utc=True).to_numpy()
+    low_times = lowtf.index.to_numpy()
 
-    low_bucket = (low_ts // high_sec)
-    high_bucket = (high_ts // high_sec)
+    high_ns = high_times.astype("datetime64[ns]").astype(np.int64)
+    low_ns = low_times.astype("datetime64[ns]").astype(np.int64)
 
-    lowtf["bucket"] = low_bucket
+    idx = np.searchsorted(high_ns, low_ns, side="right") - 1
+    high_window_ns = np.int64(high_sec) * np.int64(1_000_000_000)
+    valid = (idx >= 0) & (idx < len(high_ns))
+    valid = valid & (low_ns < (high_ns[idx] + high_window_ns))
+    lowtf = lowtf.loc[valid]
+    idx = idx[valid]
+
+    lowtf["bucket"] = idx
     grp = lowtf.groupby("bucket", sort=False)
 
     sb = grp["bull_v"].sum().to_dict()
@@ -453,9 +460,9 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
 
     sumBull = np.zeros(len(df_high), float)
     sumBear = np.zeros(len(df_high), float)
-    for i, b in enumerate(high_bucket):
-        sumBull[i] = float(sb.get(int(b), 0.0))
-        sumBear[i] = float(sr.get(int(b), 0.0))
+    for i in range(len(df_high)):
+        sumBull[i] = float(sb.get(int(i), 0.0))
+        sumBear[i] = float(sr.get(int(i), 0.0))
 
     df_high["sumBull"] = sumBull
     df_high["sumBear"] = sumBear
