@@ -6,17 +6,22 @@ import pandas as pd
 from typing import Any, Dict, List, Optional, Tuple
 
 # =========================
-# SETTINGS (1h)
+# SETTINGS (1h baseline)
 # =========================
 EXCHANGE_ID = "binanceusdm"
 TIMEFRAME = "1h"         # <-- طلبك
-NUM_CANDLES = 300        # على 1h: 300 شمعة => تحتاج ~18000 شمعة 1m (معقول على الموبايل)
+BASE_CANDLES_1H = 300    # على 1h: 300 شمعة => تحتاج ~18000 شمعة 1m (معقول على الموبايل)
 SYMBOLS = None           # None = كل USDT-M
 POLL_SECONDS = 60
 
+# Touch detection (last N candles)
+TOUCH_LOOKBACK = 10
+PRINT_TOUCH_EVENTS = True
+SHOW_ONLY_TOUCH_EVENTS = True
+
 # Pine inputs
 PARAMS = {
-    "mitigationSrc": "high/low",   # "close" أو "high/low"
+    "mitigationSrc": "close",   # "close" أو "high/low"
     "bullGaps": True,
     "bearGaps": True,
     "volumeBars": True,
@@ -32,6 +37,7 @@ PARAMS = {
 PRINT_EVENTS = True          # إنشاء/حذف
 PRINT_ACTIVE_SUMMARY = True  # ملخص الفجوات النشطة آخر بار
 ACTIVE_TOP_N = 8
+PRINT_SYMBOL_DONE = True     # اطبع عند انتهاء تحليل كل عملة
 
 # =========================
 # Timeframe helpers (TV-like)
@@ -71,12 +77,17 @@ def format_volume_tv_like(v: float) -> str:
         return f"{v/1e3:.3f}K"
     return f"{v:.0f}"
 
+def format_percent_tv_like(v: float) -> str:
+    if pd.isna(v):
+        return "na"
+    return f"{int(v)}"
+
 # =========================
 # Rolling helpers
 # =========================
 def rolling_max_full(series: np.ndarray, length: int) -> np.ndarray:
     s = pd.Series(series, dtype="float64")
-    return s.rolling(length, min_periods=length).max().to_numpy(dtype=float)
+    return s.rolling(length, min_periods=1).max().to_numpy(dtype=float)
 
 # ============================================================
 # Core indicator (matches Pine v6 logic)
@@ -120,10 +131,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         if pd.isna(c[i-1]) or pd.isna(o[i-1]):
             continue
         if c[i-1] > o[i-1]:
-            if not pd.isna(l[i]) and not pd.isna(h[i-2]) and l[i] != 0:
+            if not pd.isna(l[i]) and not pd.isna(h[i-2]):
                 diff[i] = (l[i] - h[i-2]) / l[i] * 100.0
         else:
-            if not pd.isna(l[i-2]) and not pd.isna(h[i]) and h[i] != 0:
+            if not pd.isna(l[i-2]) and not pd.isna(h[i]):
                 diff[i] = (l[i-2] - h[i]) / h[i] * 100.0
 
     # percentile_nearest_rank(diff, 1000, 100) == rolling max
@@ -132,7 +143,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
     sizeFVG = np.full(n, np.nan, float)
     filterFVG = np.full(n, np.nan, float)
     for i in range(n):
-        if pd.isna(diff[i]) or pd.isna(p100[i]) or p100[i] == 0:
+        if pd.isna(diff[i]) or pd.isna(p100[i]):
             continue
         sizeFVG[i] = diff[i] / p100[i] * 100.0
         filterFVG[i] = 1.0 if (sizeFVG[i] > filter_threshold) else 0.0
@@ -158,10 +169,10 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
     removed_count = np.zeros(n, float)
     active_count = np.zeros(n, float)
 
-    def pct_int(num: float, den: float) -> int:
+    def pct_int_or_nan(num: float, den: float) -> float:
         if pd.isna(num) or pd.isna(den) or den == 0:
-            return 0
-        return int((num / den) * 100.0)
+            return float("nan")
+        return float(int((num / den) * 100.0))
 
     for i in range(n):
         if not (i > min_bar_index):
@@ -172,8 +183,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
         prev_total = totalVol[i-1] if i >= 1 else np.nan
         prev_bull = sumBull[i-1] if i >= 1 else np.nan
         prev_bear = sumBear[i-1] if i >= 1 else np.nan
-        bullPct = pct_int(prev_bull, prev_total)
-        bearPct = pct_int(prev_bear, prev_total)
+        bullPct = pct_int_or_nan(prev_bull, prev_total)
+        bearPct = pct_int_or_nan(prev_bear, prev_total)
         totalV = float(prev_total) if not pd.isna(prev_total) else np.nan
 
         # ---- CREATE BULL
@@ -185,8 +196,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": True,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -211,8 +222,8 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
             fvg = {
                 "id": next_id,
                 "isBull": False,
-                "bull": int(bullPct),
-                "bear": int(bearPct),
+                "bull": bullPct,
+                "bear": bearPct,
                 "totalVol": totalV,
                 "created_at_bar": int(i),
                 "removed_at_bar": None,
@@ -276,20 +287,29 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     size = width / 200.0
                     fvg["bullBar"]["right"] = left + size * float(fvg["bull"])
                     fvg["bearBar"]["right"] = left + size * float(fvg["bear"])
-                    fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
-                    fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
+                    if pd.isna(fvg["bull"]):
+                        fvg["bullBar"]["text"] = "na"
+                    else:
+                        fvg["bullBar"]["text"] = f"{int(fvg['bull'])}%"
+                    if pd.isna(fvg["bear"]):
+                        fvg["bearBar"]["text"] = "na"
+                    else:
+                        fvg["bearBar"]["text"] = f"{int(fvg['bear'])}%"
                 else:
                     fvg["bullBar"]["text"] = ""
                     fvg["bearBar"]["text"] = ""
 
         # ---- REMOVE OVERLAP (matches Pine condition top1 < top and top1 > bot)
-        i_idx = 0
-        while i_idx < len(active):
+        initial_size = len(active)
+        for i_idx in range(initial_size):
+            if i_idx >= len(active):
+                break
             fvg = active[i_idx]
             top = float(fvg["body"]["top"])
             bot = float(fvg["body"]["bottom"])
-            removed_here = False
-            for j_idx in range(len(active)):
+            for j_idx in range(initial_size):
+                if j_idx >= len(active):
+                    continue
                 if i_idx == j_idx:
                     continue
                 other = active[j_idx]
@@ -302,10 +322,7 @@ def run_indicator(df: pd.DataFrame, params: Dict[str, Any]) -> Tuple[pd.DataFram
                     fvg["removed_reason"] = "overlap"
                     active.pop(i_idx)
                     removed_count[i] += 1.0
-                    removed_here = True
                     break
-            if not removed_here:
-                i_idx += 1
 
         # ---- CONTROL SIZE (shift oldest)
         while len(active) > max_fvgs:
@@ -427,14 +444,18 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
     lowtf["bull_v"] = np.where(lowtf["close"] > lowtf["open"], lowtf["volume"], 0.0)
     lowtf["bear_v"] = np.where(lowtf["close"] < lowtf["open"], lowtf["volume"], 0.0)
 
-    # bucket into 1h by epoch floor
-    low_ts = (lowtf.index.view("int64") // 10**9).astype(np.int64)
-    high_ts = (pd.to_datetime(df_high["time"], utc=True).view("int64") // 10**9).astype(np.int64)
+    # align lower-tf bars into chart bars using actual chart open times
+    high_ns = df_high["time"].view("int64").to_numpy()
+    low_ns = lowtf.index.view("int64")
 
-    low_bucket = (low_ts // high_sec)
-    high_bucket = (high_ts // high_sec)
+    idx = np.searchsorted(high_ns, low_ns, side="right") - 1
+    high_window_ns = np.int64(high_sec) * np.int64(1_000_000_000)
+    valid = (idx >= 0) & (idx < len(high_ns))
+    valid = valid & (low_ns < (high_ns[idx] + high_window_ns))
+    lowtf = lowtf.loc[valid]
+    idx = idx[valid]
 
-    lowtf["bucket"] = low_bucket
+    lowtf["bucket"] = idx
     grp = lowtf.groupby("bucket", sort=False)
 
     sb = grp["bull_v"].sum().to_dict()
@@ -442,9 +463,9 @@ def attach_lower_tf_volume_sums_1h(df_high: pd.DataFrame, df_1m: pd.DataFrame, c
 
     sumBull = np.zeros(len(df_high), float)
     sumBear = np.zeros(len(df_high), float)
-    for i, b in enumerate(high_bucket):
-        sumBull[i] = float(sb.get(int(b), 0.0))
-        sumBear[i] = float(sr.get(int(b), 0.0))
+    for i in range(len(df_high)):
+        sumBull[i] = float(sb.get(int(i), 0.0))
+        sumBear[i] = float(sr.get(int(i), 0.0))
 
     df_high["sumBull"] = sumBull
     df_high["sumBear"] = sumBear
@@ -473,14 +494,19 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
     high_sec = tf_to_seconds(TIMEFRAME)
     lower_tf = tv_lower_tf_string_from_chart_tf(TIMEFRAME)  # "6" on 1h
+    base_history_sec = BASE_CANDLES_1H * 3600
+    num_candles = max(150, int(math.ceil(base_history_sec / high_sec)))
     # need 1m bars to cover high window:
-    need_1m = int(NUM_CANDLES * (high_sec / 60)) + 500  # buffer
+    need_1m = int(num_candles * (high_sec / 60)) + 500  # buffer
 
     for sym in symbols:
+        last_time = None
+        status = "ok"
         try:
-            # fetch 1h candles (last NUM_CANDLES)
-            df_high = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=NUM_CANDLES)
+            # fetch chart tf candles
+            df_high = ex.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=num_candles)
             if not df_high or len(df_high) < 150:
+                status = "skip_short"
                 continue
             df_high = pd.DataFrame(np.array(df_high, float), columns=["time","open","high","low","close","volume"])
             df_high["time"] = pd.to_datetime(df_high["time"], unit="ms", utc=True)
@@ -491,6 +517,7 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             # fetch 1m bars covering the same range (paged)
             df_1m = fetch_ohlcv_paged(ex, sym, "1m", since_ms=start_ms, limit=1500, max_bars=need_1m)
             if df_1m.empty:
+                status = "skip_no_1m"
                 continue
 
             # attach lower tf sums (1h -> 6m)
@@ -504,6 +531,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 
             def emit(payload: Dict[str, Any]):
                 if PRINT_EVENTS:
+                    if SHOW_ONLY_TOUCH_EVENTS and payload.get("event") != "FVG_TOUCHED":
+                        return
                     print("[OUT] " + json.dumps(payload, ensure_ascii=False))
 
             # أحداث آخر شمعة (إنشاء/حذف)
@@ -524,8 +553,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         })
                     seen[key] = last_bar
@@ -549,8 +578,8 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                         "reason": f["removed_reason"],
                         "top": float(f["body"]["top"]),
                         "bottom": float(f["body"]["bottom"]),
-                        "bull%": int(f["bull"]),
-                        "bear%": int(f["bear"]),
+                        "bull%": format_percent_tv_like(f["bull"]),
+                        "bear%": format_percent_tv_like(f["bear"]),
                         "totalVol": format_volume_tv_like(f["totalVol"]),
                     })
                     seen[key] = last_bar
@@ -577,16 +606,55 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                             "type": "BULL" if f["isBull"] else "BEAR",
                             "top": float(f["body"]["top"]),
                             "bottom": float(f["body"]["bottom"]),
-                            "bull%": int(f["bull"]),
-                            "bear%": int(f["bear"]),
+                            "bull%": format_percent_tv_like(f["bull"]),
+                            "bear%": format_percent_tv_like(f["bear"]),
                             "totalVol": format_volume_tv_like(f["totalVol"]),
                         }
                         for f in active_now
                     ]
                 })
 
+            # لمس المنطقة خلال آخر شموع قابلة للتخصيص
+            if PRINT_TOUCH_EVENTS and TOUCH_LOOKBACK > 0:
+                active_now = [x for x in fvgs if x["removed_at_bar"] is None]
+                if active_now:
+                    end_idx = len(df_hi2)
+                    start_idx = max(0, end_idx - TOUCH_LOOKBACK)
+                    highs = df_hi2["high"].to_numpy(float)[start_idx:end_idx]
+                    lows = df_hi2["low"].to_numpy(float)[start_idx:end_idx]
+                    touched = []
+                    for f in active_now:
+                        top = float(f["body"]["top"])
+                        bottom = float(f["body"]["bottom"])
+                        hit = np.any((lows <= top) & (highs >= bottom))
+                        if hit:
+                            touched.append({
+                                "id": int(f["id"]),
+                                "type": "BULL" if f["isBull"] else "BEAR",
+                                "top": float(f["body"]["top"]),
+                                "bottom": float(f["body"]["bottom"]),
+                                "bull%": format_percent_tv_like(f["bull"]),
+                                "bear%": format_percent_tv_like(f["bear"]),
+                                "totalVol": format_volume_tv_like(f["totalVol"]),
+                            })
+                    if touched:
+                        emit({
+                            "symbol": sym,
+                            "event": "FVG_TOUCHED",
+                            "tf": TIMEFRAME,
+                            "lower_tf": lower_tf,
+                            "time": last_time,
+                            "lookback": TOUCH_LOOKBACK,
+                            "count": len(touched),
+                            "fvgs": touched,
+                        })
+
         except Exception as e:
+            status = "error"
             print(f"[WARN] {sym}: {e}")
+        finally:
+            if PRINT_SYMBOL_DONE:
+                print(f"[DONE] {sym} tf={TIMEFRAME} lower_tf={lower_tf} candles={num_candles} status={status} last={last_time}")
 
     state["seen"] = seen
     return state
