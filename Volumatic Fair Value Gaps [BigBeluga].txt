@@ -1,0 +1,201 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © BigBeluga
+
+
+//@version=6
+indicator("Volumatic Fair Value Gaps [BigBeluga]", overlay = true, max_boxes_count = 500, max_bars_back = 5000)
+
+
+// ＩＮＰＵＴＳ ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――{
+
+string mitigationSrc = input.string("close", "FVGs Mitigation Source", ["close", "high/low"])
+
+bool bullGaps   = input.bool(true, "Bullish FVG")
+bool bearGaps   = input.bool(true, "Bearish FVG")
+bool volumeBars = input.bool(true, "Volume Bars")
+
+color bullColor = input.color(color.rgb(26, 194, 216, 50), "Bullish", inline = "colors")
+color bearColor = input.color(color.rgb(216, 118, 26, 50), "Bearish", inline = "colors")
+
+
+type VolumaticFVG
+    box  body 
+    int  bull 
+    int  bear 
+    bool isBull
+    box  bullBar
+    box  bearBar
+    float totalVol
+
+var fvgs  = array.new<VolumaticFVG>()
+var boxes = array.new<box>()
+
+
+// ＣＡＬＣＵＬＡＴＩＯＮＳ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――{
+
+// Gap Filters
+float diff      =  close[1] > open[1] ? (low - high[2]) / low * 100 : (low[2] - high) / high *100
+float sizeFVG   = diff / ta.percentile_nearest_rank(diff, 1000, 100) * 100
+bool  filterFVG = sizeFVG > 10
+
+bool isBull_gap = high[2] < low and high[2] < high[1] and low[2] < low and filterFVG
+bool isBear_gap = low[2] > high and low[2] > low[1] and high[2] > high  and filterFVG
+
+time_ = timeframe.in_seconds("")/60
+time_s = timeframe.in_seconds("")
+div   = 10
+
+tf = time_ <= 1 ? "5S" : str.tostring(math.ceil(time_/div))
+
+array<float> BullVolume = request.security_lower_tf('', tf, (close > open ? volume : 0))
+array<float> BearVolume = request.security_lower_tf('', tf, (close < open ? volume : 0))
+
+sumBull = BullVolume.sum()
+sumBear = BearVolume.sum()
+float totalVolume       = sumBull + sumBear
+
+var dash = table.new(position.top_right, 100, 100, chart.bg_color)
+
+if bar_index > 100
+
+    if isBull_gap and bullGaps
+        body    = box.new(bar_index-1, low, bar_index+5, high[2], bgcolor = color.new(bullColor, 70), border_color = na)
+        mid     = math.avg(low, high[2])
+        bullVol = (sumBull[1] / totalVolume[1]) * 100
+        bearVol = (sumBear[1] / totalVolume[1]) * 100
+        bearBar = box.new(body.get_left(), body.get_top(), body.get_left(), mid, bgcolor = bearColor, border_color = chart.bg_color)
+        bullBar = box.new(body.get_left(), mid, body.get_left(), body.get_bottom(), bgcolor = bullColor, border_color = chart.bg_color)
+
+        fvgs.push(VolumaticFVG.new(body, int(bullVol), int(bearVol), true, bullBar, bearBar, totalVolume[1]))
+
+    if isBear_gap and bearGaps
+        body    = box.new(bar_index-1, low[2], bar_index+5, high, bgcolor = color.new(bearColor, 70), border_color = na)
+        mid     = math.avg(low[2], high)
+        bullVol = (sumBull[1] / totalVolume[1]) * 100
+        bearVol = (sumBear[1] / totalVolume[1]) * 100
+        bearBar = box.new(body.get_left(), body.get_top(), body.get_left(), mid, bgcolor = bearColor, border_color = chart.bg_color)
+        bullBar = box.new(body.get_left(), mid, body.get_left(), body.get_bottom(), bgcolor = bullColor, border_color = chart.bg_color)
+
+        fvgs.push(VolumaticFVG.new(body, int(bullVol), int(bearVol), false, bullBar, bearBar, totalVolume[1]))
+
+
+
+
+    // Remove Crossed FVGs
+    if fvgs.size() > 0 
+
+        for fvg in fvgs
+
+            src1 = mitigationSrc == "close" ? close : low
+            src2 = mitigationSrc == "close" ? close : high
+
+            left  = fvg.body.get_left()
+            right = fvg.body.get_right()
+
+            if fvg.isBull
+                if src1 < fvg.body.get_bottom() 
+                    fvg.body.delete()
+                    fvg.bullBar.delete()
+                    fvg.bearBar.delete()
+                    fvgs.remove(fvgs.indexof(fvg))
+            else 
+                if src2 > fvg.body.get_top() 
+                    fvg.body.delete()
+                    fvg.bullBar.delete()
+                    fvg.bearBar.delete()
+                    fvgs.remove(fvgs.indexof(fvg))
+
+            fvg.body.set_right(bar_index+25)
+
+ 
+            fvg.body.set_text(str.tostring(fvg.totalVol, format.volume))
+            fvg.body.set_text_halign(text.align_right)
+            fvg.body.set_text_color(chart.bg_color)
+            
+
+            if volumeBars
+
+                top = fvg.body.get_top()
+                bot = fvg.body.get_bottom()
+                mid = math.avg(top, bot)
+
+                size = int(right - left) / 200
+
+                fvg.bullBar.set_right(left + size * fvg.bull)
+                fvg.bearBar.set_right(left + size * fvg.bear)
+
+                fvg.bullBar.set_text(str.tostring(int(fvg.bull), format.percent))
+                fvg.bearBar.set_text(str.tostring(int(fvg.bear), format.percent))
+
+                fvg.bullBar.set_text_color(chart.fg_color)
+                fvg.bearBar.set_text_color(chart.fg_color)
+
+                fvg.bullBar.set_text_halign(text.align_right)
+                fvg.bearBar.set_text_halign(text.align_right)
+            
+
+            else 
+                fvg.bearBar.set_text("")
+                fvg.bullBar.set_text("")
+
+    // Remove Overlaped 
+    if fvgs.size() > 0
+        for i = 0 to fvgs.size() - 1
+            fvg = fvgs.get(i)
+            top = fvg.body.get_top()
+            bot = fvg.body.get_bottom()
+
+            for j = 0 to fvgs.size() - 1
+                if i == j
+                    continue  // Don't compare with self
+
+                l   = fvgs.get(j)
+
+                top1 = l.body.get_top()
+                bot1 = l.body.get_bottom()
+
+                if top1 < top and top1 > bot
+                    fvg.body.delete()
+                    fvg.bearBar.delete()
+                    fvg.bullBar.delete()
+                    fvgs.remove(fvgs.indexof(fvg))
+
+    // Controle Size
+    if fvgs.size() > 10 
+        fvg = fvgs.shift()
+        fvg.body.delete()
+        fvg.bullBar.delete()
+        fvg.bearBar.delete()
+
+    // DashBoard
+    if barstate.islast
+
+        bullCount = 0 
+        bearCount = 0
+
+        bullVolume = 0.
+        bearVolume = 0.
+
+        if fvgs.size() > 0 
+
+            for fvg in fvgs 
+                if fvg.isBull
+                    bullCount += 1
+                    bullVolume += fvg.totalVol
+                else
+                    bearCount += 1
+                    bearVolume += fvg.totalVol
+
+        dash.cell(0, 0, "FVG Type", text_color = chart.fg_color)
+        dash.cell(1, 0, "On Chart", text_color = chart.fg_color)
+        dash.cell(2, 0, "Total Volume", text_color = chart.fg_color)
+
+        dash.cell(0, 1, "Bullish FVG", text_color = color.new(bullColor, 0))
+        dash.cell(1, 1, str.tostring(bullCount), text_color = chart.fg_color)
+        dash.cell(2, 1, str.tostring(bullVolume, format.volume), text_color = chart.fg_color)
+            
+        dash.cell(0, 2, "Bearish FVG", text_color = color.new(bearColor, 0))
+        dash.cell(1, 2, str.tostring(bearCount), text_color = chart.fg_color)
+        dash.cell(2, 2, str.tostring(bearVolume, format.volume), text_color = chart.fg_color)
+// }
