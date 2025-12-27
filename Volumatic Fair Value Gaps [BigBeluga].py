@@ -14,6 +14,10 @@ NUM_CANDLES = 300        # على 1h: 300 شمعة => تحتاج ~18000 شمعة
 SYMBOLS = None           # None = كل USDT-M
 POLL_SECONDS = 60
 
+# Touch detection (last N candles)
+TOUCH_LOOKBACK = 10
+PRINT_TOUCH_EVENTS = True
+
 # Pine inputs
 PARAMS = {
     "mitigationSrc": "close",   # "close" أو "high/low"
@@ -602,6 +606,41 @@ def scan_once(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                         for f in active_now
                     ]
                 })
+
+            # لمس المنطقة خلال آخر شموع قابلة للتخصيص
+            if PRINT_TOUCH_EVENTS and TOUCH_LOOKBACK > 0:
+                active_now = [x for x in fvgs if x["removed_at_bar"] is None]
+                if active_now:
+                    end_idx = len(df_hi2)
+                    start_idx = max(0, end_idx - TOUCH_LOOKBACK)
+                    highs = df_hi2["high"].to_numpy(float)[start_idx:end_idx]
+                    lows = df_hi2["low"].to_numpy(float)[start_idx:end_idx]
+                    touched = []
+                    for f in active_now:
+                        top = float(f["body"]["top"])
+                        bottom = float(f["body"]["bottom"])
+                        hit = np.any((lows <= top) & (highs >= bottom))
+                        if hit:
+                            touched.append({
+                                "id": int(f["id"]),
+                                "type": "BULL" if f["isBull"] else "BEAR",
+                                "top": float(f["body"]["top"]),
+                                "bottom": float(f["body"]["bottom"]),
+                                "bull%": format_percent_tv_like(f["bull"]),
+                                "bear%": format_percent_tv_like(f["bear"]),
+                                "totalVol": format_volume_tv_like(f["totalVol"]),
+                            })
+                    if touched:
+                        emit({
+                            "symbol": sym,
+                            "event": "FVG_TOUCHED",
+                            "tf": TIMEFRAME,
+                            "lower_tf": lower_tf,
+                            "time": last_time,
+                            "lookback": TOUCH_LOOKBACK,
+                            "count": len(touched),
+                            "fvgs": touched,
+                        })
 
         except Exception as e:
             print(f"[WARN] {sym}: {e}")
