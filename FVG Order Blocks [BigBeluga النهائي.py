@@ -40,7 +40,7 @@ DEFAULT_CONFIG: Dict[str, object] = {
     "rate_limit": True,
     "atr_warmup_extra": 500,
     # NEW: event filters/printing
-    "event_age_bars": 3,
+    "event_age_bars": 0,
     "print_touched": True,
     "print_created": True,
     "print_broken": True,
@@ -287,9 +287,11 @@ def _process_bear_boxes_like_pine(
 
 
 def _filter_by_age_ts(events: List[ZoneEvent], ts: np.ndarray, age_bars: int) -> List[ZoneEvent]:
-    if age_bars <= 0:
+    if age_bars < 0:
         return events
     n = len(ts)
+    if n == 0:
+        return []
     cutoff_index = max(0, n - 1 - age_bars)
     ts_to_index = {int(ts[idx]): idx for idx in range(n)}
     return [e for e in events if ts_to_index.get(e.ts, -1) >= cutoff_index]
@@ -410,7 +412,7 @@ def analyze_symbol(
                 boxes_bear.pop(0)
 
     age_bars = int(cfg["signal_age_bars"])
-    if age_bars > 0:
+    if age_bars >= 0:
         cutoff_index = max(0, n - 1 - age_bars)
         ts_to_index = {int(ts[idx]): idx for idx in range(n)}
         signals = [s for s in signals if ts_to_index.get(s.ts, -1) >= cutoff_index]
@@ -569,6 +571,9 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
     )
     print("Scanning... (Ctrl+C to stop)\n")
 
+    seen_signals = set()
+    seen_events = set()
+
     while True:
         all_signals: List[Signal] = []
         all_events: List[ZoneEvent] = []
@@ -621,12 +626,18 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
                 if sigs:
                     all_signals.extend(sigs)
                     for s in sigs:
-                        print(f"[SIG {fmt_ts(s.ts)}] {s.symbol:18s} {s.kind:10s} price={s.price:.6f} | {s.info}")
+                        sig_key = (s.symbol, s.kind, s.ts)
+                        if sig_key not in seen_signals:
+                            print(f"[SIG {fmt_ts(s.ts)}] {s.symbol:18s} {s.kind:10s} price={s.price:.6f} | {s.info}")
+                            seen_signals.add(sig_key)
                 if events:
                     all_events.extend(events)
                     for e in events:
                         if _should_print_event(e, config):
-                            _print_event_line(e)
+                            evt_key = (e.symbol, e.kind, e.ts)
+                            if evt_key not in seen_events:
+                                _print_event_line(e)
+                                seen_events.add(evt_key)
 
         all_signals.sort(key=lambda s: s.ts, reverse=True)
         all_events.sort(key=lambda e: e.ts, reverse=True)
