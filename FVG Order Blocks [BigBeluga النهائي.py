@@ -26,7 +26,8 @@ ANSI_RED = "\033[91m"
 
 
 DEFAULT_CONFIG: Dict[str, object] = {
-    "timeframe": "1m",
+    "htf_timeframe": "1h",
+    "ltf_timeframe": "5m",
     "lookback_candles": 2000,
     "atr_length": 200,
     "gap_filter_pct": 0.5,
@@ -294,7 +295,9 @@ def _filter_by_age_ts(events: List[ZoneEvent], ts: np.ndarray, age_bars: int) ->
     return [e for e in events if ts_to_index.get(e.ts, -1) >= cutoff_index]
 
 
-def analyze_symbol(symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]) -> Tuple[List[Signal], List[ZoneEvent]]:
+def analyze_symbol(
+    symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]
+) -> Tuple[List[Signal], List[ZoneEvent], List[BoxLevel], List[BoxLevel]]:
     arr = np.array(ohlcv, dtype=float)
     ts = arr[:, 0].astype(np.int64)
     high = arr[:, 2]
@@ -310,7 +313,7 @@ def analyze_symbol(symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]
     n = len(ts)
     atr_length = int(cfg["atr_length"])
     if n < max(atr_length + 5, 10):
-        return [], []
+        return [], [], [], []
 
     atr = wilder_atr(high, low, close, atr_length)
 
@@ -413,7 +416,7 @@ def analyze_symbol(symbol: str, ohlcv: List[List[float]], cfg: Dict[str, object]
         signals = [s for s in signals if ts_to_index.get(s.ts, -1) >= cutoff_index]
 
     events = _filter_by_age_ts(events, ts, int(cfg.get("event_age_bars", 0)))
-    return signals, events
+    return signals, events, boxes_bull, boxes_bear
 
 
 _THREAD_LOCAL = threading.local()
@@ -467,16 +470,64 @@ def _worker_scan_symbol(symbol: str, config: Dict[str, object], fetch_limit: int
         sleep_ms = delay_ms + (random.random() * jitter_ms if jitter_ms > 0 else 0.0)
         time.sleep(max(0.0, sleep_ms) / 1000.0)
 
-    ohlcv = fetch_ohlcv_safe(ex, symbol, str(config["timeframe"]), fetch_limit)
-    if not ohlcv or len(ohlcv) < 10:
+    htf = str(config.get("htf_timeframe", "1h"))
+    ohlcv_htf = fetch_ohlcv_safe(ex, symbol, htf, fetch_limit)
+    if not ohlcv_htf or len(ohlcv_htf) < 10:
         return [], []
 
-    daily_rise = _daily_rise_pct_from_ohlcv(ohlcv, str(config["timeframe"]))
+    daily_rise = _daily_rise_pct_from_ohlcv(ohlcv_htf, htf)
     min_daily_rise = float(config.get("min_daily_rise_pct", 0.0))
     if daily_rise is not None and daily_rise < min_daily_rise:
         return [], []
 
-    return analyze_symbol(symbol, ohlcv, config)
+    _, _, boxes_bull, boxes_bear = analyze_symbol(symbol, ohlcv_htf, config)
+    if not boxes_bull and not boxes_bear:
+        return [], []
+
+    ltf = str(config.get("ltf_timeframe", "5m"))
+    ohlcv_ltf = fetch_ohlcv_safe(ex, symbol, ltf, 5)
+    if not ohlcv_ltf:
+        return [], []
+
+    arr_ltf = np.array(ohlcv_ltf, dtype=float)
+    ts_ltf = arr_ltf[:, 0].astype(np.int64)
+    high_ltf = arr_ltf[:, 2]
+    low_ltf = arr_ltf[:, 3]
+
+    ltf_events: List[ZoneEvent] = []
+    ltf_signals: List[Signal] = []
+
+    for i in range(len(ts_ltf)):
+        for box in boxes_bull:
+            if high_ltf[i] >= box.bottom and low_ltf[i] <= box.top:
+                ltf_events.append(
+                    ZoneEvent(
+                        symbol,
+                        "zone_touched",
+                        "bull",
+                        int(ts_ltf[i]),
+                        float(low_ltf[i]),
+                        f"LTF ({ltf}) Touched HTF ({htf}) Bull Zone [{box.bottom:.6f}, {box.top:.6f}]",
+                        strength_pct=box.strength_pct,
+                    )
+                )
+
+        for box in boxes_bear:
+            if high_ltf[i] >= box.bottom and low_ltf[i] <= box.top:
+                ltf_events.append(
+                    ZoneEvent(
+                        symbol,
+                        "zone_touched",
+                        "bear",
+                        int(ts_ltf[i]),
+                        float(high_ltf[i]),
+                        f"LTF ({ltf}) Touched HTF ({htf}) Bear Zone [{box.bottom:.6f}, {box.top:.6f}]",
+                        strength_pct=box.strength_pct,
+                    )
+                )
+
+    unique_events = list({(e.ts, e.kind, e.side): e for e in ltf_events}.values())
+    return ltf_signals, unique_events
 
 
 def fmt_ts(ms: int) -> str:
@@ -509,7 +560,7 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
 
     print(f"Loaded {len(symbols)} USDT-M perpetual symbols.")
     print(
-        f"Timeframe={config['timeframe']}, lookback={config['lookback_candles']}, "
+        f"HTF={config['htf_timeframe']}, LTF={config['ltf_timeframe']}, lookback={config['lookback_candles']}, "
         f"filter={config['gap_filter_pct']}%, min_daily_rise={config['min_daily_rise_pct']}%, "
         f"workers={config['scan_workers']}, symbols={config['scan_symbols_count']}, "
         f"min_zone_gap={config['min_zone_gap_strength_pct']}%"
@@ -605,8 +656,9 @@ def run_scan(config: Dict[str, object], once: bool = False) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="FVG + OB signal scanner for Binance futures.")
-    parser.add_argument("--timeframe", default=DEFAULT_CONFIG["timeframe"])
+    parser = argparse.ArgumentParser(description="MTF FVG + OB signal scanner for Binance futures.")
+    parser.add_argument("--htf", default=DEFAULT_CONFIG["htf_timeframe"], help="Higher Timeframe (Zones)")
+    parser.add_argument("--ltf", default=DEFAULT_CONFIG["ltf_timeframe"], help="Lower Timeframe (Triggers)")
     parser.add_argument("--lookback", type=int, default=DEFAULT_CONFIG["lookback_candles"])
     parser.add_argument("--interval", type=float, default=DEFAULT_CONFIG["scan_interval_sec"])
     parser.add_argument("--symbols-count", type=int, default=DEFAULT_CONFIG["scan_symbols_count"])
@@ -618,7 +670,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = dict(DEFAULT_CONFIG)
-    config["timeframe"] = args.timeframe
+    config["htf_timeframe"] = args.htf
+    config["ltf_timeframe"] = args.ltf
     config["lookback_candles"] = args.lookback
     config["scan_interval_sec"] = args.interval
     config["scan_symbols_count"] = args.symbols_count
