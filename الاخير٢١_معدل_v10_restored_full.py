@@ -4092,12 +4092,283 @@ def send_telegram(message):
     except Exception as e:
         print(f"تليجرام خطأ: {e}")
 
+
+HIERARCHICAL_STATES = {
+    'EARLY_ACCUMULATION': 'مرشح مبكر',
+    'INSTITUTIONAL_BUILDUP': 'إشارة مؤسسية',
+    'PRE_BREAKOUT': 'انفجار وشيك',
+    'IMMINENT_EXPANSION': 'انفجار وشيك جدًا'
+}
+
+
+def timeframe_label(tf: str) -> str:
+    return {'1d': '1D', '4h': '4H', '15m': '15m', '5m': '5m'}.get(tf, tf)
+
+
+def describe_daily_bias(symbol: str):
+    kl = get_klines(symbol, '1d', 45)
+    if not kl or len(kl['close']) < 25:
+        return {'status': 'UNKNOWN', 'score': 0, 'text': 'بيانات يومية غير كافية'}
+
+    closes = kl['close']
+    ema20 = ema(closes[-20:], alpha=2/(20+1))
+    ema40 = ema(closes[-40:], alpha=2/(40+1))
+    slope = linear_trend_slope(closes[-12:])
+    price_vs_ema20 = pct_change(ema20, closes[-1])
+
+    if closes[-1] > ema20 > ema40 and slope > 0:
+        return {'status': 'BULLISH', 'score': 3, 'text': f"اتجاه صاعد: السعر فوق EMA20/EMA40 وميل يومي موجب ({price_vs_ema20:+.2f}% فوق EMA20)"}
+    if closes[-1] < ema20 < ema40 and slope < 0:
+        return {'status': 'BEARISH', 'score': -3, 'text': f"اتجاه هابط: السعر أسفل EMA20/EMA40 وميل يومي سالب ({price_vs_ema20:+.2f}% مقابل EMA20)"}
+    if closes[-1] >= ema20 and slope >= 0:
+        return {'status': 'BULLISH_BIAS', 'score': 1, 'text': "انحياز صاعد غير مكتمل: السعر أعلى EMA20 لكن الاتجاه ليس قويًا"}
+    if closes[-1] <= ema20 and slope <= 0:
+        return {'status': 'BEARISH_BIAS', 'score': -1, 'text': "انحياز هابط غير مكتمل: السعر أسفل EMA20 لكن الاتجاه ليس قويًا"}
+    return {'status': 'NEUTRAL', 'score': 0, 'text': "سوق يومي محايد/متذبذب"}
+
+
+def describe_4h_confirmation(symbol: str, daily_status: str):
+    kl = get_klines(symbol, '4h', 60)
+    if not kl or len(kl['close']) < 30:
+        return {'status': 'UNKNOWN', 'score': 0, 'text': 'بيانات 4H غير كافية', 'alignment': 'unknown'}
+
+    closes = kl['close']
+    ema21 = ema(closes[-21:], alpha=2/(21+1))
+    ema55 = ema(closes[-55:], alpha=2/(55+1))
+    slope = linear_trend_slope(closes[-10:])
+
+    if closes[-1] > ema21 > ema55 and slope > 0:
+        status = 'BULLISH'
+        score = 2
+    elif closes[-1] < ema21 < ema55 and slope < 0:
+        status = 'BEARISH'
+        score = -2
+    else:
+        status = 'MIXED'
+        score = 0
+
+    daily_bull = daily_status in ('BULLISH', 'BULLISH_BIAS')
+    daily_bear = daily_status in ('BEARISH', 'BEARISH_BIAS')
+    if (daily_bull and status == 'BULLISH') or (daily_bear and status == 'BEARISH'):
+        alignment = 'aligned'
+    elif (daily_bull and status == 'BEARISH') or (daily_bear and status == 'BULLISH'):
+        alignment = 'conflict'
+    else:
+        alignment = 'partial'
+
+    return {
+        'status': status,
+        'score': score,
+        'alignment': alignment,
+        'text': f"{status} | EMA21/EMA55 + ميل 4H ({'متوافق' if alignment == 'aligned' else 'متعارض' if alignment == 'conflict' else 'جزئي'})"
+    }
+
+
+def describe_15m_interest(symbol: str):
+    kl = get_klines(symbol, '15m', 64)
+    if not kl or len(kl['close']) < 25:
+        return {'status': 'UNKNOWN', 'score': 0, 'zone': 'none', 'text': 'بيانات 15m غير كافية'}
+
+    closes = kl['close']
+    highs = kl['high']
+    lows = kl['low']
+    vols = kl['volume']
+    change_3 = pct_change(closes[-4], closes[-1])
+    change_6 = pct_change(closes[-7], closes[-1])
+    bb_pct, _ = bollinger_bandwidth_percentile(closes, window=20, lookback=50)
+    avg_vol = mean(vols[-20:-5]) if len(vols) >= 25 else mean(vols)
+    vol_ratio = safe_div(vols[-1], avg_vol, default=1.0)
+    recent_high = max(highs[-12:-1])
+    recent_low = min(lows[-12:-1])
+
+    if bb_pct < 25 and vol_ratio >= 1.15:
+        return {'status': 'BUILDUP', 'score': 2, 'zone': 'squeeze', 'text': f"بداية squeeze/build-up | BB%={bb_pct:.0f} | حجم={vol_ratio:.2f}x"}
+    if closes[-1] > recent_high and change_3 > 0.6:
+        return {'status': 'BULLISH_INTEREST', 'score': 3, 'zone': 'breakout_zone', 'text': f"منطقة اهتمام صاعدة (اختراق 15m +{change_3:.2f}%)"}
+    if closes[-1] < recent_low and change_3 < -0.6:
+        return {'status': 'BEARISH_INTEREST', 'score': -3, 'zone': 'failure_zone', 'text': f"منطقة ضعف/فشل هابطة (كسر 15m {change_3:.2f}%)"}
+    if change_6 > 0.9:
+        return {'status': 'BULLISH_INTEREST', 'score': 1, 'zone': 'monitor_up', 'text': f"تجميع صاعد تدريجي على 15m ({change_6:+.2f}%)"}
+    if change_6 < -0.9:
+        return {'status': 'BEARISH_INTEREST', 'score': -1, 'zone': 'monitor_down', 'text': f"ضغط هابط تدريجي على 15m ({change_6:+.2f}%)"}
+    return {'status': 'NEUTRAL', 'score': 0, 'zone': 'none', 'text': 'لا توجد منطقة اهتمام واضحة على 15m'}
+
+
+def describe_5m_trigger(symbol: str, side_hint: str = 'UP'):
+    kl = get_klines(symbol, '5m', 36)
+    oi5 = get_oi_history(symbol, '5m', 18)
+    if not kl or len(kl['close']) < 12:
+        return {'status': 'UNKNOWN', 'score': 0, 'timing': 'unknown', 'text': 'بيانات 5m غير كافية'}
+
+    closes = kl['close']
+    vols = kl['volume']
+    change_1 = pct_change(closes[-2], closes[-1])
+    change_3 = pct_change(closes[-4], closes[-1])
+    avg_vol = mean(vols[-12:-1]) if len(vols) >= 13 else mean(vols)
+    vol_ratio = safe_div(vols[-1], avg_vol, default=1.0)
+    oi_delta = pct_change(oi5[-2], oi5[-1]) if oi5 and len(oi5) >= 2 else 0.0
+
+    if side_hint == 'UP':
+        if change_1 > 0.2 and change_3 < 1.5 and vol_ratio >= 1.1:
+            return {'status': 'TRIGGER_UP', 'score': 2, 'timing': 'early', 'text': f"trigger صاعد مبكر | 5m={change_1:+.2f}% | حجم={vol_ratio:.2f}x | OI={oi_delta:+.2f}%"}
+        if change_3 >= 2.0 or vol_ratio >= 2.2:
+            return {'status': 'TRIGGER_UP', 'score': 1, 'timing': 'late', 'text': f"الدخول متأخر نسبيًا بعد اندفاع 5m ({change_3:+.2f}%)"}
+    else:
+        if change_1 < -0.2 and change_3 > -1.5 and vol_ratio >= 1.1:
+            return {'status': 'TRIGGER_DOWN', 'score': -2, 'timing': 'early', 'text': f"trigger هابط مبكر | 5m={change_1:+.2f}% | حجم={vol_ratio:.2f}x | OI={oi_delta:+.2f}%"}
+        if change_3 <= -2.0 or vol_ratio >= 2.2:
+            return {'status': 'TRIGGER_DOWN', 'score': -1, 'timing': 'late', 'text': f"الدخول متأخر نسبيًا بعد هبوط 5m ({change_3:+.2f}%)"}
+
+    return {'status': 'NO_TRIGGER', 'score': 0, 'timing': 'waiting', 'text': 'لا يوجد trigger تنفيذي واضح على 5m'}
+
+
+def detect_hierarchical_states(direction: str, tf15: dict, tf5: dict, flow_data: dict):
+    states = []
+    if direction == 'UP':
+        if tf15['status'] in ('BULLISH_INTEREST', 'BUILDUP') and tf5['timing'] == 'early':
+            states.append('EARLY_ACCUMULATION')
+        if flow_data.get('buy_ratio', 0.0) >= 0.57 and flow_data.get('recent_trade_ratio', 1.0) >= 1.15:
+            states.append('INSTITUTIONAL_BUILDUP')
+        if tf15.get('zone') in ('breakout_zone', 'squeeze'):
+            states.append('PRE_BREAKOUT')
+        if flow_data.get('oi_15m', 0.0) >= 3.0 and flow_data.get('price_15m', 0.0) >= 1.4:
+            states.append('IMMINENT_EXPANSION')
+    else:
+        if tf15['status'] == 'BEARISH_INTEREST' and tf5['timing'] == 'early':
+            states.append('EARLY_ACCUMULATION')
+        if flow_data.get('buy_ratio', 0.0) <= 0.44 and flow_data.get('recent_trade_ratio', 1.0) <= 0.9:
+            states.append('INSTITUTIONAL_BUILDUP')
+        if tf15.get('zone') == 'failure_zone':
+            states.append('PRE_BREAKOUT')
+        if flow_data.get('oi_15m', 0.0) >= 2.8 and flow_data.get('price_15m', 0.0) <= -1.3:
+            states.append('IMMINENT_EXPANSION')
+    return states
+
+
+def build_hierarchical_decision(signal_data: dict):
+    symbol = signal_data['symbol']
+    direction = signal_data.get('direction', 'UP')
+
+    flow_data = analyze_orderflow_short(symbol)
+    oi_profile = get_oi_accel_profile(symbol)
+    flow_features = {
+        'buy_ratio': flow_data.get('recent_buy_ratio', 0.5),
+        'recent_trade_ratio': flow_data.get('recent_trade_ratio', 1.0),
+        'price_15m': flow_data.get('price_change_15m', 0.0),
+        'oi_15m': oi_profile.get('delta_15m', 0.0),
+    }
+
+    tf1d = describe_daily_bias(symbol)
+    tf4h = describe_4h_confirmation(symbol, tf1d['status'])
+    tf15 = describe_15m_interest(symbol)
+    tf5 = describe_5m_trigger(symbol, side_hint=direction)
+    states = detect_hierarchical_states(direction, tf15, tf5, flow_features)
+
+    direction_gate = True
+    if direction == 'UP':
+        direction_gate = tf1d['score'] >= -1 and tf4h['status'] in ('BULLISH', 'MIXED') and tf15['score'] >= 1 and tf5['status'] == 'TRIGGER_UP'
+    elif direction == 'DOWN':
+        direction_gate = tf1d['score'] <= 1 and tf4h['status'] in ('BEARISH', 'MIXED') and tf15['score'] <= -1 and tf5['status'] == 'TRIGGER_DOWN'
+
+    quality = max(0, signal_data.get('score', 0))
+    quality += 8 if tf4h['alignment'] == 'aligned' else -6 if tf4h['alignment'] == 'conflict' else 0
+    quality += 5 * len(states)
+    quality += 5 if tf5['timing'] == 'early' else -8 if tf5['timing'] == 'late' else 0
+    quality += int(scale_to_unit(abs(flow_features['oi_15m']), 0, 6) * 6)
+    quality = max(0, min(100, quality))
+
+    decisive_factor = 'توافق 1D و4H مع منطقة اهتمام 15m وتفعيل 5m'
+    if tf4h['alignment'] == 'conflict':
+        decisive_factor = 'تعارض 4H مع 1D خفّض الجودة'
+    elif len(states) >= 2:
+        decisive_factor = 'تعدد الحالات الداعمة على نفس العملة'
+    elif tf5['timing'] == 'late':
+        decisive_factor = 'الإشارة تأخرت على 5m رغم تحقق الشروط'
+
+    return {
+        'eligible': direction_gate and len(states) >= 1,
+        'symbol': symbol,
+        'direction': direction,
+        'base_classification': signal_data.get('classification') or signal_data.get('pattern'),
+        'quality': quality,
+        'states': states,
+        'timing': tf5['timing'],
+        'tf1d': tf1d,
+        'tf4h': tf4h,
+        'tf15': tf15,
+        'tf5': tf5,
+        'decisive_factor': decisive_factor,
+        'why': signal_data.get('reasons', []),
+        'not_random': [
+            'تم فرض تسلسل 1D -> 4H -> 15m -> 5m',
+            'تم رفض أي إشارة لا تملك trigger على 5m مدعومًا من الفريمات الأكبر',
+            f"حالات داعمة: {', '.join(HIERARCHICAL_STATES.get(s, s) for s in states)}"
+        ],
+    }
+
+
+def format_hierarchical_block(item: dict):
+    states_ar = [HIERARCHICAL_STATES.get(s, s) for s in item['states']]
+    return (
+        f"- الرمز: {item['symbol']}\n"
+        f"- الاتجاه المتوقع: {'صعود' if item['direction'] == 'UP' else 'هبوط'}\n"
+        f"- التصنيف الأساسي: {item['base_classification']}\n"
+        f"- جودة الإشارة: {item['quality']}/100\n"
+        f"- الحالة الأساسية: {states_ar[0] if states_ar else 'غير محددة'}\n"
+        f"- الحالات المتوافقة: {', '.join(states_ar) if states_ar else 'لا يوجد'}\n"
+        f"- 1D: {item['tf1d']['text']}\n"
+        f"- 4H: {item['tf4h']['text']}\n"
+        f"- 15m: {item['tf15']['text']}\n"
+        f"- 5m: {item['tf5']['text']}\n"
+        f"- العامل الحاسم: {item['decisive_factor']}\n"
+        f"- لماذا تم ترشيحها: {'، '.join(item['why']) if item['why'] else 'توافق هرمي + تدفق + OI'}\n"
+        f"- لماذا ليست عشوائية: {' | '.join(item['not_random'])}\n"
+        f"- هل الدخول مبكر أم متأخر: {item['timing']}\n"
+    )
+
+
+def generate_hierarchical_report(results):
+    if not results:
+        return []
+
+    decisions = []
+    for r in results:
+        try:
+            decisions.append(build_hierarchical_decision(r))
+        except Exception as e:
+            diagnostics.log_error(r.get('symbol', 'UNKNOWN'), 'build_hierarchical_decision', str(e))
+
+    bullish = [d for d in decisions if d['eligible'] and d['direction'] == 'UP']
+    bearish = [d for d in decisions if d['eligible'] and d['direction'] == 'DOWN']
+
+    bullish.sort(key=lambda x: x['quality'], reverse=True)
+    bearish.sort(key=lambda x: x['quality'], reverse=True)
+
+    lines = ["🚦 *تقرير الترشيح الهرمي متعدد الفريمات*", ""]
+    lines.append("📈 *أفضل مرشحي الصعود*")
+    if bullish:
+        for b in bullish[:8]:
+            lines.append(format_hierarchical_block(b))
+    else:
+        lines.append("- لا توجد عملات تستوفي الشروط الصارمة للصعود حالياً.")
+
+    lines.append("📉 *أفضل مرشحي الهبوط*")
+    if bearish:
+        for b in bearish[:8]:
+            lines.append(format_hierarchical_block(b))
+    else:
+        lines.append("- لا توجد عملات تستوفي الشروط الصارمة للهبوط حالياً.")
+
+    return lines
+
 def generate_report(results):
     if not results:
         print("⚠️ لا توجد إشارات.")
         return
     results.sort(key=lambda x: x['score'], reverse=True)
     lines = ["🚀 *تقرير الماسح المتكامل*\n"]
+    lines.extend(generate_hierarchical_report(results))
+    lines.append("\n🔎 *الإشارات الخام (مرجعية)*\n")
     for r in results[:10]:
         pattern_key = r['pattern']
         pattern_info = PATTERN_ARABIC.get(pattern_key, {
