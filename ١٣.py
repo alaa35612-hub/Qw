@@ -1813,36 +1813,212 @@ def _apply_family_hysteresis(symbol, candidates, best_candidate):
 
 
 def detect_acceptance_state(ref, oi_state=None, family_hint=None):
+    """
+    قبول الإشارة لا يعني فقط وجود OI أو breakout.
+    يجب وجود:
+    1) ignition
+    2) acceptance
+    3) minimum follow-through quality
+    """
+
     flow = ref.get('flow') or {}
     oi = ref.get('oi') or {}
-    oi_state = oi_state or classify_oi_price_state(
-        price_5m=safe_float(flow.get('price_change_5m'), 0.0),
-        price_15m=safe_float(flow.get('price_change_15m'), 0.0),
-        oi_5m=safe_float(oi.get('current_delta_5m'), 0.0),
-        oi_15m=safe_float(oi.get('delta_15m'), 0.0),
-    )
+    tf15 = ref.get('tf15') or {}
     micro_state = detect_micro_ignition_state(ref)
-    squeeze_override = ref.get('short_squeeze_override') or detect_short_squeeze_ignition_override(ref, ref.get('pre_ignition_pressure'))
-    trade_expansion = bool(ref.get('trade_activity_expansion'))
-    breakout = bool(ref.get('local_breakout_clear') or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone') or micro_state.get('breakout'))
+    squeeze_override = ref.get('short_squeeze_override') or detect_short_squeeze_ignition_override(
+        ref, ref.get('pre_ignition_pressure')
+    )
+
+    price_5m = safe_float(flow.get('price_change_5m'), 0.0)
+    price_15m = safe_float(flow.get('price_change_15m'), 0.0)
     buy_ratio = safe_float(flow.get('buy_ratio_recent'), 0.0)
     ofi_recent = safe_float(flow.get('ofi_recent'), 0.0)
+    trade_ratio = safe_float(
+        flow.get('trade_ratio', ref.get('recent_trade_ratio', 1.0)), 1.0
+    )
+    oi_5m = safe_float(oi.get('current_delta_5m'), 0.0)
+    oi_15m = safe_float(oi.get('delta_15m'), 0.0)
+
+    breakout = bool(
+        ref.get('local_breakout_clear')
+        or tf15.get('zone') == 'breakout_zone'
+        or micro_state.get('breakout')
+    )
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
+    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
+    hybrid_ready = bool(ref.get('hybrid_transition_ready'))
+    prepared_continuation = bool(
+        (ref.get('prepared_continuation') or {}).get('active')
+    )
+
+    oi_state = oi_state or classify_oi_price_state(
+        price_5m=price_5m,
+        price_15m=price_15m,
+        oi_5m=oi_5m,
+        oi_15m=oi_15m,
+    )
+
+    # ---------------------------
+    # رفضات صلبة
+    # ---------------------------
+    if oi_state == 'COVERING':
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'covering_state'
+        }
 
     if oi_state == 'PRICE_UP_OI_FLAT':
-        if micro_state.get('active') or squeeze_override.get('active'):
-            return {'state': 'ACCEPTED_EXCEPTION', 'confidence': 'narrow', 'reason': 'flat_oi_exception_micro_or_squeeze'}
-        return {'state': 'REJECTED', 'confidence': 'hard', 'reason': 'flat_oi_default_reject'}
+        if micro_state.get('active') or squeeze_override.get('active') or prepared_continuation:
+            return {
+                'state': 'ACCEPTED_EXCEPTION',
+                'confidence': 'narrow',
+                'reason': 'flat_oi_exception'
+            }
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'flat_oi_default_reject'
+        }
 
-    if oi_state == 'COVERING':
-        return {'state': 'REJECTED', 'confidence': 'hard', 'reason': 'covering_state'}
+    # ---------------------------
+    # نقاط البصمة
+    # ---------------------------
+    ignition_points = 0
+    if breakout:
+        ignition_points += 1
+    if micro_state.get('active'):
+        ignition_points += 1
+    if trade_expansion or trade_ratio >= 1.35:
+        ignition_points += 1
+    if buy_ratio >= 0.56 or ofi_recent >= 0.10:
+        ignition_points += 1
 
-    if oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION') and (trade_expansion or breakout or buy_ratio >= 0.53 or ofi_recent >= 0.08):
-        return {'state': 'CONFIRMED', 'confidence': 'strong', 'reason': 'oi_flow_accept'}
+    acceptance_points = 0
+    if oi_confirms:
+        acceptance_points += 1
+    if oi_nv_confirms:
+        acceptance_points += 1
+    if oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION'):
+        acceptance_points += 1
+    if price_5m >= 0.20:
+        acceptance_points += 1
 
-    if micro_state.get('active') and breakout:
-        return {'state': 'CONFIRMED', 'confidence': 'strong', 'reason': 'micro_ignition_accept'}
+    continuation_points = 0
+    if trade_ratio >= 1.20:
+        continuation_points += 1
+    if buy_ratio >= 0.54:
+        continuation_points += 1
+    if ofi_recent >= 0.08:
+        continuation_points += 1
+    if hybrid_ready or prepared_continuation:
+        continuation_points += 1
 
-    return {'state': 'WEAK', 'confidence': 'weak', 'reason': 'insufficient_acceptance'}
+    # ---------------------------
+    # منطق خاص بالعائلات
+    # ---------------------------
+    if family_hint == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
+        if ignition_points >= 2 and acceptance_points >= 1 and continuation_points >= 2:
+            return {
+                'state': 'CONFIRMED',
+                'confidence': 'strong',
+                'reason': 'flow_acceptance_confirmed'
+            }
+        if ignition_points >= 2 and acceptance_points >= 1:
+            return {
+                'state': 'WEAK',
+                'confidence': 'medium',
+                'reason': 'flow_ignited_not_held'
+            }
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'flow_not_accepted'
+        }
+
+    if family_hint == 'POSITION_LED_SQUEEZE_BUILDUP':
+        if squeeze_override.get('active') and (breakout or buy_ratio >= 0.53):
+            return {
+                'state': 'CONFIRMED',
+                'confidence': 'strong',
+                'reason': 'position_squeeze_accept'
+            }
+        if acceptance_points >= 2 and continuation_points >= 1:
+            return {
+                'state': 'CONFIRMED',
+                'confidence': 'strong',
+                'reason': 'position_acceptance_confirmed'
+            }
+        if acceptance_points >= 1:
+            return {
+                'state': 'WEAK',
+                'confidence': 'medium',
+                'reason': 'position_partial_acceptance'
+            }
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'position_not_accepted'
+        }
+
+    if family_hint == 'ACCOUNT_LED_ACCUMULATION':
+        if acceptance_points >= 2 and continuation_points >= 2:
+            return {
+                'state': 'CONFIRMED',
+                'confidence': 'strong',
+                'reason': 'account_acceptance_confirmed'
+            }
+        if acceptance_points >= 1 and prepared_continuation:
+            return {
+                'state': 'WEAK',
+                'confidence': 'medium',
+                'reason': 'account_prepared_not_confirmed'
+            }
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'account_not_accepted'
+        }
+
+    if family_hint == 'CONSENSUS_BULLISH_EXPANSION':
+        if acceptance_points >= 2 and continuation_points >= 2:
+            return {
+                'state': 'CONFIRMED',
+                'confidence': 'strong',
+                'reason': 'consensus_acceptance_confirmed'
+            }
+        if acceptance_points >= 2:
+            return {
+                'state': 'WEAK',
+                'confidence': 'medium',
+                'reason': 'consensus_acceptance_without_followthrough'
+            }
+        return {
+            'state': 'REJECTED',
+            'confidence': 'hard',
+            'reason': 'consensus_not_accepted'
+        }
+
+    # fallback عام
+    if ignition_points >= 2 and acceptance_points >= 2 and continuation_points >= 1:
+        return {
+            'state': 'CONFIRMED',
+            'confidence': 'strong',
+            'reason': 'generic_acceptance_confirmed'
+        }
+    if ignition_points >= 1 and acceptance_points >= 1:
+        return {
+            'state': 'WEAK',
+            'confidence': 'weak',
+            'reason': 'generic_partial_acceptance'
+        }
+
+    return {
+        'state': 'REJECTED',
+        'confidence': 'hard',
+        'reason': 'insufficient_acceptance'
+    }
 
 
 def detect_micro_ignition_state(ref):
@@ -1856,29 +2032,99 @@ def detect_micro_ignition_state(ref):
 
 
 def detect_failure_continuation(ref, family_hint=None, oi_state=None):
+    """
+    هذه الدالة مسؤولة عن اكتشاف:
+    - fake breakout
+    - loss of follow-through
+    - OI build بدون قبول سعري
+    - flow collapse
+    """
+
     flow = ref.get('flow') or {}
-    oi_state = oi_state or ref.get('oi_state', 'NEUTRAL')
+    oi = ref.get('oi') or {}
+    tf15 = ref.get('tf15') or {}
+    acceptance = ref.get('acceptance_state') or {}
+
+    price_5m = safe_float(flow.get('price_change_5m'), 0.0)
+    price_15m = safe_float(flow.get('price_change_15m'), 0.0)
     buy_ratio = safe_float(flow.get('buy_ratio_recent'), 0.0)
     ofi_recent = safe_float(flow.get('ofi_recent'), 0.0)
-    trade_ratio = safe_float(flow.get('trade_ratio'), 1.0)
-    trade_expansion = bool(ref.get('trade_activity_expansion'))
-    breakout = bool(ref.get('local_breakout_clear') or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone'))
-    reasons = []
-    failed = False
+    trade_ratio = safe_float(
+        flow.get('trade_ratio', ref.get('recent_trade_ratio', 1.0)), 1.0
+    )
+    oi_5m = safe_float(oi.get('current_delta_5m'), 0.0)
+    oi_15m = safe_float(oi.get('delta_15m'), 0.0)
 
+    breakout = bool(
+        ref.get('local_breakout_clear')
+        or tf15.get('zone') == 'breakout_zone'
+        or (ref.get('micro_ignition') or {}).get('breakout')
+    )
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
+    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
+    prepared_continuation = bool((ref.get('prepared_continuation') or {}).get('active'))
+    squeeze_override = bool((ref.get('short_squeeze_override') or {}).get('active'))
+
+    oi_state = oi_state or ref.get('oi_state', 'NEUTRAL')
+
+    failed = False
+    reasons = []
+
+    # 1) covering = فشل واضح
     if oi_state == 'COVERING':
         failed = True
         reasons.append('oi_covering')
-    if buy_ratio < 0.50 and ofi_recent < 0.03 and trade_ratio < 1.0:
+
+    # 2) flow collapse
+    if buy_ratio < 0.50 and ofi_recent < 0.03 and trade_ratio < 0.95:
         failed = True
         reasons.append('flow_decay')
-    if family_hint == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and not (trade_expansion and breakout):
-        failed = True
-        reasons.append('flow_breakout_lost')
-    if family_hint in ('CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION') and not ref.get('oi_nv_confirmed_expansion'):
-        reasons.append('oi_nv_weak')
 
-    return {'failed': failed, 'reason': '|'.join(reasons) if reasons else 'continuation_ok'}
+    # 3) breakout بدون قبول
+    if breakout and acceptance.get('state') not in ('CONFIRMED', 'ACCEPTED_EXCEPTION'):
+        if buy_ratio < 0.53 and ofi_recent < 0.06:
+            failed = True
+            reasons.append('breakout_without_acceptance')
+
+    # 4) OI build لكن السعر لا يقبل
+    if (oi_confirms or oi_nv_confirms or oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION')):
+        if price_5m <= 0.05 and buy_ratio < 0.52 and ofi_recent < 0.05:
+            failed = True
+            reasons.append('oi_build_without_price_acceptance')
+
+    # 5) fake flow family
+    if family_hint == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
+        if not breakout:
+            failed = True
+            reasons.append('flow_breakout_lost')
+        if not trade_expansion and trade_ratio < 1.10:
+            failed = True
+            reasons.append('flow_activity_not_confirmed')
+
+    # 6) fake position-led
+    if family_hint == 'POSITION_LED_SQUEEZE_BUILDUP':
+        if not squeeze_override and buy_ratio < 0.52 and ofi_recent < 0.05:
+            if price_5m > 0 and not oi_confirms:
+                failed = True
+                reasons.append('position_no_real_followthrough')
+
+    # 7) fake consensus/account
+    if family_hint in ('CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION'):
+        if not oi_nv_confirms and not prepared_continuation and price_15m > 0:
+            if buy_ratio < 0.52 and trade_ratio < 1.05:
+                failed = True
+                reasons.append('consensus_or_account_not_held')
+
+    # 8) late pop ثم خفوت
+    if price_5m >= 1.20 and buy_ratio < 0.53 and ofi_recent < 0.06 and trade_ratio < 1.05:
+        failed = True
+        reasons.append('late_pop_without_hold')
+
+    return {
+        'failed': bool(failed),
+        'reason': '|'.join(reasons) if reasons else 'continuation_ok'
+    }
 
 
 def detect_exhaustion_risk(ref, oi_state=None):
@@ -1897,14 +2143,65 @@ def detect_exhaustion_risk(ref, oi_state=None):
 
 
 def behavioral_memory_veto(symbol, ref, stage=None, family=None):
+    """
+    الذاكرة السلوكية يجب أن تمنع الرموز التي تعطي بدايات كاذبة بشكل متكرر،
+    لا أن تكتفي بوصفها فقط.
+    """
+
     if not ENABLE_HUMAN_MEMORY or not symbol:
         return {'veto': False, 'reason': 'memory_disabled'}
-    profile = load_symbol_outcome_profile(symbol)
+
+    profile = load_symbol_outcome_profile(symbol) or {}
     false_starts = int(profile.get('false_starts', 0) or 0)
-    success_rate = safe_float(profile.get('success_rate'), 0.0)
     evaluated = int(profile.get('evaluated_count', 0) or 0)
-    if evaluated >= 4 and false_starts >= 3 and success_rate < 0.35 and stage in ('PREPARE', 'ARMED'):
-        return {'veto': True, 'reason': 'historical_false_starts'}
+    success_rate = safe_float(profile.get('success_rate', 0.0), 0.0)
+
+    flow = ref.get('flow') or {}
+    buy_ratio = safe_float(flow.get('buy_ratio_recent', 0.0), 0.0)
+    ofi_recent = safe_float(flow.get('ofi_recent', 0.0), 0.0)
+    trade_ratio = safe_float(
+        flow.get('trade_ratio', ref.get('recent_trade_ratio', 1.0)), 1.0
+    )
+    breakout = bool(
+        ref.get('local_breakout_clear')
+        or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone')
+        or ((ref.get('micro_ignition') or {}).get('breakout'))
+    )
+    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
+    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
+    squeeze_override = bool((ref.get('short_squeeze_override') or {}).get('active'))
+    prepared_continuation = bool((ref.get('prepared_continuation') or {}).get('active'))
+
+    # لا توجد ذاكرة كافية
+    if evaluated < 3:
+        return {'veto': False, 'reason': 'memory_insufficient'}
+
+    # 1) رموز سيئة تاريخيًا جدًا
+    if evaluated >= 5 and false_starts >= 4 and success_rate <= 0.20:
+        # لا نسمح لها إلا إذا كانت البصمة الحالية قوية جدًا
+        if not (
+            breakout and
+            (buy_ratio >= 0.58 or ofi_recent >= 0.12) and
+            (trade_ratio >= 1.35 or oi_confirms or oi_nv_confirms or squeeze_override or prepared_continuation)
+        ):
+            return {'veto': True, 'reason': 'historical_false_start_symbol'}
+
+    # 2) stage مبكر + ذاكرة سيئة
+    if stage in ('WATCH', 'PREPARE'):
+        if false_starts >= 3 and success_rate < 0.35:
+            if not (
+                breakout and
+                (buy_ratio >= 0.56 or ofi_recent >= 0.10) and
+                (trade_ratio >= 1.20 or oi_confirms or squeeze_override)
+            ):
+                return {'veto': True, 'reason': 'early_stage_memory_veto'}
+
+    # 3) account/consensus الضعيفة مع ذاكرة سيئة
+    if family in ('ACCOUNT_LED_ACCUMULATION', 'CONSENSUS_BULLISH_EXPANSION'):
+        if false_starts >= 3 and success_rate < 0.40:
+            if not (oi_nv_confirms or prepared_continuation):
+                return {'veto': True, 'reason': 'weak_family_memory_veto'}
+
     return {'veto': False, 'reason': 'memory_ok'}
 
 
@@ -3844,48 +4141,160 @@ def update_signal_stability(signal_data):
 
 
 def is_signal_printable(signal_data):
+    """
+    فصل واضح بين:
+    - DISCOVERY
+    - ACTIONABILITY
+
+    لا نطبع PREPARE وARMED وTRIGGERED بنفس السهولة.
+    """
+
     if not signal_data:
         return False, 'empty_signal'
+
     stage = signal_data.get('signal_stage', 'WATCH')
+    family = signal_data.get('primary_family', 'UNKNOWN')
+    oi_state = signal_data.get('oi_state', 'NEUTRAL')
     ref = signal_data.get('reference_features') or {}
+
     acceptance = signal_data.get('acceptance_state') or ref.get('acceptance_state') or {}
     continuation = signal_data.get('continuation_state') or ref.get('continuation_state') or {}
     exhaustion = signal_data.get('exhaustion_risk') or ref.get('exhaustion_risk') or {}
     memory = signal_data.get('behavioral_memory') or ref.get('behavioral_memory') or {}
     micro = signal_data.get('micro_ignition') or ref.get('micro_ignition') or {}
-    oi_state = signal_data.get('oi_state', 'NEUTRAL')
+    squeeze = signal_data.get('short_squeeze_override') or ref.get('short_squeeze_override') or {}
+    prepared_cont = signal_data.get('prepared_continuation') or ref.get('prepared_continuation') or {}
 
+    flow = ref.get('flow') or {}
+    buy_ratio = safe_float(flow.get('buy_ratio_recent', 0.0), 0.0)
+    ofi_recent = safe_float(flow.get('ofi_recent', 0.0), 0.0)
+    trade_ratio = safe_float(
+        flow.get('trade_ratio', ref.get('recent_trade_ratio', 1.0)), 1.0
+    )
+    price_5m = safe_float(flow.get('price_change_5m', 0.0), 0.0)
+    price_15m = safe_float(flow.get('price_change_15m', 0.0), 0.0)
+
+    breakout = bool(
+        ref.get('local_breakout_clear')
+        or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone')
+        or micro.get('breakout')
+    )
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
+    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
+
+    # ---------------------------
+    # حالات block مباشرة
+    # ---------------------------
     if stage in ('FAILED_CONTINUATION', 'REJECTED') or continuation.get('failed'):
         signal_data['execution_status'] = 'BLOCKED'
+        signal_data['discovery_status'] = 'DETECTED_BUT_FAILED'
         return False, 'failed_continuation'
+
+    if memory.get('veto'):
+        signal_data['execution_status'] = 'BLOCKED'
+        signal_data['discovery_status'] = 'DETECTED_MEMORY_BLOCKED'
+        return False, 'behavioral_memory_veto'
+
     if stage == 'LATE_CHASE' or exhaustion.get('late'):
         signal_data['execution_status'] = 'LATE_CHASE'
         signal_data['discovery_status'] = 'DETECTED_LATE'
         return False, 'late_chase'
-    if memory.get('veto'):
-        signal_data['execution_status'] = 'BLOCKED'
-        return False, 'behavioral_memory_veto'
+
     if acceptance.get('state') == 'REJECTED':
         signal_data['execution_status'] = 'BLOCKED'
-        return False, f"acceptance_rejected:{acceptance.get('reason','unknown')}"
+        signal_data['discovery_status'] = 'DETECTED_NOT_ACCEPTED'
+        return False, f"acceptance_rejected:{acceptance.get('reason', 'unknown')}"
 
     if oi_state == 'PRICE_UP_OI_FLAT':
-        squeeze = signal_data.get('short_squeeze_override') or ref.get('short_squeeze_override') or {}
-        if not (micro.get('active') or squeeze.get('active')):
+        if not (micro.get('active') or squeeze.get('active') or prepared_cont.get('active')):
             signal_data['execution_status'] = 'BLOCKED'
+            signal_data['discovery_status'] = 'DETECTED_FLAT_OI'
             return False, 'flat_oi_default_block'
 
+    # ---------------------------
+    # شروط التنفيذ الحقيقي
+    # ---------------------------
+    strong_flow = (
+        buy_ratio >= 0.58 or
+        ofi_recent >= 0.12 or
+        trade_ratio >= 1.35
+    )
+
+    minimal_hold = (
+        breakout and
+        (oi_confirms or oi_nv_confirms or oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION')) and
+        (trade_expansion or trade_ratio >= 1.15) and
+        (buy_ratio >= 0.53 or ofi_recent >= 0.08 or squeeze.get('active') or prepared_cont.get('active'))
+    )
+
+    strong_hold = (
+        breakout and
+        (oi_confirms or oi_nv_confirms or squeeze.get('active')) and
+        (trade_expansion or trade_ratio >= 1.30) and
+        (buy_ratio >= 0.56 or ofi_recent >= 0.10 or prepared_cont.get('active'))
+    )
+
+    # حماية من الارتفاعات التي تبدو جيدة ثم تنعكس
+    weak_pop = (
+        price_5m > 0.80 and
+        buy_ratio < 0.54 and
+        ofi_recent < 0.06 and
+        trade_ratio < 1.05
+    )
+    if weak_pop:
+        signal_data['execution_status'] = 'DISCOVERY_ONLY'
+        signal_data['discovery_status'] = 'DETECTED_WEAK_POP'
+        return False, 'weak_pop_without_hold'
+
+    # ---------------------------
+    # stage-based execution
+    # ---------------------------
     if stage == 'TRIGGERED':
-        signal_data['execution_status'] = 'ACTIONABLE'
-        return True, 'triggered'
+        if strong_hold:
+            signal_data['execution_status'] = 'ACTIONABLE_NOW'
+            signal_data['discovery_status'] = 'DETECTED_ACTIONABLE'
+            return True, 'triggered_strong_hold'
+        signal_data['execution_status'] = 'DISCOVERY_ONLY'
+        signal_data['discovery_status'] = 'DETECTED_TRIGGERED_NOT_HELD'
+        return False, 'triggered_not_held'
+
     if stage == 'ARMED':
-        signal_data['execution_status'] = 'ACTIONABLE'
-        return True, 'armed'
+        if family == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
+            if strong_hold:
+                signal_data['execution_status'] = 'ACTIONABLE_NOW'
+                signal_data['discovery_status'] = 'DETECTED_ACTIONABLE'
+                return True, 'armed_flow_strong_hold'
+            signal_data['execution_status'] = 'DISCOVERY_ONLY'
+            signal_data['discovery_status'] = 'DETECTED_ARMED_NOT_READY'
+            return False, 'armed_flow_not_ready'
+
+        if strong_hold or (minimal_hold and strong_flow):
+            signal_data['execution_status'] = 'ACTIONABLE_NOW'
+            signal_data['discovery_status'] = 'DETECTED_ACTIONABLE'
+            return True, 'armed_held'
+        signal_data['execution_status'] = 'DISCOVERY_ONLY'
+        signal_data['discovery_status'] = 'DETECTED_ARMED_NOT_READY'
+        return False, 'armed_not_ready'
+
     if stage == 'PREPARE':
-        signal_data['execution_status'] = 'ACTIONABLE'
-        return True, 'prepare'
+        # PREPARE لا يطبع تنفيذياً إلا إذا كانت البصمة قوية جدًا
+        if family == 'POSITION_LED_SQUEEZE_BUILDUP' and squeeze.get('active') and minimal_hold and strong_flow:
+            signal_data['execution_status'] = 'ACTIONABLE_EARLY'
+            signal_data['discovery_status'] = 'DETECTED_ACTIONABLE'
+            return True, 'prepare_position_exception'
+
+        if family == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and strong_hold and micro.get('active'):
+            signal_data['execution_status'] = 'ACTIONABLE_EARLY'
+            signal_data['discovery_status'] = 'DETECTED_ACTIONABLE'
+            return True, 'prepare_flow_exception'
+
+        signal_data['execution_status'] = 'DISCOVERY_ONLY'
+        signal_data['discovery_status'] = 'DISCOVERY_PREPARE_ONLY'
+        return False, 'prepare_discovery_only'
 
     signal_data['execution_status'] = 'DISCOVERY_ONLY'
+    signal_data['discovery_status'] = 'DISCOVERY_ONLY'
     return False, 'discovery_only'
 
 
