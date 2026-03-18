@@ -3932,7 +3932,7 @@ def update_signal_stability(signal_data):
             'oi_state': oi_state,
             'stages': stage_history,
             'families': family_history,
-            'resolver_score': float(signal_data.get('reference_features', {}).get('resolver_score', signal_data.get('score', 0)) or signal_data.get('score', 0)),
+            'resolver_score': signal_data.get('reference_features', {}).get('resolver_score', ()),
             'execution_priority': current_exec,
         }
 
@@ -4090,10 +4090,10 @@ def resolve_primary_family_signal(symbol):
             family_candidate = next(c for c in candidates if c['family'] == family)
             family_resolver = family_candidate.get('resolver_score', family_strength)
             best_resolver = best.get('resolver_score', best['strength'])
-            if abs(family_resolver - best_resolver) < 0.15:
-                note = f"مؤهل وقريب جدًا من {best['family']} لكن خسر tie-break المرجعي ({family_resolver:.1f} ≈ {best_resolver:.1f})"
+            if family_resolver == best_resolver:
+                note = f"مؤهل وقريب جدًا من {best['family']} لكن خسر tie-break المرجعي (fingerprint متطابق)"
             else:
-                note = f"مؤهل لكنه أضعف من {best['family']} (resolver={family_resolver:.1f} < {best_resolver:.1f})"
+                note = f"مؤهل لكنه أضعف من {best['family']} وفق ترتيب fingerprint"
         other_family_notes[family] = note
 
     price = ref['price']
