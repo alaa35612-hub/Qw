@@ -509,13 +509,14 @@ PRIMARY_FAMILY_ARABIC = {
 }
 
 STAGE_ARABIC = {
+    "DISCOVERY_ONLY": "اكتشاف فقط",
     "WATCH": "مراقبة",
     "PREPARE": "تهيؤ",
     "ARMED": "جاهز",
     "TRIGGERED": "انطلاق",
-    "CONFIRMED": "مؤكد",
+    "FAILED_CONTINUATION": "فشل الاستمرار",
+    "LATE_CHASE": "مطاردة متأخرة",
     "REJECTED": "مرفوض",
-    "LATE": "متأخر",
 }
 
 QUALITY_ARABIC = {
@@ -581,10 +582,12 @@ def stage_transition_text_ar(prev_stage, current_stage):
         ('WATCH', 'PREPARE'): 'انتقال مراقبة ← تهيؤ',
         ('PREPARE', 'ARMED'): 'ترقية تهيؤ ← جاهز',
         ('ARMED', 'TRIGGERED'): 'ترقية جاهز ← انطلاق',
-        ('TRIGGERED', 'CONFIRMED'): 'ترقية انطلاق ← مؤكد',
         ('WATCH', 'ARMED'): 'قفزة مبكرة إلى الجاهزية',
         ('PREPARE', 'TRIGGERED'): 'قفزة مباشرة إلى الانطلاق',
-        ('ARMED', 'CONFIRMED'): 'قفزة مباشرة إلى التأكيد',
+        ('WATCH', 'DISCOVERY_ONLY'): 'تحول إلى اكتشاف فقط',
+        ('PREPARE', 'FAILED_CONTINUATION'): 'فشل استمرار بعد التهيؤ',
+        ('ARMED', 'FAILED_CONTINUATION'): 'فشل استمرار بعد الجاهزية',
+        ('TRIGGERED', 'LATE_CHASE'): 'الإشارة أصبحت مطاردة متأخرة',
     }
     return mapping.get((prev_stage, current_stage), f"تحول مرحلي: {stage_name_ar(prev_stage)} ←→ {stage_name_ar(current_stage)}")
 
@@ -606,13 +609,14 @@ def _compress_history(seq):
 
 
 _STAGE_ORDER = {
-    'WATCH': 0,
-    'PREPARE': 1,
-    'ARMED': 2,
-    'TRIGGERED': 3,
-    'CONFIRMED': 4,
-    'REJECTED': -1,
-    'LATE': -1,
+    'REJECTED': -3,
+    'FAILED_CONTINUATION': -2,
+    'LATE_CHASE': -1,
+    'DISCOVERY_ONLY': 0,
+    'WATCH': 1,
+    'PREPARE': 2,
+    'ARMED': 3,
+    'TRIGGERED': 4,
 }
 
 
@@ -646,75 +650,30 @@ def _supportive_stage_inputs(signal_data):
 
 def _path_based_stage_override(signal_data, prev_stage=None):
     stage = signal_data.get('signal_stage', 'WATCH')
-    family = signal_data.get('primary_family', 'UNKNOWN')
-    history = _compress_history(signal_data.get('stage_history') or [])
-    cycles = int(signal_data.get('persistence_cycles', 1) or 1)
-    family_persistence = int(signal_data.get('family_persistence', 1) or 1)
-    stage_persistence = int(signal_data.get('stage_persistence', 1) or 1)
-    score = safe_float(signal_data.get('score'), 0.0)
-    sup = _supportive_stage_inputs(signal_data)
+    ref = signal_data.get('reference_features') or {}
+    continuation = signal_data.get('continuation_state') or ref.get('continuation_state') or {}
+    exhaustion = signal_data.get('exhaustion_risk') or ref.get('exhaustion_risk') or {}
+    acceptance = signal_data.get('acceptance_state') or ref.get('acceptance_state') or {}
+    memory = signal_data.get('behavioral_memory') or ref.get('behavioral_memory') or {}
 
-    if stage in ('LATE', 'REJECTED'):
-        return stage, None
-    if sup['flat_oi'] and family != 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
-        return stage, None
-
-    tail2 = history[-2:] if len(history) >= 2 else history[:]
-    tail3 = history[-3:] if len(history) >= 3 else history[:]
-    path_eval = evaluate_signal_path_quality(history, stage)
-    path_quality = path_eval.get('path_quality', 'flat')
-    bad_regressions = int(path_eval.get('bad_regressions', 0) or 0)
-    whipsaws = int(path_eval.get('whipsaws', 0) or 0)
-    path_upgrade = None
-
-    prepare_pressure = (tail2 == ['WATCH', 'PREPARE']) or (history.count('PREPARE') >= 2)
-    armed_pressure = (tail2 == ['PREPARE', 'ARMED']) or (stage_persistence >= 2 and stage == 'ARMED')
-    trigger_pressure = (tail2 == ['ARMED', 'TRIGGERED']) or (stage == 'TRIGGERED' and stage_persistence >= 2)
-
-    actionable_count = sum([sup['oi_ready'], sup['flow_ready'], sup['trade_expansion'], sup['breakout'], sup['funding_ok']])
-    trigger_count = sum([sup['oi_strong'], sup['flow_strong'], sup['trade_expansion'], sup['breakout']])
-
-    if bad_regressions >= 2 or whipsaws >= 2:
-        if stage == 'TRIGGERED':
-            return 'ARMED', 'memory_armed_not_ready'
-        if stage == 'ARMED':
-            return 'PREPARE', 'memory_armed_not_ready'
-        return stage, None
-
-    if stage == 'WATCH':
-        if family_persistence >= 2 and prepare_pressure and actionable_count >= 2:
-            return 'PREPARE', 'memory_watch_to_prepare'
-        if family_persistence >= 3 and score >= 82 and actionable_count >= 3:
-            return 'PREPARE', 'memory_stable_prepare'
-
-    if stage == 'PREPARE':
-        if family_persistence >= 2 and (prepare_pressure or cycles >= 2) and actionable_count >= 3 and score >= ARMED_PRINT_MIN_SCORE and path_quality in ('good', 'strong', 'excellent'):
-            return 'ARMED', 'memory_prepare_to_armed'
-        if tail3 == ['WATCH', 'PREPARE', 'WATCH'] and actionable_count < 2:
-            return 'WATCH', 'memory_prepare_faded'
-
-    if stage == 'ARMED':
-        if (armed_pressure or cycles >= 2) and trigger_count >= 2 and score >= TRIGGER_PRINT_MIN_SCORE and path_quality in ('good', 'strong', 'excellent'):
-            return 'TRIGGERED', 'memory_armed_to_triggered'
-        if tail3 == ['PREPARE', 'ARMED', 'PREPARE'] and trigger_count < 2:
-            return 'PREPARE', 'memory_armed_not_ready'
-
-    if stage == 'TRIGGERED':
-        if trigger_pressure and sup['oi_strong'] and sup['breakout'] and sup['trade_expansion'] and cycles >= 2 and path_quality in ('strong', 'excellent'):
-            return 'CONFIRMED', 'memory_triggered_to_confirmed'
-
-    return stage, path_upgrade
+    # التاريخ لا يرقّي المرحلة وحده: فقط يخفض عند فساد البصمة الحالية
+    if continuation.get('failed'):
+        return 'FAILED_CONTINUATION', 'memory_continuation_failed'
+    if exhaustion.get('late'):
+        return 'LATE_CHASE', 'memory_late_chase'
+    if memory.get('veto'):
+        return 'DISCOVERY_ONLY', 'memory_behavioral_veto'
+    if acceptance.get('state') == 'REJECTED':
+        return 'DISCOVERY_ONLY', 'memory_acceptance_rejected'
+    return stage, None
 
 
 def _stage_upgrade_text_ar(reason, old_stage, new_stage):
     mapping = {
-        'memory_watch_to_prepare': 'الذاكرة رفعت WATCH ← PREPARE بعد تكرار البصمة',
-        'memory_stable_prepare': 'الذاكرة رفعت المرحلة إلى PREPARE بسبب الثبات',
-        'memory_prepare_to_armed': 'المسار التراكمي رفع PREPARE ← ARMED',
-        'memory_prepare_faded': 'المسار أعاد PREPARE إلى WATCH بسبب ضعف الاستمرار',
-        'memory_armed_to_triggered': 'المسار التراكمي رفع ARMED ← TRIGGERED',
-        'memory_armed_not_ready': 'المسار خفّض ARMED ← PREPARE لعدم اكتمال المحرك',
-        'memory_triggered_to_confirmed': 'المسار التراكمي رفع TRIGGERED ← CONFIRMED',
+        'memory_continuation_failed': 'المرحلة خُفّضت بسبب فشل الاستمرار الفعلي',
+        'memory_late_chase': 'المرحلة تحولت إلى مطاردة متأخرة بسبب البصمة الحالية',
+        'memory_behavioral_veto': 'الذاكرة السلوكية منعت التنفيذ الحالي',
+        'memory_acceptance_rejected': 'رفض قبول البصمة الحالية أعاد الحالة إلى اكتشاف فقط',
     }
     return mapping.get(reason, f'تعديل مرحلي من {stage_name_ar(old_stage)} إلى {stage_name_ar(new_stage)}')
 
@@ -870,120 +829,36 @@ def signal_evolution_summary_ar(signal_data):
 
 def execution_judgment_ar(signal_data):
     stage = signal_data.get('signal_stage', 'WATCH')
-    cycles = int(signal_data.get('persistence_cycles', 1) or 1)
-    score = safe_float(signal_data.get('score'), 0.0)
-    oi_state = signal_data.get('oi_state', 'NEUTRAL')
-    family = signal_data.get('primary_family', 'UNKNOWN')
-    exec_score = safe_float(signal_data.get('execution_priority_score'), safe_float(signal_data.get('execution_priority'), 0.0))
-    path_eval = signal_data.get('signal_path_eval') or evaluate_signal_path_quality(
-        signal_data.get('stage_history') or signal_data.get('stages') or [],
-        stage,
-    )
-    path_quality = path_eval.get('path_quality', 'flat')
-    noisy = int(path_eval.get('bad_regressions', 0) or 0) >= 2 or int(path_eval.get('whipsaws', 0) or 0) >= 2
-    micro_ignition = signal_data.get('micro_ignition') or (signal_data.get('reference_features') or {}).get('micro_ignition', {}) or {}
-    if signal_data.get('execution_status') == 'LATE':
-        return 'متأخرة تنفيذيًا / اكتشاف فقط'
-    if noisy and stage in ('PREPARE', 'ARMED', 'TRIGGERED', 'CONFIRMED'):
-        return 'مراقبة بسبب تذبذب المسار'
-    if stage == 'CONFIRMED' and cycles >= 2 and exec_score >= 255 and path_quality in ('excellent', 'strong'):
-        return 'تنفيذ فوري'
-    if stage == 'CONFIRMED' and exec_score >= 235 and path_quality in ('excellent', 'strong', 'good'):
-        return 'مؤكد وقابل للتنفيذ الآن'
-    if stage == 'TRIGGERED' and cycles >= 2 and exec_score >= 228 and path_quality in ('strong', 'excellent', 'good'):
-        return 'قابل للتنفيذ الآن'
+    acceptance = signal_data.get('acceptance_state') or {}
+    continuation = signal_data.get('continuation_state') or {}
+    exhaustion = signal_data.get('exhaustion_risk') or {}
+    mem = signal_data.get('behavioral_memory') or {}
+    micro = signal_data.get('micro_ignition') or {}
     if stage == 'TRIGGERED':
-        return 'متابعة لصيقة جدًا'
-    if stage == 'ARMED' and cycles >= 2 and oi_state in ('BUILDUP_EXPANSION', 'PREMOVE_BUILDUP') and exec_score >= 205:
-        return 'جاهز للتنفيذ'
+        return 'تنفيذي: TRIGGERED'
     if stage == 'ARMED':
-        return 'قريب جدًا من التنفيذ'
-    if family == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and score >= 88 and (micro_ignition.get('active') or exec_score >= 190):
-        return 'مرشح اختراق تدفقي'
-    if family == 'CONSENSUS_BULLISH_EXPANSION' and score >= 88 and oi_state in ('BUILDUP_EXPANSION', 'PREMOVE_BUILDUP') and exec_score >= 190:
-        return 'توافق قوي تحت المراقبة'
-    if stage == 'PREPARE' and cycles >= 2 and exec_score >= 175:
-        return 'قابل للتنفيذ قريبًا'
+        return 'تنفيذي: ARMED'
     if stage == 'PREPARE':
-        return 'متابعة لصيقة'
-    if score >= 84 or exec_score >= 155:
-        return 'مراقبة نشطة'
-    return 'مراقبة فقط'
+        return 'تهيئة تنفيذ: PREPARE'
+    if stage == 'LATE_CHASE' or exhaustion.get('late'):
+        return 'مرفوض تنفيذيًا: late chase'
+    if stage == 'FAILED_CONTINUATION' or continuation.get('failed'):
+        return 'مرفوض: failure continuation'
+    if mem.get('veto'):
+        return 'مرفوض: behavioral memory veto'
+    if acceptance.get('state') == 'REJECTED':
+        return 'مرفوض: acceptance rejected'
+    if micro.get('active'):
+        return 'اكتشاف فقط مع micro ignition قيد المتابعة'
+    return 'اكتشاف فقط'
 
 
 def execution_priority_score(signal_data):
+    """معزول للتشخيص فقط؛ لا يستخدم في القرار التنفيذي."""
     stage = signal_data.get('signal_stage', 'WATCH')
-    stage_weight = {
-        'CONFIRMED': 100,
-        'TRIGGERED': 80,
-        'ARMED': 58,
-        'PREPARE': 35,
-        'WATCH': 10,
-        'REJECTED': -100,
-        'LATE': -12,
-    }.get(stage, 0)
-    cycles = int(signal_data.get('persistence_cycles', 1) or 1)
-    stage_persistence = int(signal_data.get('stage_persistence', 1) or 1)
-    score = safe_float(signal_data.get('score'), 0.0)
-    oi_bonus = {
-        'BUILDUP_EXPANSION': 14,
-        'PREMOVE_BUILDUP': 10,
-        'PRICE_UP_OI_FLAT': -18,
-        'SHORT_COVERING': -12,
-        'LONG_UNWIND': -20,
-        'NEUTRAL': 0,
-        'UNKNOWN': -4,
-    }.get(signal_data.get('oi_state', 'NEUTRAL'), 0)
-    family_bonus = {
-        'FLOW_LIQUIDITY_VACUUM_BREAKOUT': 8,
-        'POSITION_LED_SQUEEZE_BUILDUP': 6,
-        'CONSENSUS_BULLISH_EXPANSION': 5,
-        'ACCOUNT_LED_ACCUMULATION': 2,
-    }.get(signal_data.get('primary_family', 'UNKNOWN'), 0)
-    evolution_bonus = 0
-    if signal_data.get('execution_trend') == 'improving':
-        evolution_bonus += 8
-    elif signal_data.get('execution_trend') == 'weakening':
-        evolution_bonus -= 8
-    if signal_data.get('family_transition'):
-        evolution_bonus += 3
-    if signal_data.get('stage_transition_upgrade'):
-        evolution_bonus += 7
-    micro_ignition = signal_data.get('micro_ignition') or (signal_data.get('reference_features') or {}).get('micro_ignition', {}) or {}
-    path_eval = signal_data.get('signal_path_eval') or evaluate_signal_path_quality(
-        signal_data.get('stage_history') or signal_data.get('stages') or [],
-        signal_data.get('signal_stage')
-    )
-    path_bonus = safe_float(path_eval.get('path_bonus'), 0.0)
-    memory_bonus = safe_float(signal_data.get('human_memory_score'), 0.0)
-    pre_ignition = signal_data.get('pre_ignition_pressure') or {}
-    squeeze_override = signal_data.get('short_squeeze_override') or {}
-    continuation = signal_data.get('prepared_continuation') or {}
-    exec_bonus = 0.0
-    exec_bonus += safe_float(pre_ignition.get('score'), 0.0) * 16.0
-    exec_bonus += safe_float(squeeze_override.get('score'), 0.0) * 18.0
-    exec_bonus += safe_float(continuation.get('score'), 0.0) * 15.0
-    if squeeze_override.get('active'):
-        exec_bonus += 6.0
-    if continuation.get('active'):
-        exec_bonus += 5.0
-    if micro_ignition.get('active'):
-        exec_bonus += 11.0
-    elif micro_ignition.get('pre_break'):
-        exec_bonus += 4.0
-    if signal_data.get('primary_family') == 'CONSENSUS_BULLISH_EXPANSION':
-        if safe_float((signal_data.get('reference_features') or {}).get('oi_nv_delta_15m', 0.0), 0.0) <= 0 and not micro_ignition.get('active'):
-            exec_bonus -= 8.0
-    if signal_data.get('primary_family') == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and safe_float((signal_data.get('reference_features') or {}).get('recent_trade_ratio', 1.0), 1.0) < FLOW_LOW_TRADE_RATIO_MIN and not micro_ignition.get('active'):
-        exec_bonus -= 10.0
-    if pre_ignition.get('pressure_building'):
-        exec_bonus += 4.0
-    if signal_data.get('flat_oi_context', {}).get('label') == 'salvageable':
-        exec_bonus += 4.0
-    if signal_data.get('execution_status') == 'LATE':
-        exec_bonus -= 25.0
-    return stage_weight + score + oi_bonus + family_bonus + (cycles * 7) + (stage_persistence * 4) + evolution_bonus + path_bonus + memory_bonus + exec_bonus
+    return {'TRIGGERED': 4, 'ARMED': 3, 'PREPARE': 2, 'WATCH': 1}.get(stage, 0)
 
+TRADING_SYMBOLS_SET = set()
 TRADING_SYMBOLS_SET = set()
 SPOT_TRADING_SYMBOLS_SET = None
 SIGNAL_STABILITY = {}
@@ -1879,22 +1754,23 @@ def classify_signal_stage(price_5m=0.0, price_15m=0.0, oi_5m=0.0, oi_15m=0.0, fu
     oi_state = classify_oi_price_state(price_5m=price_5m, price_15m=price_15m, oi_5m=oi_5m, oi_15m=oi_15m)
     funding_abs = abs(funding_rate) if funding_rate is not None else 0.0
     if oi_state == 'COVERING' or price_5m >= 3.8 or price_15m >= 8.5 or funding_abs >= 0.08:
-        return 'LATE'
+        return 'LATE_CHASE'
     if oi_state == 'BUILDUP_EXPANSION' and buy_ratio >= 0.58 and 0.4 <= price_15m <= 3.5:
         return 'TRIGGERED'
     if oi_state == 'PREMOVE_BUILDUP' and buy_ratio >= 0.54:
         return 'ARMED'
     if oi_state == 'PREMOVE_BUILDUP':
         return 'PREPARE'
-    return 'WATCH'
+    return 'DISCOVERY_ONLY'
 
 
 def _stage_rank(stage):
-    order = {'REJECTED': -2, 'LATE': -1, 'WATCH': 0, 'PREPARE': 1, 'ARMED': 2, 'TRIGGERED': 3, 'CONFIRMED': 4}
+    order = {'REJECTED': -3, 'FAILED_CONTINUATION': -2, 'LATE_CHASE': -1, 'DISCOVERY_ONLY': 0, 'WATCH': 1, 'PREPARE': 2, 'ARMED': 3, 'TRIGGERED': 4}
     return order.get(stage, 0)
 
 
 def _apply_family_hysteresis(symbol, candidates, best_candidate):
+    """Family lock لا يتغلب على فساد البصمة الحالية."""
     if not symbol or not candidates or not best_candidate:
         return best_candidate
     with SIGNAL_STABILITY_LOCK:
@@ -1904,208 +1780,194 @@ def _apply_family_hysteresis(symbol, candidates, best_candidate):
     prev_family = prev.get('family')
     if not prev_family or prev_family == best_candidate.get('family'):
         return best_candidate
-    stable_cycles = int(prev.get('cycles', 0) or 0)
-    if stable_cycles < 2:
-        return best_candidate
     prev_candidate = next((c for c in candidates if c.get('family') == prev_family), None)
-    if not prev_candidate or not prev_candidate.get('eligible'):
+    if not prev_candidate:
         return best_candidate
-    best_score = float(best_candidate.get('resolver_score', best_candidate.get('strength', 0.0)) or 0.0)
-    prev_score = float(prev_candidate.get('resolver_score', prev_candidate.get('strength', 0.0)) or 0.0)
-    if (best_score - prev_score) > FAMILY_LOCK_SCORE_MARGIN:
+
+    prev_ref = prev_candidate.get('_reference_ref', {})
+    prev_stage, _ = classify_signal_stage_from_reference(prev_ref, family_hint=prev_family)
+    best_ref = best_candidate.get('_reference_ref', {})
+    best_stage, _ = classify_signal_stage_from_reference(best_ref, family_hint=best_candidate.get('family'))
+
+    prev_failure = (prev_ref.get('continuation_state') or {}).get('failed') or (prev_ref.get('exhaustion_risk') or {}).get('risky')
+    if prev_failure:
         return best_candidate
-    prev_stage, _ = classify_signal_stage_from_reference(prev_candidate.get('_reference_ref', {}), family_hint=prev_family)
-    best_stage, _ = classify_signal_stage_from_reference(best_candidate.get('_reference_ref', {}), family_hint=best_candidate.get('family'))
-    if (_stage_rank(best_stage) - _stage_rank(prev_stage)) > FAMILY_LOCK_MAX_STAGE_DOWNGRADE:
+    if _stage_rank(best_stage) > _stage_rank(prev_stage):
         return best_candidate
+
     locked = dict(prev_candidate)
-    locked['resolver_score'] = max(prev_score, best_score - 0.25)
-    locked['why_selected'] = (locked.get('why_selected', '') + ' | تم تفعيل family lock/hysteresis للحفاظ على اتساق العائلة عبر الدورات').strip(' |')
+    locked['why_selected'] = (locked.get('why_selected', '') + ' | family lock حافظ على العائلة بدون تجاوز فشل البصمة الحالية').strip(' |')
     return locked
 
 
-def classify_signal_stage_from_reference(ref, family_hint=None):
-    """تصنيف المرحلة التنفيذية من بصمة العائلة نفسها مع مسارات ignition وmemory."""
+def detect_acceptance_state(ref, oi_state=None, family_hint=None):
     flow = ref.get('flow') or {}
-    top = ref.get('top') or {}
     oi = ref.get('oi') or {}
-    funding_context = ref.get('funding_context', 'FUNDING_UNINFORMATIVE')
-    liquidity = ref.get('liquidity') or {}
-    tf15 = ref.get('tf15') or {}
-    compression = ref.get('compression') or {}
-
-    symbol = ref.get('symbol')
-    memory = ref.get('pre_ignition_pressure') or compute_pre_ignition_pressure(symbol)
-    flat_oi_context = classify_price_up_oi_flat_context(ref)
-    squeeze_override = detect_short_squeeze_ignition_override(ref, memory)
-    continuation = detect_prepared_continuation(ref, memory)
-    ref['pre_ignition_pressure'] = memory
-    ref['flat_oi_context'] = flat_oi_context
-    ref['short_squeeze_override'] = squeeze_override
-    ref['prepared_continuation'] = continuation
-
-    price_5m = safe_float(flow.get('price_change_5m'), 0.0)
-    price_15m = safe_float(flow.get('price_change_15m'), 0.0)
-    oi_5m = safe_float(oi.get('current_delta_5m'), 0.0)
-    oi_15m = safe_float(oi.get('delta_15m'), 0.0)
+    oi_state = oi_state or classify_oi_price_state(
+        price_5m=safe_float(flow.get('price_change_5m'), 0.0),
+        price_15m=safe_float(flow.get('price_change_15m'), 0.0),
+        oi_5m=safe_float(oi.get('current_delta_5m'), 0.0),
+        oi_15m=safe_float(oi.get('delta_15m'), 0.0),
+    )
+    micro_state = detect_micro_ignition_state(ref)
+    squeeze_override = ref.get('short_squeeze_override') or detect_short_squeeze_ignition_override(ref, ref.get('pre_ignition_pressure'))
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    breakout = bool(ref.get('local_breakout_clear') or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone') or micro_state.get('breakout'))
     buy_ratio = safe_float(flow.get('buy_ratio_recent'), 0.0)
     ofi_recent = safe_float(flow.get('ofi_recent'), 0.0)
-    trade_ratio = safe_float(flow.get('trade_ratio'), 0.0)
-    pos_delta = safe_float(top.get('pos_delta'), 0.0)
-    acc_delta = safe_float(top.get('acc_delta'), 0.0)
-    consensus_alignment = safe_float(ref.get('consensus_alignment'), 0.0)
-    hybrid_transition_strength = safe_float(ref.get('hybrid_transition_strength'), 0.0)
-    global_ls_ratio = safe_float(ref.get('global_ls_ratio_now'), 1.0)
-    micro_ignition = ref.get('micro_ignition') or detect_micro_ignition(symbol, ref)
-    ref['micro_ignition'] = micro_ignition
 
-    oi_state = classify_oi_price_state(price_5m=price_5m, price_15m=price_15m, oi_5m=oi_5m, oi_15m=oi_15m)
-
-    breakout_ready = bool(ref.get('local_breakout_clear') or tf15.get('zone') == 'breakout_zone' or micro_ignition.get('breakout'))
-    trade_expansion = bool(ref.get('trade_activity_expansion'))
-    compression_ready = bool(compression.get('bb_percentile', 100) <= 35 or compression.get('atr_ratio', 1.0) <= 0.88)
-    vacuum = bool(liquidity.get('vacuum'))
-    position_leads = bool(ref.get('position_leads'))
-    account_leads = bool(ref.get('account_leads'))
-    short_squeeze_path = bool(ref.get('short_squeeze_inflexion'))
-    hybrid_transition_ready = bool(ref.get('hybrid_transition_ready'))
-    crowded_short = ref.get('ratio_conflict_state') == 'SHORT_SIDE_CROWDING'
-    basis_supportive = bool(ref.get('basis_supportive', True))
-    funding_supportive = funding_context in ('FUNDING_QUIET_REGIME', 'FUNDING_NEGATIVE_IMPROVING', 'FUNDING_NON_CROWDED')
-    crowded_or_bad = funding_context not in ('FUNDING_QUIET_REGIME', 'FUNDING_NEGATIVE_IMPROVING', 'FUNDING_NON_CROWDED', 'FUNDING_UNINFORMATIVE')
-
-    oi_supportive = oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION') or (short_squeeze_path and oi_state != 'COVERING')
-    oi_strong = oi_state == 'BUILDUP_EXPANSION'
-    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
-    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
-
-    flow_actionable = buy_ratio >= MIN_BUY_RATIO_FLOW_ACTIONABLE or ofi_recent >= MIN_OFI_FLOW_ACTIONABLE or trade_ratio >= 1.25 or micro_ignition.get('active')
-    flow_strong = buy_ratio >= MIN_BUY_RATIO_FLOW_STRONG or ofi_recent >= MIN_OFI_FLOW_STRONG or trade_ratio >= 1.80 or micro_ignition.get('active')
-    sequence_ready = (
-        (position_leads and pos_delta > -0.005) or
-        (account_leads and acc_delta > -0.005) or
-        consensus_alignment >= 0.75 or
-        hybrid_transition_ready
-    )
-    sequence_strong = (
-        (position_leads and pos_delta >= 0.01) or
-        (account_leads and acc_delta >= 0.01) or
-        consensus_alignment >= 0.95 or
-        hybrid_transition_strength >= 0.22
-    )
-
-    price_extended_soft = price_5m > PRETRIGGER_MAX_PRICE_5M or price_15m > PRETRIGGER_MAX_PRICE_15M
-    price_extended_hard = price_5m > FLOW_PRICE_CHASE_HARD_MAX or price_15m > 6.0
-    price_not_extended = not price_extended_soft
-    late_or_chased = bool(ref.get('late_or_chased')) or price_extended_hard
-    flat_oi_penalty = oi_state == 'PRICE_UP_OI_FLAT'
+    if oi_state == 'PRICE_UP_OI_FLAT':
+        if micro_state.get('active') or squeeze_override.get('active'):
+            return {'state': 'ACCEPTED_EXCEPTION', 'confidence': 'narrow', 'reason': 'flat_oi_exception_micro_or_squeeze'}
+        return {'state': 'REJECTED', 'confidence': 'hard', 'reason': 'flat_oi_default_reject'}
 
     if oi_state == 'COVERING':
-        return 'REJECTED', oi_state
-    if late_or_chased and family_hint != 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and not continuation.get('active'):
-        if micro_ignition.get('active') or squeeze_override.get('active') or breakout_ready or trade_expansion:
-            return 'TRIGGERED', oi_state
-        if price_15m >= max(PRETRIGGER_MAX_PRICE_15M, 6.0):
-            return 'LATE', oi_state
-    if ref.get('hard_bearish_conflict'):
-        return 'REJECTED', oi_state
-    if crowded_or_bad and family_hint in ('ACCOUNT_LED_ACCUMULATION', 'CONSENSUS_BULLISH_EXPANSION') and not continuation.get('active'):
-        return 'REJECTED', oi_state
+        return {'state': 'REJECTED', 'confidence': 'hard', 'reason': 'covering_state'}
 
-    if squeeze_override.get('active') and family_hint in ('POSITION_LED_SQUEEZE_BUILDUP', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'ACCOUNT_LED_ACCUMULATION', None):
-        if flow_strong or trade_expansion or breakout_ready:
-            return ('TRIGGERED' if oi_supportive or oi_confirms else 'ARMED'), oi_state
-    if continuation.get('active') and family_hint in ('CONSENSUS_BULLISH_EXPANSION', 'FLOW_LIQUIDITY_VACUUM_BREAKOUT', 'ACCOUNT_LED_ACCUMULATION', None):
-        if oi_confirms or oi_nv_confirms or trade_expansion or micro_ignition.get('active'):
-            return ('TRIGGERED' if (breakout_ready or micro_ignition.get('active')) else 'ARMED'), oi_state
+    if oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION') and (trade_expansion or breakout or buy_ratio >= 0.53 or ofi_recent >= 0.08):
+        return {'state': 'CONFIRMED', 'confidence': 'strong', 'reason': 'oi_flow_accept'}
 
-    if family_hint == 'POSITION_LED_SQUEEZE_BUILDUP':
-        if not position_leads and not short_squeeze_path:
-            return 'REJECTED', oi_state
-        if pos_delta < acc_delta - 0.003 and not squeeze_override.get('active'):
-            return 'REJECTED', oi_state
-        if not oi_supportive and not crowded_short and not continuation.get('active'):
-            return 'REJECTED', oi_state
-        if flat_oi_penalty:
-            if flat_oi_context['label'] == 'salvageable' and (crowded_short or squeeze_override.get('active')):
-                return 'ARMED', oi_state
-            return 'WATCH', oi_state
-        if oi_strong and breakout_ready and (flow_actionable or crowded_short) and (oi_confirms or trade_expansion):
-            return 'TRIGGERED', oi_state
-        if oi_supportive and sequence_strong and funding_supportive and price_not_extended and (compression_ready or breakout_ready or trade_expansion or memory.get('pressure_building')):
-            return 'ARMED', oi_state
-        if oi_state == 'PREMOVE_BUILDUP' and oi_supportive and sequence_ready and funding_supportive and (compression_ready or crowded_short or memory.get('pressure_building')) and price_not_extended:
-            return 'PREPARE', oi_state
-        return 'WATCH', oi_state
+    if micro_state.get('active') and breakout:
+        return {'state': 'CONFIRMED', 'confidence': 'strong', 'reason': 'micro_ignition_accept'}
 
-    if family_hint == 'ACCOUNT_LED_ACCUMULATION':
-        penalties = 0
-        penalties += 1 if not account_leads and not short_squeeze_path else 0
-        penalties += 1 if buy_ratio < 0.51 else 0
-        penalties += 1 if not oi_nv_confirms else 0
-        penalties += 1 if not trade_expansion else 0
-        penalties += 1 if not basis_supportive else 0
-        penalties += 1 if global_ls_ratio > 1.95 else 0
-        penalties += 1 if price_15m > 3.2 and not breakout_ready else 0
-        if penalties >= 5 and not squeeze_override.get('active'):
-            return 'REJECTED', oi_state
-        if flat_oi_penalty and flat_oi_context['label'] != 'salvageable':
-            return 'WATCH', oi_state
-        if breakout_ready and trade_expansion and flow_actionable and (oi_supportive or squeeze_override.get('active')) and (oi_nv_confirms or oi_confirms or memory.get('pressure_building')):
-            return 'TRIGGERED', oi_state
-        if account_leads and oi_supportive and funding_supportive and basis_supportive and (oi_nv_confirms or trade_expansion or memory.get('pressure_building')) and price_not_extended and penalties <= 2:
-            return 'ARMED', oi_state
-        if (account_leads or safe_float(top.get('acc_now'), 0.0) >= 1.22) and funding_supportive and basis_supportive and compression_ready and price_not_extended and penalties <= 3:
-            return 'PREPARE', oi_state
-        return 'WATCH', oi_state
+    return {'state': 'WEAK', 'confidence': 'weak', 'reason': 'insufficient_acceptance'}
 
-    if family_hint == 'CONSENSUS_BULLISH_EXPANSION':
-        if consensus_alignment < 0.75 and not hybrid_transition_ready and not continuation.get('active'):
-            return 'REJECTED', oi_state
-        if not oi_supportive and not continuation.get('active'):
-            return 'REJECTED', oi_state
-        if flat_oi_penalty and flat_oi_context['label'] != 'salvageable':
-            return 'WATCH', oi_state
-        if oi_strong and oi_nv_confirms and consensus_alignment >= 0.95 and ((breakout_ready and trade_expansion) or micro_ignition.get('active')):
-            return 'CONFIRMED', oi_state
-        if continuation.get('active') and (trade_expansion or breakout_ready or micro_ignition.get('active')):
-            return 'TRIGGERED', oi_state
-        if (oi_confirms or oi_strong or memory.get('pressure_building')) and (consensus_alignment >= 0.85 or hybrid_transition_strength >= 0.22) and (((flow_actionable or micro_ignition.get('active')) and (trade_expansion or micro_ignition.get('active'))) or breakout_ready):
-            return 'TRIGGERED', oi_state
-        if oi_supportive and sequence_ready and funding_supportive and not price_extended_soft and (trade_expansion or compression_ready or memory.get('pressure_building') or micro_ignition.get('pre_break')):
-            return 'ARMED', oi_state
-        if memory.get('pressure_building') and funding_supportive and not price_extended_soft:
-            return 'PREPARE', oi_state
-        return 'WATCH', oi_state
 
-    if family_hint == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
-        if not vacuum or not breakout_ready:
-            if continuation.get('active') and breakout_ready:
-                return 'ARMED', oi_state
-            return 'REJECTED', oi_state
-        if trade_ratio < FLOW_LOW_TRADE_RATIO_MIN and not continuation.get('active') and not micro_ignition.get('active'):
-            return 'WATCH', oi_state
-        if not trade_expansion and not continuation.get('active') and not micro_ignition.get('active'):
-            return 'WATCH', oi_state
-        if not flow_actionable and not continuation.get('active') and not micro_ignition.get('active'):
-            return 'WATCH', oi_state
-        if flat_oi_penalty and flat_oi_context['label'] != 'salvageable' and not squeeze_override.get('active'):
-            return 'WATCH', oi_state
-        if flow_strong and ((trade_ratio >= 1.4 and (trade_expansion or micro_ignition.get('active'))) or micro_ignition.get('active')) and (oi_supportive or oi_confirms or continuation.get('active')) and price_15m <= max(PRETRIGGER_MAX_PRICE_15M, 4.5):
-            return ('CONFIRMED' if (oi_strong and micro_ignition.get('active')) else 'TRIGGERED'), oi_state
-        if flow_actionable and (trade_expansion or continuation.get('active') or micro_ignition.get('active')) and breakout_ready and price_15m <= max(PRETRIGGER_MAX_PRICE_15M, 4.8):
-            return 'ARMED', oi_state
-        if (memory.get('pressure_building') or micro_ignition.get('pre_break')) and breakout_ready and not price_extended_soft:
-            return 'PREPARE', oi_state
-        return 'WATCH', oi_state
+def detect_micro_ignition_state(ref):
+    micro = ref.get('micro_ignition') or detect_micro_ignition(ref.get('symbol'), ref)
+    return {
+        'active': bool(micro.get('active')),
+        'pre_break': bool(micro.get('pre_break')),
+        'breakout': bool(micro.get('breakout')),
+        'reason': micro.get('reason', ''),
+    }
 
-    if squeeze_override.get('active') and (breakout_ready or vacuum):
+
+def detect_failure_continuation(ref, family_hint=None, oi_state=None):
+    flow = ref.get('flow') or {}
+    oi_state = oi_state or ref.get('oi_state', 'NEUTRAL')
+    buy_ratio = safe_float(flow.get('buy_ratio_recent'), 0.0)
+    ofi_recent = safe_float(flow.get('ofi_recent'), 0.0)
+    trade_ratio = safe_float(flow.get('trade_ratio'), 1.0)
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    breakout = bool(ref.get('local_breakout_clear') or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone'))
+    reasons = []
+    failed = False
+
+    if oi_state == 'COVERING':
+        failed = True
+        reasons.append('oi_covering')
+    if buy_ratio < 0.50 and ofi_recent < 0.03 and trade_ratio < 1.0:
+        failed = True
+        reasons.append('flow_decay')
+    if family_hint == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT' and not (trade_expansion and breakout):
+        failed = True
+        reasons.append('flow_breakout_lost')
+    if family_hint in ('CONSENSUS_BULLISH_EXPANSION', 'ACCOUNT_LED_ACCUMULATION') and not ref.get('oi_nv_confirmed_expansion'):
+        reasons.append('oi_nv_weak')
+
+    return {'failed': failed, 'reason': '|'.join(reasons) if reasons else 'continuation_ok'}
+
+
+def detect_exhaustion_risk(ref, oi_state=None):
+    flow = ref.get('flow') or {}
+    oi_state = oi_state or ref.get('oi_state', 'NEUTRAL')
+    price_5m = safe_float(flow.get('price_change_5m'), 0.0)
+    price_15m = safe_float(flow.get('price_change_15m'), 0.0)
+    buy_ratio = safe_float(flow.get('buy_ratio_recent'), 0.0)
+    ofi_recent = safe_float(flow.get('ofi_recent'), 0.0)
+    late = bool(ref.get('late_or_chased')) or price_5m > FLOW_PRICE_CHASE_HARD_MAX or price_15m > 6.0
+    overheat = price_15m > PRETRIGGER_MAX_PRICE_15M and buy_ratio < 0.54 and ofi_recent < 0.08
+    risky = late or overheat or oi_state == 'PRICE_UP_OI_FLAT'
+    if oi_state == 'PRICE_UP_OI_FLAT' and (ref.get('micro_ignition') or {}).get('active'):
+        risky = False
+    return {'risky': bool(risky), 'late': bool(late), 'reason': 'late_or_overheat' if risky else 'risk_ok'}
+
+
+def behavioral_memory_veto(symbol, ref, stage=None, family=None):
+    if not ENABLE_HUMAN_MEMORY or not symbol:
+        return {'veto': False, 'reason': 'memory_disabled'}
+    profile = load_symbol_outcome_profile(symbol)
+    false_starts = int(profile.get('false_starts', 0) or 0)
+    success_rate = safe_float(profile.get('success_rate'), 0.0)
+    evaluated = int(profile.get('evaluated_count', 0) or 0)
+    if evaluated >= 4 and false_starts >= 3 and success_rate < 0.35 and stage in ('PREPARE', 'ARMED'):
+        return {'veto': True, 'reason': 'historical_false_starts'}
+    return {'veto': False, 'reason': 'memory_ok'}
+
+
+def fingerprint_quality_rank(ref, family, stage):
+    flow = ref.get('flow') or {}
+    micro = ref.get('micro_ignition') or {}
+    acceptance = ref.get('acceptance_state') or {}
+    continuation = ref.get('continuation_state') or {}
+    exhaustion = ref.get('exhaustion_risk') or {}
+    return (
+        1 if stage == 'TRIGGERED' else 0,
+        1 if stage == 'ARMED' else 0,
+        1 if stage == 'PREPARE' else 0,
+        1 if acceptance.get('state') in ('CONFIRMED', 'ACCEPTED_EXCEPTION') else 0,
+        0 if continuation.get('failed') else 1,
+        0 if exhaustion.get('risky') else 1,
+        1 if micro.get('active') else 0,
+        1 if ref.get('oi_nv_confirmed_expansion') else 0,
+        1 if ref.get('oi_confirmed_expansion') else 0,
+        1 if ref.get('trade_activity_expansion') else 0,
+        1 if ref.get('local_breakout_clear') else 0,
+        round(safe_float(flow.get('buy_ratio_recent'), 0.0), 4),
+        round(safe_float(flow.get('ofi_recent'), 0.0), 4),
+        round(safe_float(flow.get('trade_ratio'), 1.0), 4),
+    )
+
+
+def classify_signal_stage_from_reference(ref, family_hint=None):
+    """تصنيف مرحلي مبني فقط على البصمة الحالية (Discovery vs Actionability)."""
+    flow = ref.get('flow') or {}
+    oi = ref.get('oi') or {}
+    symbol = ref.get('symbol')
+
+    ref['micro_ignition'] = ref.get('micro_ignition') or detect_micro_ignition(symbol, ref) or {}
+    ref['pre_ignition_pressure'] = ref.get('pre_ignition_pressure') or compute_pre_ignition_pressure(symbol)
+    ref['short_squeeze_override'] = ref.get('short_squeeze_override') or detect_short_squeeze_ignition_override(ref, ref.get('pre_ignition_pressure'))
+    ref['prepared_continuation'] = ref.get('prepared_continuation') or detect_prepared_continuation(ref, ref.get('pre_ignition_pressure'))
+    ref['flat_oi_context'] = classify_price_up_oi_flat_context(ref)
+
+    oi_state = classify_oi_price_state(
+        price_5m=safe_float(flow.get('price_change_5m'), 0.0),
+        price_15m=safe_float(flow.get('price_change_15m'), 0.0),
+        oi_5m=safe_float(oi.get('current_delta_5m'), 0.0),
+        oi_15m=safe_float(oi.get('delta_15m'), 0.0),
+    )
+    ref['oi_state'] = oi_state
+
+    acceptance = detect_acceptance_state(ref, oi_state=oi_state, family_hint=family_hint)
+    continuation = detect_failure_continuation(ref, family_hint=family_hint, oi_state=oi_state)
+    exhaustion = detect_exhaustion_risk(ref, oi_state=oi_state)
+    micro_state = detect_micro_ignition_state(ref)
+    memory_veto = behavioral_memory_veto(symbol, ref, family=family_hint)
+    ref['acceptance_state'] = acceptance
+    ref['continuation_state'] = continuation
+    ref['exhaustion_risk'] = exhaustion
+    ref['micro_ignition_state'] = micro_state
+    ref['behavioral_memory'] = memory_veto
+
+    breakout = bool(ref.get('local_breakout_clear') or ((ref.get('tf15') or {}).get('zone') == 'breakout_zone') or micro_state.get('breakout'))
+    trade_expansion = bool(ref.get('trade_activity_expansion'))
+    flow_ready = safe_float(flow.get('buy_ratio_recent'), 0.0) >= MIN_BUY_RATIO_FLOW_ACTIONABLE or safe_float(flow.get('ofi_recent'), 0.0) >= MIN_OFI_FLOW_ACTIONABLE
+
+    if continuation.get('failed'):
+        return 'FAILED_CONTINUATION', oi_state
+    if acceptance.get('state') == 'REJECTED':
+        return 'DISCOVERY_ONLY', oi_state
+    if exhaustion.get('late'):
+        return 'LATE_CHASE', oi_state
+    if memory_veto.get('veto'):
+        return 'DISCOVERY_ONLY', oi_state
+    if acceptance.get('state') in ('CONFIRMED', 'ACCEPTED_EXCEPTION') and breakout and (micro_state.get('active') or (trade_expansion and flow_ready)):
         return 'TRIGGERED', oi_state
-    if continuation.get('active') and breakout_ready:
+    if acceptance.get('state') in ('CONFIRMED', 'ACCEPTED_EXCEPTION') and (trade_expansion or breakout or micro_state.get('pre_break')):
         return 'ARMED', oi_state
-    if oi_strong and sequence_strong and breakout_ready and flow_strong:
-        return 'TRIGGERED', oi_state
-    if oi_supportive and sequence_ready and funding_supportive and not price_extended_soft:
+    if acceptance.get('state') in ('CONFIRMED', 'WEAK') and (flow_ready or ref.get('prepared_continuation', {}).get('active')):
         return 'PREPARE', oi_state
     return 'WATCH', oi_state
 
@@ -3825,7 +3687,7 @@ def detect_position_led_squeeze_buildup(ref):
         f"مع OI={'مؤكد' if ref['oi_confirmed_expansion'] else 'غير مؤكد'} "
         f"وFunding={ref['funding_context']}"
     )
-    eligible = strength >= 64 and (ref['position_leads'] or ref.get('short_squeeze_inflexion')) and safe_float(top.get('pos_delta'), 0.0) >= -0.004 and (ref['oi_confirmed_expansion'] or ref.get('short_squeeze_inflexion')) and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
+    eligible = (ref['position_leads'] or ref.get('short_squeeze_inflexion')) and safe_float(top.get('pos_delta'), 0.0) >= -0.004 and (ref['oi_confirmed_expansion'] or ref.get('short_squeeze_inflexion')) and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
     why_not_selected = ' | '.join(unmet) if unmet else 'الشروط الجوهرية مكتملة'
     return _build_family_result('POSITION_LED_SQUEEZE_BUILDUP', eligible, strength, decisive_feature, why_selected, why_not_selected)
 
@@ -3882,7 +3744,7 @@ def detect_account_led_accumulation(ref):
         f"L.S Acco يقود بينما L.S Posit أبطأ، والسعر بدأ قبل اكتمال توسع المراكز، "
         f"مع Basis={'neutral' if ref['basis_supportive'] else 'hostile'} وFunding={ref['funding_context']}"
     )
-    eligible = strength >= 64 and (ref['account_leads'] or ref.get('short_squeeze_inflexion')) and safe_float(top.get('acc_delta'), 0.0) >= -0.004 and (ref['oi_confirmed_expansion'] or ref.get('short_squeeze_inflexion')) and ref['basis_supportive'] and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
+    eligible = (ref['account_leads'] or ref.get('short_squeeze_inflexion')) and safe_float(top.get('acc_delta'), 0.0) >= -0.004 and (ref['oi_confirmed_expansion'] or ref.get('short_squeeze_inflexion')) and ref['basis_supportive'] and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
     why_not_selected = ' | '.join(unmet) if unmet else 'الشروط الجوهرية مكتملة'
     return _build_family_result('ACCOUNT_LED_ACCUMULATION', eligible, strength, decisive_feature, why_selected, why_not_selected)
 
@@ -3940,7 +3802,7 @@ def detect_consensus_bullish_expansion(ref):
         f"Posit وAcco وL.S Ratio يتحركون معًا في توسع منظم، "
         f"والـ OI/OI NV يؤكدان التمدد، وFunding={ref['funding_context']}"
     )
-    eligible = strength >= 68 and (ref['consensus_alignment'] >= 0.75 or ref.get('hybrid_transition_ready')) and ref['oi_confirmed_expansion'] and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
+    eligible = (ref['consensus_alignment'] >= 0.75 or ref.get('hybrid_transition_ready')) and ref['oi_confirmed_expansion'] and _funding_is_supportive(ref) and _base_uptrend_not_hostile(ref)
     why_not_selected = ' | '.join(unmet) if unmet else 'الشروط الجوهرية مكتملة'
     return _build_family_result('CONSENSUS_BULLISH_EXPANSION', eligible, strength, decisive_feature, why_selected, why_not_selected)
 
@@ -3992,40 +3854,19 @@ def detect_flow_liquidity_vacuum_breakout(ref):
         f"التدفق هو العامل الحاسم: imbalance قوي + trade activity expansion + breakout واضح "
         f"مع تمويل غير عدائي ورفض الاعتماد على textbook candle"
     )
-    eligible = strength >= 68 and (taker_imbalance >= 0.07 or safe_float(flow.get('buy_ratio_recent'), 0.0) >= 0.58) and ref['trade_activity_expansion'] and (ref['local_breakout_clear'] or ref['tf15'].get('zone') == 'breakout_zone') and _base_uptrend_not_hostile(ref)
+    eligible = (taker_imbalance >= 0.07 or safe_float(flow.get('buy_ratio_recent'), 0.0) >= 0.58) and ref['trade_activity_expansion'] and (ref['local_breakout_clear'] or ref['tf15'].get('zone') == 'breakout_zone') and _base_uptrend_not_hostile(ref)
     why_not_selected = ' | '.join(unmet) if unmet else 'الشروط الجوهرية مكتملة'
     return _build_family_result('FLOW_LIQUIDITY_VACUUM_BREAKOUT', eligible, strength, decisive_feature, why_selected, why_not_selected)
 
 
 def _resolver_priority_score(candidate, ref):
     family = candidate['family']
-    score = float(candidate.get('strength', 0.0))
-    flow = ref['flow']
-    top = ref['top']
+    stage = ref.get('signal_stage', 'WATCH')
+    return fingerprint_quality_rank(ref, family, stage)
 
-    if family == 'POSITION_LED_SQUEEZE_BUILDUP':
-        score += min(6.0, ref['position_led_divergence'] * 12.0)
-        score += 2.0 if ref['ratio_conflict_state'] == 'POSITION_LED' else 0.0
-        score += 1.0 if safe_float(top.get('pos_delta'), 0.0) > 0 else 0.0
-    elif family == 'ACCOUNT_LED_ACCUMULATION':
-        score += min(6.0, ref['account_led_divergence'] * 12.0)
-        score += 2.0 if ref['ratio_conflict_state'] == 'ACCOUNT_LED' else 0.0
-        score += 1.0 if safe_float(top.get('acc_delta'), 0.0) > 0 else 0.0
-    elif family == 'CONSENSUS_BULLISH_EXPANSION':
-        score += ref['consensus_alignment'] * 8.0
-        score += 2.0 if ref['oi_nv_confirmed_expansion'] else 0.0
-        score += 1.0 if ref['ratio_conflict_state'] == 'CONSENSUS' else 0.0
-    elif family == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
-        score += min(5.0, max(0.0, safe_float(flow.get('buy_ratio_recent'), 0.0) - 0.5) * 40.0)
-        score += min(4.0, max(0.0, safe_float(flow.get('ofi_recent'), 0.0)) * 20.0)
-        score += 2.0 if ref['liquidity'].get('vacuum') == 1 else 0.0
 
-    if ref['funding_context'] == 'FUNDING_NEGATIVE_IMPROVING':
-        score += 1.0 if family in ('POSITION_LED_SQUEEZE_BUILDUP', 'ACCOUNT_LED_ACCUMULATION') else 0.0
-    if ref['funding_context'] == 'FUNDING_QUIET_REGIME':
-        score += 1.0 if family in ('CONSENSUS_BULLISH_EXPANSION', 'POSITION_LED_SQUEEZE_BUILDUP') else 0.0
-
-    return round(score, 4)
+def _resolver_sort_key(candidate):
+    return candidate.get('resolver_score')
 
 
 def update_signal_stability(signal_data):
@@ -4079,10 +3920,6 @@ def update_signal_stability(signal_data):
     prev_exec = float(prev.get('execution_priority', current_exec)) if prev else current_exec
     exec_delta = current_exec - prev_exec
     execution_trend = 'stable'
-    if exec_delta >= 6:
-        execution_trend = 'improving'
-    elif exec_delta <= -6:
-        execution_trend = 'weakening'
     family_transition = bool(prev_family and prev_family != family)
     stage_transition_upgrade = _stage_rank(stage) > _stage_rank(prev_stage) if prev_stage else False
 
@@ -4142,7 +3979,7 @@ def update_signal_stability(signal_data):
                 'trade_ratio': safe_float(((signal_data.get('reference_features') or {}).get('flow') or {}).get('trade_ratio', 0.0), 0.0),
                 'breakout': bool((signal_data.get('reference_features') or {}).get('local_breakout_clear')),
                 'vacuum': bool(((signal_data.get('reference_features') or {}).get('liquidity') or {}).get('vacuum')),
-                'execution_score': current_exec,
+                'execution_rank_diag': current_exec,
                 'micro_active': bool((signal_data.get('reference_features') or {}).get('micro_ignition', {}).get('active')),
             })
             recent_frames = recent_frames[-PRE_IGNITION_MEMORY_BARS:]
@@ -4168,135 +4005,46 @@ def is_signal_printable(signal_data):
     if not signal_data:
         return False, 'empty_signal'
     stage = signal_data.get('signal_stage', 'WATCH')
-    oi_state = signal_data.get('oi_state', 'NEUTRAL')
-    family = signal_data.get('primary_family', 'UNKNOWN')
-    score = float(signal_data.get('score', 0) or 0)
-    cycles = int(signal_data.get('persistence_cycles', 1) or 1)
     ref = signal_data.get('reference_features') or {}
-    flow = ref.get('flow') or {}
-    buy_ratio = safe_float(ref.get('buy_ratio_recent'), 0.0)
-    ofi_recent = safe_float(ref.get('ofi_recent'), 0.0)
-    price_5m = safe_float(flow.get('price_change_5m'), 0.0)
-    price_15m = safe_float(flow.get('price_change_15m'), 0.0)
-    micro_ignition = signal_data.get('micro_ignition') or ref.get('micro_ignition') or {}
-    trade_ratio = safe_float(ref.get('recent_trade_ratio', 1.0), 1.0)
-    breakout = bool(ref.get('local_breakout_clear') or (ref.get('tf15') or {}).get('zone') == 'breakout_zone' or micro_ignition.get('breakout'))
-    trade_expansion = bool(ref.get('trade_activity_expansion') or micro_ignition.get('active'))
-    stage_persistence = int(signal_data.get('stage_persistence', 1) or 1)
-    oi_nv_confirms = bool(ref.get('oi_nv_confirmed_expansion'))
-    oi_confirms = bool(ref.get('oi_confirmed_expansion'))
-    crowded_short = ref.get('ratio_conflict_state') == 'SHORT_SIDE_CROWDING'
-    hybrid_transition_ready = bool(ref.get('hybrid_transition_ready'))
-    explosive_early = (
-        score >= HYBRID_ONE_CYCLE_PRINT_SCORE and
-        price_5m >= EXPLOSIVE_ONE_CYCLE_PRICE5M_MIN and
-        price_15m >= EXPLOSIVE_ONE_CYCLE_PRICE15M_MIN and
-        (oi_confirms or oi_nv_confirms or oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION')) and
-        (buy_ratio >= 0.52 or breakout or trade_expansion or hybrid_transition_ready)
-    )
+    acceptance = signal_data.get('acceptance_state') or ref.get('acceptance_state') or {}
+    continuation = signal_data.get('continuation_state') or ref.get('continuation_state') or {}
+    exhaustion = signal_data.get('exhaustion_risk') or ref.get('exhaustion_risk') or {}
+    memory = signal_data.get('behavioral_memory') or ref.get('behavioral_memory') or {}
+    micro = signal_data.get('micro_ignition') or ref.get('micro_ignition') or {}
+    oi_state = signal_data.get('oi_state', 'NEUTRAL')
 
-    if stage == 'REJECTED':
-        signal_data['execution_status'] = 'REJECTED'
-        return False, 'rejected_stage'
-    if stage == 'LATE':
-        late_discovery = (
-            score >= max(TRIGGER_PRINT_MIN_SCORE, 76) and
-            (breakout or trade_expansion or micro_ignition.get('active') or price_5m >= FLOW_PRICE_CHASE_HARD_MAX)
-        )
-        if late_discovery:
-            signal_data['execution_status'] = 'LATE'
-            signal_data['discovery_status'] = 'DETECTED_LATE'
-            return True, 'late_discovery_only'
-        signal_data['execution_status'] = 'LATE'
-        return False, 'late_stage_hidden'
-    if oi_state == 'COVERING':
-        return False, f'oi_state={oi_state}'
+    if stage in ('FAILED_CONTINUATION', 'REJECTED') or continuation.get('failed'):
+        signal_data['execution_status'] = 'BLOCKED'
+        return False, 'failed_continuation'
+    if stage == 'LATE_CHASE' or exhaustion.get('late'):
+        signal_data['execution_status'] = 'LATE_CHASE'
+        signal_data['discovery_status'] = 'DETECTED_LATE'
+        return False, 'late_chase'
+    if memory.get('veto'):
+        signal_data['execution_status'] = 'BLOCKED'
+        return False, 'behavioral_memory_veto'
+    if acceptance.get('state') == 'REJECTED':
+        signal_data['execution_status'] = 'BLOCKED'
+        return False, f"acceptance_rejected:{acceptance.get('reason','unknown')}"
+
     if oi_state == 'PRICE_UP_OI_FLAT':
-        flat_ctx = signal_data.get('flat_oi_context', {}) or {}
-        if flat_ctx.get('label') != 'salvageable' and (not crowded_short or not breakout or not trade_expansion or buy_ratio < 0.58):
-            return False, f'oi_state={oi_state}'
-    explosive_short_squeeze = (
-        crowded_short and
-        price_5m >= SHORT_SQUEEZE_MIN_PRICE_5M and
-        price_15m >= SHORT_SQUEEZE_MIN_PRICE_15M and
-        (oi_confirms or ref.get('short_squeeze_inflexion') or oi_state in ('PREMOVE_BUILDUP', 'BUILDUP_EXPANSION'))
-    )
-    path_eval = signal_data.get('signal_path_eval') or evaluate_signal_path_quality(
-        signal_data.get('stage_history') or signal_data.get('stages') or [],
-        stage
-    )
-    path_quality = path_eval.get('path_quality', 'flat')
-    bad_regressions = int(path_eval.get('bad_regressions', 0) or 0)
-    whipsaws = int(path_eval.get('whipsaws', 0) or 0)
+        squeeze = signal_data.get('short_squeeze_override') or ref.get('short_squeeze_override') or {}
+        if not (micro.get('active') or squeeze.get('active')):
+            signal_data['execution_status'] = 'BLOCKED'
+            return False, 'flat_oi_default_block'
 
-    if bad_regressions >= 2 or whipsaws >= 2:
-        return False, 'path_too_noisy'
-
-    if stage == 'PREPARE' and path_quality in ('weak', 'mixed') and not explosive_short_squeeze and not explosive_early:
-        pre_pressure = signal_data.get('pre_ignition_pressure', {}) or {}
-        if not pre_pressure.get('pressure_building'):
-            return False, 'prepare_path_weak'
-
-    if stage == 'ARMED' and path_quality == 'weak' and cycles < max(PERSISTENCE_MIN_CYCLES, 2) and not explosive_short_squeeze:
-        return False, 'armed_path_weak'
-
-    if cycles < PERSISTENCE_MIN_CYCLES and stage not in ('TRIGGERED', 'CONFIRMED') and not explosive_short_squeeze and not explosive_early:
-        return False, 'needs_persistence'
-
-    if family == 'FLOW_LIQUIDITY_VACUUM_BREAKOUT':
-        micro_ok = bool(micro_ignition.get('active') and (micro_ignition.get('buy_ratio', 0.5) >= FLOW_MICRO_CONFIRM_BUY or micro_ignition.get('ofi', 0.0) >= FLOW_MICRO_CONFIRM_OFI))
-        if trade_ratio < FLOW_LOW_TRADE_RATIO_MIN and not micro_ok:
-            return False, 'flow_trade_ratio_weak'
-        if not (breakout and (trade_expansion or micro_ok) and (buy_ratio >= MIN_BUY_RATIO_FLOW_ACTIONABLE or ofi_recent >= MIN_OFI_FLOW_ACTIONABLE or micro_ok)):
-            return False, 'flow_not_actionable'
-
-    if family == 'ACCOUNT_LED_ACCUMULATION':
-        account_penalty = sum([
-            1 if buy_ratio < 0.53 else 0,
-            1 if not oi_nv_confirms else 0,
-            1 if not trade_expansion else 0,
-            1 if not breakout else 0,
-            1 if safe_float(ref.get('global_ls_ratio_now'), 1.0) > 2.3 else 0,
-        ])
-        if account_penalty >= 3 and not explosive_short_squeeze:
-            return False, 'account_led_too_wide'
-
-    if family == 'POSITION_LED_SQUEEZE_BUILDUP' and stage == 'PREPARE' and buy_ratio < 0.50 and not trade_expansion and not explosive_short_squeeze:
-        return False, 'position_led_not_ready'
-
-    if family == 'CONSENSUS_BULLISH_EXPANSION' and hybrid_transition_ready:
-        if score >= HYBRID_ONE_CYCLE_PRINT_SCORE and (explosive_early or breakout or trade_expansion or oi_nv_confirms or micro_ignition.get('active')):
-            return True, 'hybrid_consensus_early'
-
-    if family == 'CONSENSUS_BULLISH_EXPANSION':
-        delta_sum = abs(safe_float((ref.get('top') or {}).get('pos_delta'), 0.0)) + abs(safe_float((ref.get('top') or {}).get('acc_delta'), 0.0))
-        weak_consensus = (
-            safe_float(ref.get('oi_nv_delta_15m'), 0.0) < CONSENSUS_PRINT_MIN_OINV and
-            delta_sum < CONSENSUS_MIN_DELTA_SUM and
-            not trade_expansion and
-            not breakout and
-            not micro_ignition.get('active')
-        )
-        if weak_consensus and stage not in ('TRIGGERED', 'CONFIRMED'):
-            return False, 'consensus_too_soft'
-
-    if stage == 'WATCH':
-        return False, 'watch_hidden'
-    if stage == 'PREPARE':
-        if score >= SETUP_PRINT_MIN_SCORE and ((cycles >= max(PERSISTENCE_MIN_CYCLES, 2) and (trade_expansion or breakout or buy_ratio >= 0.54 or oi_confirms or micro_ignition.get('active'))) or explosive_short_squeeze or explosive_early):
-            return True, 'prepare_strong'
-        return False, 'prepare_hidden'
-    if stage == 'ARMED':
-        if score >= ARMED_PRINT_MIN_SCORE and (cycles >= PERSISTENCE_SHORT_SQUEEZE_BYPASS or breakout or trade_expansion or stage_persistence >= 2 or explosive_short_squeeze or explosive_early or micro_ignition.get('active')):
-            return True, 'armed'
-        return False, 'armed_weak'
     if stage == 'TRIGGERED':
-        if score >= TRIGGER_PRINT_MIN_SCORE and (breakout or trade_expansion or stage_persistence >= 1 or explosive_short_squeeze or micro_ignition.get('active')):
-            return True, 'triggered'
-        return False, 'triggered_weak'
-    if stage == 'CONFIRMED':
-        return True, 'confirmed'
-    return False, 'unhandled_stage'
+        signal_data['execution_status'] = 'ACTIONABLE'
+        return True, 'triggered'
+    if stage == 'ARMED':
+        signal_data['execution_status'] = 'ACTIONABLE'
+        return True, 'armed'
+    if stage == 'PREPARE':
+        signal_data['execution_status'] = 'ACTIONABLE'
+        return True, 'prepare'
+
+    signal_data['execution_status'] = 'DISCOVERY_ONLY'
+    return False, 'discovery_only'
 
 
 def resolve_primary_family_signal(symbol):
@@ -4328,7 +4076,7 @@ def resolve_primary_family_signal(symbol):
     for item in candidates:
         item['_reference_ref'] = ref
         item['resolver_score'] = _resolver_priority_score(item, ref)
-    candidates.sort(key=lambda item: (item['resolver_score'], item['strength']), reverse=True)
+    candidates.sort(key=lambda item: _resolver_sort_key(item), reverse=True)
     best = _apply_family_hysteresis(symbol, candidates, candidates[0])
 
     # Resolver صارم: لا نعتمد على أول detector نجح، بل على الأعلى قوة بعد التحقق من عدم late/contradiction.
@@ -4357,7 +4105,7 @@ def resolve_primary_family_signal(symbol):
         'secondary_contexts': list(dict.fromkeys(ref['secondary_contexts'])),
         'funding_context': ref['funding_context'],
         'decisive_feature': best['decisive_feature'],
-        'signal_quality_tier': _quality_tier_from_score(score),
+        'signal_quality_tier': 'N/A',
         'signal_stage': ref['signal_stage'],
         'oi_state': ref.get('oi_state', 'NEUTRAL'),
         'why_selected': best['why_selected'],
@@ -4369,7 +4117,7 @@ def resolve_primary_family_signal(symbol):
             f"primary_family={best['family']}",
             f"funding_context={ref['funding_context']}",
             f"secondary_contexts={', '.join(ref['secondary_contexts']) if ref['secondary_contexts'] else 'NONE'}",
-            f"resolver_score={best.get('resolver_score', best['strength']):.1f}",
+            f"resolver_fingerprint_rank={best.get('resolver_score')}",
             best['decisive_feature'],
             best['why_selected'],
         ],
@@ -4420,7 +4168,20 @@ def resolve_primary_family_signal(symbol):
     result['signal_stage'] = stage_with_family
     result['oi_state'] = oi_state
     result['discovery_status'] = 'DETECTED'
-    result['execution_status'] = 'ACTIONABLE'
+    ref['symbol'] = symbol
+    acceptance_state = detect_acceptance_state(ref, oi_state=oi_state, family_hint=best['family'])
+    continuation_state = detect_failure_continuation(ref, family_hint=best['family'], oi_state=oi_state)
+    exhaustion_risk = detect_exhaustion_risk(ref, oi_state=oi_state)
+    micro_state = detect_micro_ignition_state(ref)
+    memory_state = behavioral_memory_veto(symbol, ref, stage=stage_with_family, family=best['family'])
+    result['acceptance_state'] = acceptance_state
+    result['continuation_state'] = continuation_state
+    result['exhaustion_risk'] = exhaustion_risk
+    result['behavioral_memory'] = memory_state
+    result['micro_ignition_state'] = micro_state
+    result['execution_allowed'] = False
+    result['execution_block_reasons'] = []
+    result['execution_status'] = 'DISCOVERY_ONLY'
     result['pre_ignition_pressure'] = ref.get('pre_ignition_pressure', {})
     result['short_squeeze_override'] = ref.get('short_squeeze_override', {})
     result['prepared_continuation'] = ref.get('prepared_continuation', {})
@@ -4431,15 +4192,21 @@ def resolve_primary_family_signal(symbol):
     result['stop_loss'] = stop_loss
     result['take_profit1'] = tp1
     result['take_profit2'] = tp2
+    result['reference_features']['acceptance_state'] = result.get('acceptance_state', {})
+    result['reference_features']['continuation_state'] = result.get('continuation_state', {})
+    result['reference_features']['exhaustion_risk'] = result.get('exhaustion_risk', {})
+    result['reference_features']['behavioral_memory'] = result.get('behavioral_memory', {})
+    result['reference_features']['micro_ignition_state'] = result.get('micro_ignition_state', {})
     result = update_signal_stability(result)
     printable, print_reason = is_signal_printable(result)
     result['print_ready'] = printable
     result['print_reason'] = print_reason
-    if print_reason == 'late_discovery_only':
-        result['execution_status'] = 'LATE'
-        result['discovery_status'] = 'DETECTED_LATE'
+    result['execution_allowed'] = bool(printable)
     if not printable:
-        return log_rejection(symbol, 'FOUR_FAMILY_RESOLVER', print_reason, primary_family=result.get('primary_family'), signal_stage=result.get('signal_stage'), oi_state=result.get('oi_state'), score=result.get('score'))
+        result['execution_block_reasons'] = [print_reason]
+    if not printable:
+        return log_rejection(symbol, 'FOUR_FAMILY_RESOLVER', print_reason, primary_family=result.get('primary_family'), signal_stage=result.get('signal_stage'), oi_state=result.get('oi_state'))
+    diagnostics.log_accept(symbol, best['family'], reasons=[f"discovered={result.get('discovery_status')}", f"execution_allowed={result.get('execution_allowed')}", f"acceptance={result.get('acceptance_state',{}).get('state')}", f"continuation_failed={result.get('continuation_state',{}).get('failed')}", f"exhaustion={result.get('exhaustion_risk',{}).get('risky')}", f"behavioral_veto={result.get('behavioral_memory',{}).get('veto')}", f"stage={result.get('signal_stage')}", f"print_reason={result.get('print_reason')}"])
     log_acceptance(
         symbol,
         best['family'],
@@ -4724,8 +4491,8 @@ def evaluate_symbol_patterns(sym):
 # =============================================================================
 def send_individual_signal(signal_data):
     """إرسال تنبيه فوري مبني فقط على العائلة الرئيسية الجديدة."""
-    if signal_data['score'] < SIGNAL_MIN_SCORE:
-        diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('primary_family', 'UNKNOWN'), 'signal_below_send_threshold', {'score': signal_data.get('score')})
+    if not signal_data.get('execution_allowed', False):
+        diagnostics.log_reject(signal_data.get('symbol', 'UNKNOWN'), signal_data.get('primary_family', 'UNKNOWN'), 'signal_not_actionable', {'reason': signal_data.get('print_reason')})
         return
 
     family = signal_data.get('primary_family', 'UNKNOWN')
@@ -4741,7 +4508,7 @@ def send_individual_signal(signal_data):
     message = (
         f"🔔 *إشارة مرجعية جديدة: {signal_data['symbol']}*\n"
         f"{family_info['emoji']} العائلة الرئيسية: {family_info['name']}\n"
-        f"   الدرجة: {signal_data['score']} | الجودة: {quality_name_ar(signal_data.get('signal_quality_tier', 'LOW'))} | المرحلة: {stage_name_ar(signal_data.get('signal_stage', 'WATCH'))}\n"
+        f"   المرحلة: {stage_name_ar(signal_data.get('signal_stage', 'WATCH'))} | القبول: {signal_data.get('acceptance_state',{}).get('state','N/A')}\n"
         f"   الاتجاه: {direction_ar}\n"
         f"   السعر: {signal_data['price']:.6f}\n"
         f"   التمويل: {funding_name_ar(signal_data.get('funding_context', 'FUNDING_UNINFORMATIVE'))}\n"
@@ -4768,7 +4535,7 @@ def deep_scan(candidates, learning_system):
                 res = future.result(timeout=35)
                 if res:
                     family = res.get('primary_family', 'UNKNOWN')
-                    print(f"   ✅ {sym}: {res['score']} {family}")
+                    print(f"   ✅ {sym}: {family} | stage={res.get('signal_stage')} | execution_allowed={res.get('execution_allowed')}")
                     results.append(res)
                 else:
                     if DEBUG:
@@ -4779,8 +4546,8 @@ def deep_scan(candidates, learning_system):
                 if "400" in str(e) or "404" in str(e):
                     mark_symbol_invalid(sym)
 
-    stage_bonus = {'CONFIRMED': 18, 'TRIGGERED': 12, 'ARMED': 7, 'PREPARE': 2, 'WATCH': -8, 'REJECTED': -100, 'LATE': -100}
-    results.sort(key=lambda x: (x.get('score', 0) + stage_bonus.get(x.get('signal_stage', 'WATCH'), 0), 1 if x.get('stage_transition_upgrade') else 0, x.get('persistence_cycles', 1), x.get('stage_persistence', 1)), reverse=True)
+    stage_bonus = {'TRIGGERED': 3, 'ARMED': 2, 'PREPARE': 1}
+    results.sort(key=lambda x: (stage_bonus.get(x.get('signal_stage', 'WATCH'), 0), fingerprint_quality_rank(x.get('reference_features') or {}, x.get('primary_family'), x.get('signal_stage'))), reverse=True)
     return results
 
 # =============================================================================
@@ -4991,58 +4758,50 @@ def generate_report(results):
         print("⚠️ لا توجد إشارات.")
         return
 
-    printable_results = [r for r in results if r.get('print_ready', True)]
-    if not printable_results:
-        research_results = sorted(results, key=lambda x: (execution_priority_score(x), x.get('score', 0), x.get('persistence_cycles', 1)), reverse=True)[:5]
-        print("⚠️ لا توجد إشارات قابلة للطباعة بعد تطبيق reject conditions وفلتر التنفيذ.")
-        if research_results:
-            print("🔎 أعلى المرشحات البحثية غير المطبوعة:")
-            for r in research_results:
-                print(f"   - {r.get('symbol')} | {family_name_ar(r.get('primary_family','UNKNOWN'))} | score={r.get('score')} | stage={stage_name_ar(r.get('signal_stage','WATCH'))} | سبب الحجب={r.get('print_reason','N/A')}")
+    actionable = [r for r in results if r.get('execution_allowed')]
+    if not actionable:
+        research_results = sorted(
+            results,
+            key=lambda x: ({'TRIGGERED': 3, 'ARMED': 2, 'PREPARE': 1}.get(x.get('signal_stage', 'WATCH'), 0), fingerprint_quality_rank(x.get('reference_features') or {}, x.get('primary_family'), x.get('signal_stage'))),
+            reverse=True
+        )[:5]
+        print("⚠️ لا توجد إشارات تنفيذية حاليًا. المتاح أدناه discovery only.")
+        for r in research_results:
+            print(f"   - {r.get('symbol')} | {family_name_ar(r.get('primary_family','UNKNOWN'))} | stage={stage_name_ar(r.get('signal_stage','WATCH'))} | سبب الحجب={r.get('print_reason','N/A')}")
         return
 
-    printable_results.sort(
-        key=lambda x: (
-            execution_priority_score(x),
-            1 if x.get('execution_trend') == 'improving' else 0,
-            1 if x.get('stage_transition_upgrade') else 0,
-            1 if x.get('family_transition') else 0,
-            safe_float(x.get('score'), 0.0),
-            int(x.get('persistence_cycles', 1) or 1),
-            int(x.get('stage_persistence', 1) or 1),
-        ),
+    actionable.sort(
+        key=lambda x: ({'TRIGGERED': 3, 'ARMED': 2, 'PREPARE': 1}.get(x.get('signal_stage', 'WATCH'), 0), fingerprint_quality_rank(x.get('reference_features') or {}, x.get('primary_family'), x.get('signal_stage'))),
         reverse=True,
     )
-    lines = ["🚀 *التقرير التنفيذي العربي - العائلات المرجعية الأربع*", "", "يظهر هنا فقط ما اجتاز فلتر التنفيذ والثبات، وليس كل المرشحات البحثية. قد تظهر أيضًا حالات مكتشفة لكنها متأخرة تنفيذيًا.", ""]
-    console_lines = ["🚀 التقرير التنفيذي العربي - العائلات المرجعية الأربع", "", "يظهر هنا فقط ما اجتاز فلتر التنفيذ والثبات، وليس كل المرشحات البحثية. قد تظهر أيضًا حالات مكتشفة لكنها متأخرة تنفيذيًا.", ""]
-    green = "[92m"
-    reset = "[0m"
+    lines = ["🚀 *التقرير التنفيذي العربي - العائلات المرجعية الأربع*", "", "القرار النهائي يعتمد على fingerprints فقط بدون score.", ""]
+    console_lines = ["🚀 التقرير التنفيذي العربي - العائلات المرجعية الأربع", "", "القرار النهائي يعتمد على fingerprints فقط بدون score.", ""]
+    green = "\033[92m"
+    reset = "\033[0m"
 
-    for r in printable_results[:10]:
+    for r in actionable[:10]:
         family = r.get('primary_family', 'UNKNOWN')
         family_info = PRIMARY_FAMILY_ARABIC.get(family, {'name': family, 'emoji': '🔹'})
         contexts = "، ".join(r.get('secondary_contexts', [])) if r.get('secondary_contexts') else 'لا يوجد'
         why_not = r.get('why_not_other_families', {})
-        if isinstance(why_not, dict):
-            why_not_text = " | ".join([f"{family_name_ar(k)}: {v}" for k, v in why_not.items()])
-        else:
-            why_not_text = str(why_not)
-
+        why_not_text = " | ".join([f"{family_name_ar(k)}: {v}" for k, v in why_not.items()]) if isinstance(why_not, dict) else str(why_not)
         judgment = execution_judgment_ar(r)
         persistence_text = persistence_name_ar(r.get('persistence_cycles', 1))
-        readiness_rank = execution_priority_score(r)
-        evolution_summary = r.get('signal_evolution_summary', signal_evolution_summary_ar(r))
-        signal_path = r.get('signal_path_summary', signal_path_summary_ar(r))
-        memory_summary = r.get('memory_summary', 'ذاكرة قيد البناء')
+        acceptance = r.get('acceptance_state', {})
+        continuation = r.get('continuation_state', {})
+        exhaustion = r.get('exhaustion_risk', {})
+        memory = r.get('behavioral_memory', {})
+
         lines.append(
             f"{family_info['emoji']} *{r['symbol']}*\n"
             f"   العائلة الرئيسية: {family_info['name']}\n"
             f"   الحكم التنفيذي: {judgment}\n"
-            f"   الدرجة: {r['score']} | الجودة: {quality_name_ar(r.get('signal_quality_tier', 'LOW'))} | المرحلة: {stage_name_ar(r.get('signal_stage', 'WATCH'))} | قابلية التنفيذ: {readiness_rank:.1f}\n"
-            f"   حالة OI: {oi_state_name_ar(r.get('oi_state', 'NEUTRAL'))} | الثبات: {persistence_text} ({r.get('persistence_cycles', 1)}) | لقطة الدورة: {r.get('cycle_snapshot_ts', 'N/A')}\n"
-            f"   تطور الإشارة: {evolution_summary}\n"
-            f"   مسار الإشارة: {signal_path}\n"
-            f"   الذاكرة السلوكية: {memory_summary}\n"
+            f"   المرحلة: {stage_name_ar(r.get('signal_stage', 'WATCH'))} | execution_allowed={r.get('execution_allowed')}\n"
+            f"   acceptance: {acceptance.get('state','N/A')} ({acceptance.get('reason','')})\n"
+            f"   continuation: {'FAILED' if continuation.get('failed') else 'OK'} ({continuation.get('reason','')})\n"
+            f"   exhaustion: {'RISK' if exhaustion.get('risky') else 'OK'} ({exhaustion.get('reason','')})\n"
+            f"   behavioral memory: {'VETO' if memory.get('veto') else 'OK'} ({memory.get('reason','')})\n"
+            f"   حالة OI: {oi_state_name_ar(r.get('oi_state', 'NEUTRAL'))} | الثبات: {persistence_text} ({r.get('persistence_cycles', 1)})\n"
             f"   السعر: {r['price']:.6f}\n"
             f"   سياق التمويل: {funding_name_ar(r.get('funding_context', 'FUNDING_UNINFORMATIVE'))}\n"
             f"   السياقات الثانوية: {contexts}\n"
@@ -5054,11 +4813,9 @@ def generate_report(results):
             f"{family_info['emoji']} {r['symbol']}\n"
             f"   العائلة الرئيسية: {family_info['name']}\n"
             f"   {green}الحكم التنفيذي: {judgment}{reset}\n"
-            f"   الدرجة: {r['score']} | الجودة: {quality_name_ar(r.get('signal_quality_tier', 'LOW'))} | المرحلة: {stage_name_ar(r.get('signal_stage', 'WATCH'))} | قابلية التنفيذ: {readiness_rank:.1f}\n"
-            f"   حالة OI: {oi_state_name_ar(r.get('oi_state', 'NEUTRAL'))} | الثبات: {persistence_text} ({r.get('persistence_cycles', 1)}) | لقطة الدورة: {r.get('cycle_snapshot_ts', 'N/A')}\n"
-            f"   تطور الإشارة: {evolution_summary}\n"
-            f"   مسار الإشارة: {signal_path}\n"
-            f"   الذاكرة السلوكية: {memory_summary}\n"
+            f"   المرحلة: {stage_name_ar(r.get('signal_stage', 'WATCH'))} | execution_allowed={r.get('execution_allowed')}\n"
+            f"   acceptance={acceptance.get('state','N/A')} | continuation={'FAILED' if continuation.get('failed') else 'OK'} | exhaustion={'RISK' if exhaustion.get('risky') else 'OK'} | memory={'VETO' if memory.get('veto') else 'OK'}\n"
+            f"   حالة OI: {oi_state_name_ar(r.get('oi_state', 'NEUTRAL'))} | الثبات: {persistence_text} ({r.get('persistence_cycles', 1)})\n"
             f"   السعر: {r['price']:.6f}\n"
             f"   سياق التمويل: {funding_name_ar(r.get('funding_context', 'FUNDING_UNINFORMATIVE'))}\n"
             f"   السياقات الثانوية: {contexts}\n"
