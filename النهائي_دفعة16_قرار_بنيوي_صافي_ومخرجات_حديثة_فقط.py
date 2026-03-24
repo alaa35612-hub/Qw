@@ -3447,9 +3447,17 @@ def build_reference_market_features(
         "ratio_alignment": ratio_alignment,
         "ratio_conflict": ratio_conflict,
         "extreme_engine": extreme_engine,
+        "ratio_extreme_profile": safe_dict_from_api(extreme_engine.get("profiles")),
+        "ratio_inflection_profile": safe_dict_from_api(extreme_engine.get("inflection")),
         "asset_local_memory": asset_local_memory,
         "asset_memory_profile": asset_memory_profile,
         "asset_memory_context": asset_memory_context,
+        "leader_evidence": {},
+        "acceptance_evidence": {},
+        "failure_evidence": {},
+        "flow_quality_profile": {},
+        "oi_context_profile": {},
+        "hypothesis_inputs": {},
         "multi_tf": multi_tf,
         "tf_5m": tf_5m,
         "tf_15m": tf_15m,
@@ -4085,6 +4093,16 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         and not long_rollover_active
     )
 
+    structural_acceptance = (
+        not price_late
+        and (price_reaccept_proxy or higher_low_bias or (breakout_touched and ret_1 > -0.05))
+        and oi_not_collapsing
+        and (oi_supportive or ratio_supportive or trade_activity_alive)
+        and not upper_failure_active
+        and not long_rollover_active
+        and not features.get("one_bar_spike", False)
+    )
+
     if strict_acceptance:
         accepted = True
         acceptance_reason = "قبول صارم: إغلاق واختراق مثبت مع دعم OI والتدفق والنشاط"
@@ -4108,6 +4126,10 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
     elif early_regime_partial:
         partial = True
         acceptance_reason = "قبول جزئي نظامي: النظام البنيوي داعم لكن القبول السعري ما زال في طور الاكتمال"
+        diagnostics.append(acceptance_reason)
+    elif structural_acceptance:
+        accepted = True
+        acceptance_reason = "قبول بنيوي بصري: السعر حافظ على منطقة الاستعادة مع قيعان متحسنة دون إشارات فخ بارزة"
         diagnostics.append(acceptance_reason)
     elif (
         ignition_like
@@ -4136,6 +4158,9 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         "partial": partial,
         "state": "yes" if accepted else ("partial" if partial else "no"),
         "acceptance_reason": acceptance_reason,
+        "strict_acceptance": strict_acceptance,
+        "regime_acceptance": regime_anchor_strength >= 1,
+        "structural_acceptance": structural_acceptance,
         "diagnostics": diagnostics,
     }
 
@@ -5169,6 +5194,21 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
         "extreme_engine": legacy_decision.get("extreme_engine", features.get("extreme_engine", {})),
         "asset_memory_profile": features.get("asset_memory_profile", {}),
         "asset_memory_context": features.get("asset_memory_context", {}),
+        "leader_type": None,
+        "leader_reason": "",
+        "primary_hypothesis": None,
+        "alternative_hypotheses": [],
+        "hypothesis_scores": {},
+        "confidence_score": 0.0,
+        "uncertainty_score": 0.0,
+        "conflict_score": 0.0,
+        "invalidation_reason": "",
+        "next_failure_mode": "",
+        "causal_chain": [],
+        "closest_case_match": None,
+        "closest_case_score": 0.0,
+        "state_transition": None,
+        "state_transition_reason": "",
         "legacy_materials": {
             "family_info": family_info,
             "stage_info": stage_info,
@@ -5258,6 +5298,7 @@ def analyze_symbol_structural(
         result.update(build_arabic_output_fields(result))
         result = attach_structural_casefile(result)
         result = apply_structural_center(result)
+        result = enrich_result_v2_fields(result)
         result["importance_score"] = compute_importance_score(result)
         if isinstance(result.get("structural_case"), dict):
             result["structural_case"]["importance_score"] = result["importance_score"]
@@ -6780,6 +6821,75 @@ def attach_structural_casefile(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def rank_hypotheses(scores: Dict[str, float]) -> List[Tuple[str, float]]:
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def select_primary_hypothesis(ranked: List[Tuple[str, float]]) -> Dict[str, Any]:
+    if not ranked:
+        return {"primary_hypothesis": "undetermined", "alternative_hypotheses": []}
+    return {
+        "primary_hypothesis": ranked[0][0],
+        "alternative_hypotheses": [name for name, score in ranked[1:4] if score >= 0.18],
+    }
+
+
+def build_leader_reason(features: Dict[str, Any], leader_info: Dict[str, Any]) -> str:
+    leader_type = _safe_state_text(leader_info.get("leader_type"), "undetermined")
+    strength = safe_float(leader_info.get("strength"), 0.0)
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    oi_supportive = bool(features.get("oi_buildup_supported", False)) or safe_float(features.get("oi_delta_3"), 0.0) > 0.0
+    flow_supported = bool(features.get("flow_supported", False))
+    return (
+        f"leader={leader_type} | strength={strength:.2f} | "
+        f"ratio_supportive={ratio_alignment.get('overall_supportive', False)} | "
+        f"oi_supportive={oi_supportive} | flow_supported={flow_supported}"
+    )
+
+
+def enrich_result_v2_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(result)
+    features = safe_dict_from_api(result.get("market_features"))
+    leadership_model = safe_dict_from_api(result.get("leadership_model"))
+    case_similarity = safe_dict_from_api(result.get("case_similarity_context"))
+    state_transition = safe_dict_from_api(result.get("state_transition_context"))
+    thesis = safe_dict_from_api(result.get("structural_thesis"))
+
+    primary_raw, alternatives_raw, hypothesis_scores = derive_primary_hypothesis(result)
+    ranked = rank_hypotheses(hypothesis_scores)
+    selected = select_primary_hypothesis(ranked)
+
+    result["leader_type"] = _safe_state_text(leadership_model.get("leader_type"), derive_leader_type(result))
+    result["leader_reason"] = build_leader_reason(features, leadership_model)
+    result["primary_hypothesis"] = selected.get("primary_hypothesis", primary_raw)
+    result["alternative_hypotheses"] = selected.get("alternative_hypotheses", alternatives_raw)
+    result["hypothesis_scores"] = hypothesis_scores
+    result["confidence_score"] = derive_confidence_score(result)
+    result["uncertainty_score"] = derive_uncertainty_score(result)
+    result["conflict_score"] = derive_conflict_score(result)
+    causal_text = build_causal_chain_ar(result)
+    result["causal_chain"] = [causal_text] if causal_text else []
+    result["invalidation_reason"] = derive_invalidation_reason_ar(result)
+    result["next_failure_mode"] = derive_next_failure_mode_ar(result)
+    result["state_transition"] = state_transition.get("transition_key")
+    result["state_transition_reason"] = state_transition.get("transition_ar", "")
+
+    top_cases = safe_list_from_api(case_similarity.get("top_cases"))
+    if top_cases:
+        first = safe_dict_from_api(top_cases[0])
+        result["closest_case_match"] = first.get("primary_hypothesis") or first.get("primary_hypothesis_ar")
+        result["closest_case_score"] = safe_float(first.get("similarity"), 0.0)
+    else:
+        result["closest_case_match"] = None
+        result["closest_case_score"] = 0.0
+
+    result["hypothesis_inputs"] = {
+        "top_thesis_score": safe_float(thesis.get("top_score"), 0.0),
+        "thesis_quality": _safe_state_text(thesis.get("thesis_quality"), "unknown"),
+    }
+    return result
+
+
 def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     primary_ar, alternatives_ar = derive_primary_hypothesis_ar(result)
     primary_raw, alternatives_raw, hypothesis_scores = derive_primary_hypothesis(result)
@@ -6836,112 +6946,60 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
 
 def print_symbol_result(result: Dict[str, Any]) -> None:
     view = build_arabic_output_fields(result)
-    features = safe_dict_from_api(result.get("market_features"))
-    structural_case = safe_dict_from_api(result.get("structural_case"))
-    structural_thesis = safe_dict_from_api(result.get("structural_thesis"))
-    adversarial_review = safe_dict_from_api(result.get("adversarial_review"))
     execution_verdict = safe_dict_from_api(result.get("execution_verdict"))
-    pre_rise_signature = safe_dict_from_api(result.get("pre_rise_signature"))
-    acceptance_lifecycle = safe_dict_from_api(result.get("acceptance_lifecycle"))
-    short_pressure = safe_dict_from_api(result.get("short_pressure_transition"))
-    post_flush = safe_dict_from_api(result.get("post_flush_structures"))
-    crowding_regime = safe_dict_from_api(result.get("crowding_regime") or features.get("crowding_regime"))
-    extreme_engine = safe_dict_from_api(result.get("extreme_engine") or features.get("extreme_engine"))
-    ratio_alignment = safe_dict_from_api(result.get("ratio_alignment") or features.get("ratio_alignment"))
-
     structural_state = _safe_state_text(result.get("structural_execution_state"), execution_verdict.get("execution_state", "unknown"))
     structural_state_ar = view.get("structural_execution_state_ar", "غير محسوم")
     actionable_now = structural_state == "actionable_now"
-    magma_pattern = bool((features.get("counterflow_pattern") or {}).get("active", False))
+    symbol_text = _safe_state_text(result.get("symbol"), "UNKNOWN")
+    symbol_text = colorize_text(symbol_text, "green") if actionable_now else symbol_text
+    state_text = colorize_text(structural_state_ar, "green") if actionable_now else structural_state_ar
 
-    if magma_pattern and OUTPUT_SETTINGS.get("HIGHLIGHT_MAGMA_IN_RED", True):
-        header_symbol = colorize_text(_safe_state_text(result.get("symbol"), "UNKNOWN"), "red")
-        state_text = colorize_text(structural_state_ar, "red")
-    else:
-        header_symbol = colorize_text(_safe_state_text(result.get("symbol"), "UNKNOWN"), "green") if actionable_now else _safe_state_text(result.get("symbol"), "UNKNOWN")
-        state_text = colorize_text(structural_state_ar, "green") if actionable_now else structural_state_ar
+    alternatives = view.get("alternative_hypotheses_ar") or []
+    closest_case = result.get("closest_case_match") or "لا توجد حالة قريبة محفوظة بعد"
+    closest_score = format_num(result.get("closest_case_score"), 2)
 
     print(STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
-    print(f"الرمز: {header_symbol}")
-    print(f"قرار التنفيذ البنيوي: {state_text}")
-    print(f"درجة الأهمية: {format_num(result.get('importance_score'), 2)} | ترجيح الفرضية: {format_num(structural_thesis.get('top_score', 0.0), 2)} | عدم اليقين: {format_num(view.get('uncertainty_score'), 2)} | التعارض: {format_num(view.get('conflict_score'), 2)}")
-    if execution_verdict.get("reason_ar"):
-        print(f"سبب القرار: {execution_verdict.get('reason_ar')}")
+    print("Summary")
+    print(f"- symbol: {symbol_text}")
+    print(f"- importance: {format_num(result.get('importance_score'), 2)}")
+    print(f"- final bucket: {view.get('final_bucket_ar', result.get('final_bucket', 'غير معروف'))}")
+    print(f"- القرار التنفيذي: {state_text}")
 
-    print("\nملف القضية البنيوية:")
-    print(f"- النظام البنيوي: {structural_case.get('regime_pattern_ar', view.get('regime_pattern_ar', 'غير معروف'))}")
-    print(f"- نوع القيادة: {structural_case.get('leader_type_ar', view.get('leader_type_ar', 'غير معروف'))}")
-    print(f"- دور OI: {structural_case.get('oi_role_ar', 'غير معروف')}")
-    print(f"- جودة التدفق: {structural_case.get('flow_quality_ar', 'غير معروف')}")
-    print(f"- حكم السعر: {structural_case.get('price_verdict_ar', 'غير معروف')}")
-    print(f"- السلسلة السببية: {view.get('causal_chain_ar', 'لا توجد سلسلة سببية جاهزة بعد')}")
-    print(f"- شرط الإبطال: {view.get('invalidation_reason_ar', 'لا يوجد شرط إبطال واضح بعد')}")
-    print(f"- الخطر التالي المرجح: {view.get('next_failure_mode_ar', 'لا يوجد توصيف واضح للخطر التالي بعد')}")
+    print("\nStructural Read")
+    print(f"- regime: {view.get('regime_pattern_ar', 'غير معروف')}")
+    print(f"- trigger: {view.get('trigger_pattern_ar', 'غير معروف')}")
+    print(f"- execution: {view.get('execution_pattern_ar', 'غير معروف')}")
+    print(f"- leader: {view.get('leader_type_ar', 'غير معروف')}")
+    print(f"- crowding regime: {view.get('crowding_regime_ar', 'غير معروف')}")
+    print(f"- primary hypothesis: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
+    print(f"- alternative hypotheses: {', '.join(alternatives) if alternatives else 'لا توجد بدائل قريبة'}")
 
-    print("\nالأطروحة البنيوية:")
-    print(f"- الفرضية الأقوى: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
-    alternatives = view.get('alternative_hypotheses_ar') or []
-    print(f"- البديل الأقرب: {alternatives[0] if alternatives else 'لا يوجد بديل قريب واضح'}")
-    print(f"- جودة الأطروحة: {structural_thesis.get('thesis_quality_ar', 'غير محسومة')}")
-    if structural_thesis.get("summary_ar"):
-        print(f"- الملخص البنيوي: {structural_thesis.get('summary_ar')}")
+    print("\nتسلسل البحث")
+    print(f"- السياق: {view.get('regime_pattern_ar', 'غير معروف')}")
+    print(f"- القيادة: {view.get('leader_type_ar', 'غير معروف')}")
+    print(f"- OI: {view.get('oi_state_ar', 'غير معروف')}")
+    print(f"- التدفق: {_safe_state_text(result.get('flow_quality'), 'غير محسوم')}")
+    print(f"- الزناد: {view.get('trigger_pattern_ar', 'غير معروف')}")
+    print(f"- القبول: {_safe_state_text(result.get('acceptance_reason'), 'غير محسوم')}")
+    print(f"- الفرضية: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
+    print(f"- القرار: {state_text}")
+    print(f"- الإبطال: {view.get('invalidation_reason_ar', 'لا يوجد إبطال محدد بعد')}")
 
-    print("\nالمراجعة المضادة:")
-    print(f"- اعتراض محامي الشيطان: {adversarial_review.get('main_risk_ar', 'لا يوجد اعتراض بارز')}")
-    print(f"- نوع الفخ المحتمل: {adversarial_review.get('trap_type_ar', 'لا يوجد فخ واضح')}")
-    print(f"- شرط قلب الحكم: {adversarial_review.get('flip_condition', 'لا يوجد شرط قلب واضح')}")
+    print("\nWhy")
+    print(f"- causal chain: {view.get('causal_chain_ar', 'لا توجد سلسلة سببية جاهزة بعد')}")
+    print(f"- acceptance reason: {_safe_state_text(result.get('acceptance_reason'), 'غير متاح')}")
+    print(f"- continuation reason: {_safe_state_text(result.get('continuation_reason'), 'غير متاح')}")
 
-    print("\nمخرجات التعديلات الأخيرة:")
-    if pre_rise_signature:
-        print(f"- البصمة المبكرة: {_safe_state_text(pre_rise_signature.get('state'), 'غير محسومة')} | الثقة={format_num(pre_rise_signature.get('confidence'), 2)}")
-    if acceptance_lifecycle:
-        print(f"- دورة القبول: {_safe_state_text(acceptance_lifecycle.get('acceptance_quality'), 'غير معروفة')} | الهيكل={_safe_state_text(acceptance_lifecycle.get('post_breakout_structure'), 'غير معروف')} | الحكم={_safe_state_text(acceptance_lifecycle.get('verdict'), 'غير معروف')}")
-    if short_pressure:
-        print(f"- ضغط الشورت/التغطية: {_safe_state_text(short_pressure.get('pressure_state'), 'غير محسوم')} | المرحلة={_safe_state_text(short_pressure.get('phase'), 'غير معروفة')} | قابلية الاستمرار={_safe_state_text(short_pressure.get('continuation_potential'), 'غير معروفة')}")
-    if post_flush.get("active", False):
-        print(f"- بنية ما بعد الـ Flush: {_safe_state_text(post_flush.get('pattern'), 'غير معروفة')} | الثقة={format_num(post_flush.get('confidence'), 2)}")
-    if crowding_regime:
-        print(f"- نظام الازدحام الثلاثي: {view.get('crowding_regime_ar', 'غير معروف')} | الحالات الزمنية={crowding_regime.get('tf_states', {})}")
-    if ratio_alignment:
-        print(f"- توافق النسب عبر الفريمات: overall_supportive={ratio_alignment.get('overall_supportive', False)} | higher_tf_supportive={ratio_alignment.get('higher_tf_supportive', False)} | overall_conflict={ratio_alignment.get('overall_conflict', False)}")
-    if extreme_engine:
-        higher_regime = translate_label(extreme_engine.get('higher_regime'), {
-            'upper_extreme': 'تطرف علوي',
-            'lower_extreme': 'تطرف سفلي',
-            'mixed': 'تطرفات مختلطة',
-            'neutral': 'محايد',
-        }, 'غير محسوم')
-        print(f"- محرك التطرف والانعطاف: الأعلى={higher_regime} | squeeze_probability={format_num(extreme_engine.get('squeeze_probability'), 1)} | flush_probability={format_num(extreme_engine.get('flush_probability'), 1)}")
+    print("\nRisk")
+    print(f"- confidence: {format_num(view.get('confidence_score'), 2)}")
+    print(f"- uncertainty: {format_num(view.get('uncertainty_score'), 2)}")
+    print(f"- conflict: {format_num(view.get('conflict_score'), 2)}")
+    print(f"- invalidation: {view.get('invalidation_reason_ar', 'لا يوجد إبطال محدد بعد')}")
+    print(f"- next failure mode: {view.get('next_failure_mode_ar', 'غير محدد بعد')}")
 
-    print("\nسياق الأصل من ذاكرته المحلية:")
-    print(f"- {view.get('asset_memory_context_ar', 'لا توجد ذاكرة محلية كافية لهذا الأصل بعد.')}")
-    print("حالة الأصل مقارنة بذاكرته المحلية:")
-    print(f"- {view.get('asset_change_state_ar', 'لا توجد ذاكرة محلية كافية لهذا الأصل بعد.')}")
-    print("الانتقال الحالي مقارنة بآخر حالة محفوظة:")
-    print(f"- {view.get('state_transition_ar', 'لا توجد انتقالات حالة محفوظة لهذا الأصل بعد.')}")
-    print("أقرب الحالات المرجعية المشابهة لهذا الأصل:")
-    print(f"- {view.get('case_similarity_ar', 'لا توجد حالات مرجعية مشابهة محفوظة لهذا الأصل بعد.')}")
-    print("الطبع السلوكي التاريخي لهذا الأصل:")
-    print(f"- {view.get('behavior_profile_ar', 'لا توجد بعد ذاكرة سلوكية محلية كافية لهذا الأصل.')}")
-    print("مدى انسجام الحالة الحالية مع طبع الأصل:")
-    print(f"- {view.get('behavior_fit_ar', 'طبع الأصل ما زال قيد البناء.')}")
-
-    market_context = safe_dict_from_api(result.get("market_context"))
-    cross_asset = safe_dict_from_api(result.get("cross_asset_similarity_context"))
-    liq = safe_dict_from_api(result.get("liquidation_absorption_proxy"))
-    if liq:
-        print("\nقراءة السيولة/التصفية التقريبية:")
-        print(f"- {liq.get('state_ar', 'غير متاحة')}")
-        if liq.get("summary_ar"):
-            print(f"- {liq.get('summary_ar')}")
-    if market_context.get("available", False):
-        print("\nسياق السوق العام:")
-        print(f"- {market_context.get('market_regime_ar', 'غير متاح')}")
-        if market_context.get("summary_ar"):
-            print(f"- {market_context.get('summary_ar', '')}")
-    if cross_asset.get("available", False):
-        print("\nأقرب حالات مشابهة من أصول أخرى:")
-        print(f"- {cross_asset.get('summary_ar', 'غير متاح')}")
+    print("\nMemory")
+    print(f"- closest case: {closest_case} (score={closest_score})")
+    print(f"- transition from previous state: {_safe_state_text(result.get('state_transition_reason'), view.get('state_transition_ar', 'غير متاح'))}")
 
 def print_cycle_report(report: Dict[str, Any]) -> None:
     print("\n" + STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
