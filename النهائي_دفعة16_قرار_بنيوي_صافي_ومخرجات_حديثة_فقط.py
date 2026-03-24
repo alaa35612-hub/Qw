@@ -72,7 +72,7 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "SCAN_LOOP_INTERVAL_SEC": 120,
     "FULL_UNIVERSE_SCAN_ENABLED": False,
     "ENABLE_PRE_FILTER": True,  # عند التعطيل: مسح كل السوق (USDT-M perpetual النشط)
-    "PRE_FILTER_SCORE_THRESHOLD": 0.35,
+    "PRE_FILTER_SCORE_THRESHOLD": 0.42,
     "PRE_FILTER_MIN_24H_QUOTE_VOLUME": 500_000.0,
     "PRE_FILTER_MIN_24H_TRADE_COUNT": 250,
     "PRE_FILTER_PRICE_CHANGE_FLOOR": -3.0,   # لا نقصي الحركة السالبة بالكامل (لرصد التحول المبكر)
@@ -110,6 +110,8 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "FUNDING_LIMIT": 6,
     "BASIS_LIMIT": 18,
     "MAX_WORKERS": 6,
+    "CANDIDATE_TOP_N": 200,
+    "NEAR_MISS_TOP_N": 10,
     "CYCLE_CACHE_TTL_SEC": 60,
     "LONGER_CACHE_TTL_SEC": 600,
     "DEBUG_HTTP_ERRORS": False,
@@ -131,6 +133,7 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "ASSET_CASE_SIMILARITY_TOP_K": 3,
     "ASSET_TRANSITION_MEMORY_MAX": 120,
     "ASSET_BEHAVIOR_MIN_CASES": 18,
+    "ACCEPTANCE_MIN_TRIGGER_COUNT": 3,
 }
 
 
@@ -5137,6 +5140,27 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         and not features.get("one_bar_spike", False)
     )
 
+    trigger_count = 0
+    trigger_count += int(bool(ignition_like))
+    trigger_count += int(bool(price_reaccept_proxy or hold_confirmed))
+    trigger_count += int(bool(oi_not_collapsing and (oi_supportive or gap_supportive)))
+    trigger_count += int(bool(flow_supported or buy_pressure_persistent or trade_activity_alive))
+    trigger_count += int(bool(not price_late))
+
+    hard_reject_reasons: List[str] = []
+    if not oi_supportive and safe_float(features.get("oi_delta_3"), 0.0) <= 0:
+        hard_reject_reasons.append("oi build too weak")
+    if not ignition_like:
+        hard_reject_reasons.append("price has not started moving")
+    if not (breakout_touched or close_above or hold_confirmed):
+        hard_reject_reasons.append("price breakout missing")
+    if features["trade_expansion_last"] < EXECUTION_RULES["min_trade_activity_hold"]:
+        hard_reject_reasons.append("trade expansion weak")
+    if features["recent_buy_ratio"] < (EXECUTION_RULES["persistent_taker_buy_ratio"] - 0.01):
+        hard_reject_reasons.append("taker flow too weak")
+    if ratio_conflicted and not (counterflow_active or bullish_rebuild.get("active", False)):
+        hard_reject_reasons.append("ratio conflict remains unresolved")
+
     if strict_acceptance:
         accepted = True
         acceptance_reason = "قبول صارم: إغلاق واختراق مثبت مع دعم OI والتدفق والنشاط"
@@ -5187,6 +5211,17 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         acceptance_reason = "القبول موجود جزئيًا لكن تعارض الفريمات يمنع اعتباره قبولًا كاملًا"
         diagnostics.append(acceptance_reason)
 
+    min_trigger_count = safe_int(DYNAMIC_SETTINGS.get("ACCEPTANCE_MIN_TRIGGER_COUNT", 3), 3)
+    if accepted and (trigger_count < min_trigger_count or hard_reject_reasons):
+        accepted = False
+        partial = True if trigger_count >= max(1, min_trigger_count - 1) else partial
+        if hard_reject_reasons:
+            diagnostics.append("hard reject: " + " | ".join(hard_reject_reasons[:3]))
+        if trigger_count < min_trigger_count:
+            diagnostics.append(f"عدد المحفزات غير كافٍ ({trigger_count} < {min_trigger_count})")
+        if not acceptance_reason:
+            acceptance_reason = "قبول جزئي: البنية موجودة لكن لم تكتمل شروط العبور الصلب"
+
     return {
         "accepted": accepted,
         "partial": partial,
@@ -5195,6 +5230,8 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         "strict_acceptance": strict_acceptance,
         "regime_acceptance": regime_anchor_strength >= 1,
         "structural_acceptance": structural_acceptance,
+        "trigger_count": trigger_count,
+        "hard_reject_reasons": hard_reject_reasons,
         "diagnostics": diagnostics,
     }
 
@@ -6168,8 +6205,11 @@ def prepare_candidates(
         filtered.append((symbol, symbol_meta, ticker_24h, mark_info, score_hint))
 
     filtered.sort(key=lambda item: item[4], reverse=True)
-
-    final_candidates = filtered
+    top_n = safe_int(DYNAMIC_SETTINGS.get("CANDIDATE_TOP_N", 200), 200)
+    if top_n > 0:
+        final_candidates = filtered[:top_n]
+    else:
+        final_candidates = filtered
 
     return [(s, sm, t, m) for s, sm, t, m, _ in final_candidates], {
         "universe_size": len(symbol_universe),
@@ -6180,6 +6220,7 @@ def prepare_candidates(
         "quick_filter_passed": len(filtered),  # backward-compat naming
         "prefilter_passed": len(filtered),
         "deep_candidates": len(final_candidates),
+        "candidate_top_n": top_n,
         "skipped_counter": dict(skipped_counter),
     }
 
@@ -7820,6 +7861,26 @@ def print_symbol_result(result: Dict[str, Any]) -> None:
     print(f"- أقرب حالة: {closest_case} (الدرجة={closest_score})")
     print(f"- الانتقال من الحالة السابقة: {_safe_state_text(result.get('state_transition_reason'), view.get('state_transition_ar', 'غير متاح'))}")
 
+
+def build_near_miss_rows(results: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+    if not results:
+        return []
+    ranked: List[Dict[str, Any]] = []
+    for row in results:
+        state = _safe_state_text(row.get("structural_execution_state"), "unknown")
+        if state == "actionable_now":
+            continue
+        ranked.append(row)
+    ranked.sort(
+        key=lambda r: (
+            -safe_float(r.get("importance_score"), 0.0),
+            -safe_float(safe_dict_from_api(r.get("structural_thesis")).get("top_score"), 0.0),
+            r.get("symbol", ""),
+        )
+    )
+    return ranked[:max(1, limit)]
+
+
 def print_cycle_report(report: Dict[str, Any]) -> None:
     print("\n" + STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
     print("ماسح فرص Binance Futures USDT-M")
@@ -7835,6 +7896,7 @@ def print_cycle_report(report: Dict[str, Any]) -> None:
     print(f"- الفلتر الجديد (مسبق): {'مفعّل' if prep.get('prefilter_enabled', True) else 'معطّل'}")
     print(f"- مجتازة للفلتر/الكون: {prep.get('prefilter_passed', prep.get('quick_filter_passed', 0))}")
     print(f"- رموز التحليل العميق الفعلية: {prep['deep_candidates']}")
+    print(f"- حد المرشحين الأعلى المطبق: {prep.get('candidate_top_n', 'غير محدد')}")
 
     print("\nالملخص البنيوي للدورة:")
     summary = report["summary"]
@@ -7873,6 +7935,19 @@ def print_cycle_report(report: Dict[str, Any]) -> None:
 
     if not printed_results:
         print("- لا توجد نتائج مطابقة للفلتر الحالي في هذه الدورة")
+        near_n = safe_int(DYNAMIC_SETTINGS.get("NEAR_MISS_TOP_N", 10), 10)
+        near_misses = build_near_miss_rows(report.get("results", []), near_n)
+        if near_misses:
+            print(f"- أقرب الحالات (Near Misses) أعلى {len(near_misses)}:")
+            for row in near_misses:
+                symbol = _safe_state_text(row.get("symbol"), "UNKNOWN")
+                imp = format_num(row.get("importance_score"), 2)
+                exec_state = _safe_state_text(row.get("structural_execution_state_ar"), _safe_state_text(row.get("structural_execution_state"), "unknown"))
+                acceptance = safe_dict_from_api(row.get("acceptance"))
+                trigger_count = safe_int(acceptance.get("trigger_count"), 0)
+                hard_rejects = safe_list_from_api(acceptance.get("hard_reject_reasons"))
+                reject_text = ", ".join(hard_rejects[:2]) if hard_rejects else "لا يوجد hard reject صريح"
+                print(f"  • {symbol} | importance={imp} | state={exec_state} | triggers={trigger_count} | hard_reject={reject_text}")
     for row in printed_results:
         print_symbol_result(row)
 
