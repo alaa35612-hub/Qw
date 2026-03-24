@@ -5402,16 +5402,6 @@ def analyze_symbol_legacy_material_provider(
 
     acceptance = detect_acceptance_state(features)
     failure = detect_failure_continuation(features, acceptance, oi_info)
-    legacy_decision = build_final_decision(
-        symbol=symbol,
-        features=features,
-        family_info=family_info,
-        stage_info=stage_info,
-        oi_info=oi_info,
-        acceptance=acceptance,
-        failure=failure,
-    )
-
     return {
         "ok": True,
         "symbol": symbol,
@@ -5421,7 +5411,7 @@ def analyze_symbol_legacy_material_provider(
         "oi_info": oi_info,
         "acceptance": acceptance,
         "failure": failure,
-        "legacy_decision": legacy_decision,
+        "legacy_decision": {},
     }
 
 
@@ -5435,21 +5425,22 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
     acceptance = safe_dict_from_api(raw_materials.get("acceptance"))
     failure = safe_dict_from_api(raw_materials.get("failure"))
     legacy_decision = safe_dict_from_api(raw_materials.get("legacy_decision"))
+    # legacy_decision يبقى للحفاظ على التوافق فقط، وليس طبقة حاكمة للقرار.
 
     result = {
         "symbol": symbol,
         "analysis_source": "structural_orchestrator",
         "analysis_center": "structural_casefile",
-        # مواد خام بنيوية / توافق رجعي
-        "family": legacy_decision.get("family", family_info.get("family")),
-        "stage": legacy_decision.get("stage", stage_info.get("stage", "WATCH")),
-        "oi_state": legacy_decision.get("oi_state", oi_info.get("oi_state", "neutral")),
-        "discovery_state": legacy_decision.get("discovery_state", "غير مكتشفة بنيويًا"),
-        "execution_state": legacy_decision.get("execution_state", "غير قابلة للتنفيذ"),
-        "final_bucket": legacy_decision.get("final_bucket", "Discovered but not actionable"),
-        "actionable_now": legacy_decision.get("actionable_now", False),
-        "acceptance_state": legacy_decision.get("acceptance_state", acceptance.get("state", "no")),
-        "continuation_state": legacy_decision.get("continuation_state", failure.get("continuation_state", "no")),
+        # مواد خام بنيوية فقط (بدون حاكمية Legacy)
+        "family": family_info.get("family"),
+        "stage": stage_info.get("stage", "WATCH"),
+        "oi_state": oi_info.get("oi_state", "neutral"),
+        "discovery_state": "مكتشفة بنيويًا" if family_info.get("family") else "غير مكتشفة بنيويًا",
+        "execution_state": "قيد الحسم البنيوي",
+        "final_bucket": "Discovered but not actionable",
+        "actionable_now": False,
+        "acceptance_state": acceptance.get("state", "no"),
+        "continuation_state": failure.get("continuation_state", "no"),
         "decisive_factor": family_info.get("decisive_factor", "لا يوجد عامل حاسم بعد"),
         "funding_context": features.get("funding_context", "unknown"),
         "basis_context": features.get("basis_context", "missing"),
@@ -5464,11 +5455,11 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
         "zscores": features.get("zscores", {}),
         "oi_dynamics": oi_info,
         "counterflow_pattern": features.get("counterflow_pattern", {}),
-        "relief_bounce_after_flush": legacy_decision.get("relief_bounce_after_flush", {}),
-        "bullish_rebuild_after_flush": legacy_decision.get("bullish_rebuild_after_flush", {}),
-        "failed_rebuild_after_flush": legacy_decision.get("failed_rebuild_after_flush", {}),
-        "post_flush_pattern_name": legacy_decision.get("post_flush_pattern_name"),
-        "post_flush_pattern": legacy_decision.get("post_flush_pattern", {}),
+        "relief_bounce_after_flush": {},
+        "bullish_rebuild_after_flush": {},
+        "failed_rebuild_after_flush": {},
+        "post_flush_pattern_name": None,
+        "post_flush_pattern": {},
         "family_scores": family_info.get("family_scores", {}),
         "family_reasons": family_info.get("family_reasons", {}),
         "family_diagnostics": family_info.get("diagnostics", []),
@@ -5476,20 +5467,20 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
         "oi_diagnostics": oi_info.get("diagnostics", []),
         "acceptance_diagnostics": acceptance.get("diagnostics", []),
         "failure_diagnostics": failure.get("diagnostics", []),
-        "decision_diagnostics": legacy_decision.get("diagnostics", []),
-        "decision_reason": legacy_decision.get("decision_reason", "لا يوجد"),
-        "discovery_reason": legacy_decision.get("discovery_reason", ""),
-        "stage_reason": legacy_decision.get("stage_reason", stage_info.get("stage_reason", "")),
-        "acceptance_reason": legacy_decision.get("acceptance_reason", acceptance.get("acceptance_reason", "")),
-        "continuation_reason": legacy_decision.get("continuation_reason", failure.get("failure_reason", "")),
-        "promotion_reason": legacy_decision.get("promotion_reason", ""),
-        "not_actionable_reason": legacy_decision.get("not_actionable_reason", ""),
-        "regime_pattern": legacy_decision.get("regime_pattern", "NEUTRAL_REGIME"),
-        "trigger_pattern": legacy_decision.get("trigger_pattern", "NO_TRIGGER"),
-        "execution_pattern": legacy_decision.get("execution_pattern", "OBSERVE_ONLY"),
-        "ratio_alignment": legacy_decision.get("ratio_alignment", features.get("ratio_alignment", {})),
-        "ratio_conflict": legacy_decision.get("ratio_conflict", features.get("ratio_conflict", {})),
-        "extreme_engine": legacy_decision.get("extreme_engine", features.get("extreme_engine", {})),
+        "decision_diagnostics": [],
+        "decision_reason": "قرار أولي قيد الحسم عبر Structural Thesis وExecution Verdict",
+        "discovery_reason": family_info.get("decisive_factor", ""),
+        "stage_reason": stage_info.get("stage_reason", ""),
+        "acceptance_reason": acceptance.get("acceptance_reason", ""),
+        "continuation_reason": failure.get("failure_reason", ""),
+        "promotion_reason": "",
+        "not_actionable_reason": "",
+        "regime_pattern": "NEUTRAL_REGIME",
+        "trigger_pattern": "NO_TRIGGER",
+        "execution_pattern": "OBSERVE_ONLY",
+        "ratio_alignment": features.get("ratio_alignment", {}),
+        "ratio_conflict": features.get("ratio_conflict", {}),
+        "extreme_engine": features.get("extreme_engine", {}),
         "asset_memory_profile": features.get("asset_memory_profile", {}),
         "asset_memory_context": features.get("asset_memory_context", {}),
         "leader_type": None,
@@ -5515,13 +5506,13 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
             "failure": failure,
         },
         "legacy_decision_snapshot": {
-            "family": legacy_decision.get("family", family_info.get("family")),
-            "stage": legacy_decision.get("stage", stage_info.get("stage", "WATCH")),
-            "execution_state": legacy_decision.get("execution_state"),
-            "final_bucket": legacy_decision.get("final_bucket"),
-            "actionable_now": legacy_decision.get("actionable_now"),
-            "not_actionable_reason": legacy_decision.get("not_actionable_reason"),
-            "decision_reason": legacy_decision.get("decision_reason"),
+            "family": family_info.get("family"),
+            "stage": stage_info.get("stage", "WATCH"),
+            "execution_state": "non_governing_snapshot",
+            "final_bucket": "Discovered but not actionable",
+            "actionable_now": False,
+            "not_actionable_reason": "",
+            "decision_reason": "legacy detached from governing path",
         },
         "diagnostics": (
             features.get("diagnostics", [])
@@ -5530,12 +5521,8 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
             + oi_info.get("diagnostics", [])
             + acceptance.get("diagnostics", [])
             + failure.get("diagnostics", [])
-            + legacy_decision.get("relief_bounce_after_flush", {}).get("diagnostics", [])
-            + legacy_decision.get("bullish_rebuild_after_flush", {}).get("diagnostics", [])
-            + (legacy_decision.get("extreme_engine", {}) or {}).get("diagnostics", [])
-            + legacy_decision.get("ratio_conflict", {}).get("diagnostics", [])
-            + legacy_decision.get("failed_rebuild_after_flush", {}).get("diagnostics", [])
-            + legacy_decision.get("diagnostics", [])
+            + (features.get("extreme_engine", {}) or {}).get("diagnostics", [])
+            + safe_dict_from_api(features.get("ratio_conflict")).get("diagnostics", [])
         ),
     }
     return result
