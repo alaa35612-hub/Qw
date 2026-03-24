@@ -5650,6 +5650,18 @@ def analyze_symbol_structural(
         result["importance_score"] = compute_importance_score(result)
         if isinstance(result.get("structural_case"), dict):
             result["structural_case"]["importance_score"] = result["importance_score"]
+
+        # إعادة حساب الانتقال/التشابه بعد اكتمال القرار البنيوي النهائي
+        final_transition = detect_state_transition(prev_state, result)
+        result["state_transition"] = final_transition.get("state_transition")
+        result["state_transition_reason"] = final_transition.get("reason", "")
+        asset_local_memory_latest = load_asset_memory(symbol)
+        result["state_transition_context"] = build_asset_state_transition_context(asset_local_memory_latest, result)
+        result["case_similarity_context"] = build_asset_case_similarity_context(asset_local_memory_latest, result.get("market_features") or {}, result)
+        final_case_match = match_closest_case(build_case_vector(result.get("market_features") or {}, result), load_case_library())
+        result["closest_case_match"] = final_case_match.get("case_name")
+        result["closest_case_score"] = safe_float(final_case_match.get("score"), 0.0)
+
         result.update(build_arabic_output_fields(result))
         result["liquidation_absorption_proxy"] = detect_liquidation_absorption_proxy(result.get("market_features") or {}, result)
         save_current_symbol_state(symbol, result)
