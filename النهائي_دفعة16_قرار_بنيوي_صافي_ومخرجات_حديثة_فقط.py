@@ -71,6 +71,13 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "SCAN_LOOP_ENABLED": False,
     "SCAN_LOOP_INTERVAL_SEC": 120,
     "FULL_UNIVERSE_SCAN_ENABLED": False,
+    "ENABLE_PRE_FILTER": True,  # عند التعطيل: مسح كل السوق (USDT-M perpetual النشط)
+    "PRE_FILTER_SCORE_THRESHOLD": 0.35,
+    "PRE_FILTER_MIN_24H_QUOTE_VOLUME": 500_000.0,
+    "PRE_FILTER_MIN_24H_TRADE_COUNT": 250,
+    "PRE_FILTER_PRICE_CHANGE_FLOOR": -3.0,   # لا نقصي الحركة السالبة بالكامل (لرصد التحول المبكر)
+    "PRE_FILTER_PRICE_CHANGE_CEIL": 35.0,    # سقف واسع لتجنب رفض الانفجارات المبكرة
+    "APPLY_CANDIDATE_CAP_AFTER_FILTER": True,
     "MAX_CANDIDATES_AFTER_FILTER": 18,
     "TOP_N_BY_24H_VOLUME": 60,
     "MIN_24H_QUOTE_VOLUME": 5_000_000.0,
@@ -374,7 +381,7 @@ def apply_structural_center(result: Dict[str, Any]) -> Dict[str, Any]:
     if not execution_verdict:
         return result
 
-    result["legacy_decision_snapshot"] = {
+    result["pre_structural_snapshot"] = {
         "execution_state": result.get("execution_state"),
         "final_bucket": result.get("final_bucket"),
         "actionable_now": result.get("actionable_now"),
@@ -1490,6 +1497,492 @@ def update_asset_local_memory(symbol: str, features: Dict[str, Any], result: Opt
     save_json_atomic(get_asset_memory_path(symbol), memory_data)
 
 
+def load_asset_memory(symbol: str) -> Dict[str, Any]:
+    """واجهة V2 مطلوبة: تعيد ذاكرة الأصل المحلية."""
+    return load_asset_local_memory(symbol)
+
+
+def build_asset_behavior_profile(symbol: str, features: Dict[str, Any], memory: Dict[str, Any]) -> Dict[str, Any]:
+    """واجهة V2 مطلوبة: ملف سلوكي مركّز لكل أصل."""
+    profile = build_asset_local_memory_profile(symbol, memory)
+    behavior_context = build_asset_behavior_profile_context(memory, {"primary_hypothesis": None, "final_bucket": "Discovered but not actionable"})
+    return {
+        "symbol": symbol,
+        "available": profile.get("available", False),
+        "timeframes": profile.get("timeframes", {}),
+        "global": profile.get("global", {}),
+        "behavior_context": behavior_context,
+        "squeeze_prone": behavior_context.get("dominant_behavior") == "squeeze_bias",
+        "flush_prone": behavior_context.get("dominant_behavior") == "flush_failure_bias",
+        "fakeout_prone": safe_float(features.get("noise_metric"), 0.0) >= 2.0,
+        "counterflow_prone": behavior_context.get("dominant_leader") == "counterflow_led",
+    }
+
+
+def update_asset_memory(symbol: str, features: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """واجهة V2 مطلوبة: تحديث ذاكرة الأصل."""
+    update_asset_local_memory(symbol, features, result)
+
+
+def classify_relative_extreme(value: float, distribution: Dict[str, Any]) -> Dict[str, Any]:
+    q10 = safe_float(distribution.get("q10"), value)
+    q25 = safe_float(distribution.get("q25"), value)
+    q75 = safe_float(distribution.get("q75"), value)
+    q90 = safe_float(distribution.get("q90"), value)
+    if value >= q90:
+        state = "upper_extreme"
+    elif value >= q75:
+        state = "upper_band"
+    elif value <= q10:
+        state = "lower_extreme"
+    elif value <= q25:
+        state = "lower_band"
+    else:
+        state = "neutral"
+    return {"state": state, "value": value, "distribution": distribution}
+
+
+def build_ratio_extreme_profile(features: Dict[str, Any], asset_memory: Dict[str, Any]) -> Dict[str, Any]:
+    ratio_multi_tf = safe_dict_from_api(features.get("ratio_multi_tf"))
+    memory_profile = safe_dict_from_api(asset_memory.get("timeframes"))
+    profile: Dict[str, Any] = {"components": {}, "summary": {}}
+    for tf in ("5m", "15m", "1h", "4h"):
+        tf_ratios = safe_dict_from_api(ratio_multi_tf.get(tf))
+        tf_mem = safe_dict_from_api(memory_profile.get(tf))
+        for component in ("position", "account", "global"):
+            key = f"{tf}_{component}"
+            value = safe_float(safe_dict_from_api(tf_ratios.get(component)).get("last"), 0.0)
+            dist = safe_dict_from_api(tf_mem.get(f"{component}_last"))
+            profile["components"][key] = classify_relative_extreme(value, dist)
+    profile["summary"]["higher_regime"] = safe_dict_from_api(features.get("extreme_engine")).get("higher_regime", "neutral")
+    return profile
+
+
+def detect_extreme_inflection(extreme_profile: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    components = safe_dict_from_api(extreme_profile.get("components"))
+    inflection: Dict[str, Any] = {}
+    for key, payload in components.items():
+        state = _safe_state_text(safe_dict_from_api(payload).get("state"), "neutral")
+        if state == "upper_extreme":
+            inflection[key] = "upper_extreme_rolling_over" if safe_float(features.get("ret_1"), 0.0) < 0 else "plateau_extreme"
+        elif state == "lower_extreme":
+            inflection[key] = "lower_extreme_rebounding" if safe_float(features.get("ret_1"), 0.0) > 0 else "plateau_extreme"
+        else:
+            inflection[key] = "neutral"
+    return {"states": inflection}
+
+
+def score_position_led_structure(features: Dict[str, Any]) -> float:
+    gap = safe_dict_from_api(features.get("position_account_gap"))
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    score = 0.0
+    score += clamp(safe_float(gap.get("position_lead"), 0.0) * 8.0, 0.0, 0.45)
+    if ratio_alignment.get("overall_supportive", False):
+        score += 0.20
+    if safe_float(features.get("oi_delta_3"), 0.0) > 0:
+        score += 0.15
+    if bool(features.get("flow_supported", False)):
+        score += 0.12
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def score_account_led_structure(features: Dict[str, Any]) -> float:
+    gap = safe_dict_from_api(features.get("position_account_gap"))
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    score = 0.0
+    score += clamp(safe_float(gap.get("account_lead"), 0.0) * 8.0, 0.0, 0.45)
+    if ratio_alignment.get("higher_tf_supportive", False):
+        score += 0.20
+    if safe_float(features.get("oi_delta_1"), 0.0) > 0:
+        score += 0.10
+    if safe_float(features.get("recent_buy_ratio"), 0.0) >= EXECUTION_RULES["persistent_taker_buy_ratio"]:
+        score += 0.12
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def score_consensus_structure(features: Dict[str, Any]) -> float:
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    score = 0.0
+    if ratio_alignment.get("overall_supportive", False):
+        score += 0.35
+    if ratio_alignment.get("higher_tf_supportive", False):
+        score += 0.25
+    if not ratio_alignment.get("overall_conflict", False):
+        score += 0.15
+    if safe_float(features.get("oi_delta_3"), 0.0) > 0 and bool(features.get("flow_supported", False)):
+        score += 0.15
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def score_counterflow_structure(features: Dict[str, Any]) -> float:
+    pattern = safe_dict_from_api(features.get("counterflow_pattern"))
+    score = 0.0
+    if pattern.get("active", False):
+        score += 0.45
+    if pattern.get("explosive_oi", False):
+        score += 0.20
+    if pattern.get("activity_expanding", False):
+        score += 0.15
+    if bool(features.get("flow_supported", False)):
+        score += 0.10
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def determine_leader_type(features: Dict[str, Any]) -> Dict[str, Any]:
+    scores = {
+        "position_led": score_position_led_structure(features),
+        "account_led": score_account_led_structure(features),
+        "consensus_led": score_consensus_structure(features),
+        "counterflow_led": score_counterflow_structure(features),
+    }
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best_name, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if abs(best_score - second_score) <= 0.07:
+        leader_type = "mixed"
+    else:
+        leader_type = best_name
+    return {"leader_type": leader_type, "leader_scores": scores, "strength": round(best_score, 3)}
+
+
+def build_hypothesis_scores(
+    features_or_result: Dict[str, Any],
+    regime_info: Optional[Dict[str, Any]] = None,
+    leader_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, float]:
+    """واجهة V2: تدعم النداء القديم (result) والنداء الجديد (features+regime+leader)."""
+    if regime_info is None and leader_info is None and ("market_features" in features_or_result or "family" in features_or_result):
+        return _build_hypothesis_scores_legacy(features_or_result)
+    synthetic_result = {
+        "market_features": features_or_result,
+        "regime_pattern": safe_dict_from_api(regime_info).get("regime_pattern"),
+        "leader_type": safe_dict_from_api(leader_info).get("leader_type"),
+    }
+    return _build_hypothesis_scores_legacy(synthetic_result)
+
+
+def compute_confidence_score(features: Dict[str, Any], result: Dict[str, Any]) -> float:
+    return derive_confidence_score({"market_features": features, **result})
+
+
+def compute_uncertainty_score(features: Dict[str, Any], result: Dict[str, Any]) -> float:
+    return derive_uncertainty_score({"market_features": features, **result})
+
+
+def compute_conflict_score(features: Dict[str, Any], result: Dict[str, Any]) -> float:
+    return derive_conflict_score({"market_features": features, **result})
+
+
+def load_previous_symbol_state(symbol: str) -> Dict[str, Any]:
+    memory = load_asset_local_memory(symbol)
+    return safe_dict_from_api(memory.get("last_snapshot"))
+
+
+def detect_state_transition(previous: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    context = build_asset_state_transition_context({"last_snapshot": previous}, current)
+    return {"state_transition": context.get("transition_key"), "reason": context.get("transition_ar", "")}
+
+
+def save_current_symbol_state(symbol: str, current: Dict[str, Any]) -> None:
+    memory = load_asset_local_memory(symbol)
+    memory["last_snapshot"] = {
+        "updated_at": utc_now_iso(),
+        "final_bucket": current.get("final_bucket"),
+        "primary_hypothesis": current.get("primary_hypothesis"),
+        "regime_pattern": current.get("regime_pattern"),
+        "trigger_pattern": current.get("trigger_pattern"),
+        "execution_pattern": current.get("execution_pattern"),
+        "importance_score": safe_float(current.get("importance_score"), 0.0),
+    }
+    save_json_atomic(get_asset_memory_path(symbol), memory)
+
+
+def load_case_library() -> List[Dict[str, Any]]:
+    data = load_global_case_library()
+    return safe_list_from_api(data.get("cases"))
+
+
+def build_case_vector(features: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, float]:
+    return build_asset_case_vector(features, result)
+
+
+def match_closest_case(case_vector: Dict[str, float], case_library: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not case_library:
+        return {"case_name": None, "score": 0.0}
+    scored = []
+    for case in case_library:
+        if not isinstance(case, dict):
+            continue
+        sim = _compute_case_similarity_score(case_vector, safe_dict_from_api(case.get("vector")))
+        scored.append((sim, case))
+    if not scored:
+        return {"case_name": None, "score": 0.0}
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top_score, top_case = scored[0]
+    return {
+        "case_name": top_case.get("primary_hypothesis") or top_case.get("regime_pattern"),
+        "score": round(top_score, 3),
+        "case_reason": top_case.get("final_bucket"),
+    }
+
+
+def build_causal_chain(features: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
+    chain: List[str] = []
+    tf_4h = safe_dict_from_api(safe_dict_from_api(features.get("multi_tf")).get("4h"))
+    tf_1h = safe_dict_from_api(safe_dict_from_api(features.get("multi_tf")).get("1h"))
+    if tf_4h.get("accumulation", False):
+        chain.append("4h accumulation regime detected")
+    if safe_float(tf_1h.get("oi_delta_3"), 0.0) > 0:
+        chain.append("1h OI remained supportive under pressure")
+    if bool(features.get("higher_low_bias", False)):
+        chain.append("5m downside rejection appeared")
+    if safe_float(safe_dict_from_api(features.get("position_account_gap")).get("position_lead"), 0.0) > 0:
+        chain.append("position/account inflection turned upward")
+    if bool(features.get("flow_supported", False)):
+        chain.append("taker flow confirmed breakout attempt")
+    if _safe_state_text(result.get("acceptance_state"), "no") in {"yes", "partial"}:
+        chain.append("early acceptance started before classical hold fully matured")
+    return chain
+
+
+def build_invalidation_reason(features: Dict[str, Any], result: Dict[str, Any]) -> str:
+    reasons: List[str] = []
+    if not bool(features.get("hold_above_breakout_3bars", True)):
+        reasons.append("loss of reclaimed level")
+    if safe_float(features.get("oi_delta_1"), 0.0) <= EXECUTION_RULES["oi_collapse_pct"]:
+        reasons.append("oi contraction")
+    ratio_conflict = safe_dict_from_api(result.get("ratio_conflict"))
+    if ratio_conflict.get("state") == "conflicted":
+        reasons.append("ratio relapse / timeframe conflict")
+    return " + ".join(reasons) if reasons else derive_invalidation_reason_ar(result)
+
+
+def build_next_failure_mode(features: Dict[str, Any], result: Dict[str, Any]) -> str:
+    if safe_float(features.get("ret_1"), 0.0) > 0 and safe_float(features.get("oi_delta_1"), 0.0) < 0:
+        return "oi_expansion_without_bullish_confirmation"
+    if bool(features.get("one_bar_spike", False)):
+        return "one_bar_spike_rejection"
+    if safe_dict_from_api(result.get("failure")).get("early_failure", False):
+        return "early_failure_continuation"
+    return derive_next_failure_mode_ar(result)
+
+
+def build_decision_trace(result: Dict[str, Any]) -> Dict[str, str]:
+    view = build_arabic_output_fields(result)
+    flow_mismatch = safe_dict_from_api(result.get("flow_quality_mismatch"))
+    flow_text = _safe_state_text(result.get("flow_quality"), "غير محسوم")
+    if flow_mismatch.get("mismatch", False):
+        flow_text = _safe_state_text(flow_mismatch.get("warning"), flow_text)
+    return {
+        "context": view.get("regime_pattern_ar", "غير معروف"),
+        "regime_v2": view.get("market_regime_v2_ar", "نظام غير محسوم"),
+        "leadership": view.get("leader_type_ar", "غير معروف"),
+        "actor_intent": view.get("actor_intent_ar", "نية غير محسومة"),
+        "oi_relation": view.get("oi_state_ar", "غير معروف"),
+        "flow": flow_text,
+        "trigger": view.get("trigger_pattern_ar", "غير معروف"),
+        "acceptance": _safe_state_text(result.get("acceptance_reason"), "غير محسوم"),
+        "hypothesis": view.get("primary_hypothesis_ar", "غير محسومة"),
+        "decision": view.get("structural_execution_state_ar", "غير محسوم"),
+        "entry_window": view.get("entry_window_state_ar", "مراقبة"),
+        "invalidation": view.get("invalidation_reason_ar", "لا يوجد إبطال محدد بعد"),
+    }
+
+
+def classify_market_regime_v2(features: Dict[str, Any], asset_memory: Dict[str, Any]) -> Dict[str, Any]:
+    """تصنيف بيئة السوق بأسلوب أقرب لقراءة محلل بشري (trend/range/squeeze/shock)."""
+    oi_delta_3 = safe_float(features.get("oi_delta_3"), 0.0)
+    oi_delta_1 = safe_float(features.get("oi_delta_1"), 0.0)
+    ret_3 = safe_float(features.get("ret_3"), 0.0)
+    ret_1 = safe_float(features.get("ret_1"), 0.0)
+    one_bar_spike = bool(features.get("one_bar_spike", False))
+    hold_above_breakout = bool(features.get("hold_above_breakout_3bars", False))
+    flow_supported = bool(features.get("flow_supported", False))
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    extreme_regime = _safe_state_text(safe_dict_from_api(features.get("extreme_engine")).get("higher_regime"), "neutral")
+    memory_profile = safe_dict_from_api(asset_memory.get("profile"))
+    volatility_state = _safe_state_text(memory_profile.get("volatility_state"), "normal")
+
+    if one_bar_spike and abs(ret_1) >= 0.02:
+        state = "shock_event"
+        confidence = 0.78
+    elif hold_above_breakout and oi_delta_3 > 0 and flow_supported:
+        state = "trend_expansion"
+        confidence = 0.72
+    elif ratio_alignment.get("overall_conflict", False) and abs(ret_3) < 0.01:
+        state = "range_conflict"
+        confidence = 0.61
+    elif extreme_regime in {"upper_extreme", "lower_extreme"} and abs(oi_delta_1) < 0.05:
+        state = "squeeze_coil"
+        confidence = 0.58
+    else:
+        state = "transitional"
+        confidence = 0.52
+
+    return {
+        "state": state,
+        "confidence": round(confidence, 3),
+        "volatility_state": volatility_state,
+    }
+
+
+def classify_actor_intent(features: Dict[str, Any]) -> Dict[str, Any]:
+    """استدلال نية المشاركين من علاقة السعر/الـOI ونِسَب الحسابات/المراكز."""
+    ret_1 = safe_float(features.get("ret_1"), 0.0)
+    oi_delta_1 = safe_float(features.get("oi_delta_1"), 0.0)
+    oi_delta_3 = safe_float(features.get("oi_delta_3"), 0.0)
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    pos_norm = safe_float((ratio_alignment.get("position") or {}).get("normalized"), 0.0)
+    acc_norm = safe_float((ratio_alignment.get("account") or {}).get("normalized"), 0.0)
+    flow_supported = bool(features.get("flow_supported", False))
+
+    if ret_1 > 0 and oi_delta_1 > 0 and flow_supported:
+        state = "new_longs_building"
+        confidence = 0.76
+    elif ret_1 > 0 and oi_delta_1 < 0:
+        state = "short_covering"
+        confidence = 0.67
+    elif ret_1 < 0 and oi_delta_1 > 0:
+        state = "new_shorts_building"
+        confidence = 0.72
+    elif ret_1 < 0 and oi_delta_1 < 0:
+        state = "long_unwinding"
+        confidence = 0.64
+    elif oi_delta_3 > 0 and pos_norm > acc_norm:
+        state = "position_led_accumulation"
+        confidence = 0.61
+    else:
+        state = "balanced_wait"
+        confidence = 0.50
+
+    return {"state": state, "confidence": round(confidence, 3)}
+
+
+def compute_breakout_quality_score(features: Dict[str, Any], result: Dict[str, Any]) -> float:
+    score = 0.0
+    if bool(features.get("hold_above_breakout_3bars", False)):
+        score += 0.35
+    if safe_float(features.get("oi_delta_3"), 0.0) > 0:
+        score += 0.22
+    if bool(features.get("flow_supported", False)):
+        score += 0.20
+    if not bool(features.get("one_bar_spike", False)):
+        score += 0.12
+    if _safe_state_text(result.get("acceptance_state"), "no") in {"yes", "partial"}:
+        score += 0.11
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def build_early_rise_index(features: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    """مؤشر مركب (0-100) لاكتشاف احتمالية بداية الارتفاع مبكرًا."""
+    regime = safe_dict_from_api(result.get("market_regime_v2"))
+    actor = safe_dict_from_api(result.get("actor_intent"))
+    breakout_quality = safe_float(result.get("breakout_quality_score"), 0.0)
+    uncertainty = safe_float(result.get("uncertainty_score"), 0.0)
+    conflict = safe_float(result.get("conflict_score"), 0.0)
+
+    regime_score = safe_float(regime.get("confidence"), 0.5)
+    actor_score = safe_float(actor.get("confidence"), 0.5)
+    setup = (0.30 * regime_score) + (0.35 * actor_score) + (0.35 * breakout_quality)
+    penalty = min(0.45, (0.30 * uncertainty) + (0.35 * conflict))
+    final_score = clamp((setup - penalty) * 100.0, 0.0, 100.0)
+
+    if final_score >= 85:
+        state = "actionable_setup"
+    elif final_score >= 70:
+        state = "trigger_watch"
+    elif final_score >= 55:
+        state = "early_watch"
+    else:
+        state = "no_edge"
+    return {"score": round(final_score, 2), "state": state}
+
+
+def derive_entry_window_state(result: Dict[str, Any]) -> str:
+    early_state = _safe_state_text(safe_dict_from_api(result.get("early_rise_index")).get("state"), "no_edge")
+    final_bucket = _safe_state_text(result.get("final_bucket"), "Discovered but not actionable")
+    if final_bucket == "Actionable now" and early_state in {"actionable_setup", "trigger_watch"}:
+        return "trigger_confirmed"
+    if early_state == "trigger_watch":
+        return "await_trigger"
+    if early_state == "early_watch":
+        return "setup_building"
+    return "avoid_or_wait"
+
+
+def build_cvd_explanatory_context(result: Dict[str, Any]) -> Dict[str, Any]:
+    """CVD دور تفسيري فقط: لا يدخل كحاكم قرار مستقل."""
+    features = safe_dict_from_api(result.get("market_features"))
+    cvd_metrics = safe_dict_from_api(features.get("cvd_metrics") or result.get("cvd_metrics"))
+    slope = safe_float(cvd_metrics.get("cvd_slope"), 0.0)
+    persistence = safe_float(cvd_metrics.get("cvd_positive_persistence"), 0.0)
+    ratio = safe_float(cvd_metrics.get("cvd_volume_ratio"), 0.0)
+    if slope > 0 and persistence >= 0.50:
+        state = "confirmatory_positive"
+        summary_ar = "CVD يؤكد الاتجاه الحالي كمؤشر تأكيدي، وليس كحاكم قرار مستقل."
+    elif slope < 0 and persistence < 0.40:
+        state = "confirmatory_negative"
+        summary_ar = "CVD يظهر تباعدًا سلبيًا تحذيريًا، لكنه يظل عنصر تفسير لا عنصر حسم."
+    else:
+        state = "neutral_explanatory"
+        summary_ar = "CVD حيادي تفسيريًا ولا يضيف ترجيحًا حاسمًا بمفرده."
+    return {
+        "state": state,
+        "summary_ar": summary_ar,
+        "cvd_slope": round(slope, 4),
+        "cvd_positive_persistence": round(persistence, 4),
+        "cvd_volume_ratio": round(ratio, 6),
+    }
+
+
+def run_structural_conformance_audit(result: Dict[str, Any]) -> Dict[str, Any]:
+    """تدقيق مطابقة بنيوي: يتأكد أن الحاكمية النهائية بنيوية لا تصنيفية."""
+    issues: List[str] = []
+    if result.get("family") is not None:
+        issues.append("family يجب أن يبقى خارج طبقة النتيجة التشغيلية الحاكمة")
+    if result.get("stage") is not None:
+        issues.append("stage يجب أن يبقى خارج طبقة النتيجة التشغيلية الحاكمة")
+    if not safe_dict_from_api(result.get("execution_verdict")):
+        issues.append("execution_verdict مفقود")
+    if not safe_dict_from_api(result.get("structural_thesis")):
+        issues.append("structural_thesis مفقودة")
+    if not safe_dict_from_api(result.get("adversarial_review")):
+        issues.append("adversarial_review مفقودة")
+    return {
+        "passed": len(issues) == 0,
+        "issues": issues,
+        "summary_ar": "مطابقة بنيوية كاملة." if not issues else " | ".join(issues),
+    }
+
+
+def apply_v2_decision_gate(result: Dict[str, Any], features: Dict[str, Any]) -> Dict[str, Any]:
+    """Gate نهائي للقرار وفق منطق V2 (فرضية/ثقة/عدم يقين/تأخر/إبطال قريب)."""
+    result = dict(result)
+    primary = _safe_state_text(result.get("primary_hypothesis"), "undetermined")
+    confidence = safe_float(result.get("confidence_score"), 0.0)
+    uncertainty = safe_float(result.get("uncertainty_score"), 1.0)
+    acceptance_state = _safe_state_text(result.get("acceptance_state"), "no")
+    price_late = bool(features.get("price_late", False))
+    next_failure = _safe_state_text(result.get("next_failure_mode"), "")
+
+    strong_hypothesis = confidence >= 0.60 and primary not in {"undetermined", "late_blowoff", "failed_rebuild_after_flush"}
+    failure_near = next_failure in {"early_failure_continuation", "oi_expansion_without_bullish_confirmation", "one_bar_spike_rejection"}
+    transition_key = _safe_state_text(result.get("state_transition"), "")
+
+    if strong_hypothesis and uncertainty <= 0.45 and acceptance_state == "yes" and not price_late and not failure_near:
+        result["final_bucket"] = "Actionable now"
+        result["actionable_now"] = True
+    elif result.get("final_bucket") == "Actionable now" and (uncertainty > 0.62 or price_late or failure_near):
+        result["final_bucket"] = "Discovered but not actionable"
+        result["actionable_now"] = False
+        result["not_actionable_reason"] = "V2 gate downgraded: uncertainty/late/failure risk"
+    elif transition_key in {"initial_observation", "state_shift"} and result.get("final_bucket") == "Actionable now":
+        result["final_bucket"] = "Discovered but not actionable"
+        result["actionable_now"] = False
+        result["not_actionable_reason"] = "V2 gate: transition still early"
+    return result
+
+
 def compute_true_range(current_bar: Dict[str, float], prev_close: float) -> float:
     high = current_bar["high"]
     low = current_bar["low"]
@@ -1713,7 +2206,13 @@ def build_symbol_universe(exchange_info: Dict[str, Any]) -> Dict[str, Dict[str, 
     return symbols
 
 
-def quick_filter(symbol: str, symbol_meta: Dict[str, Any], ticker_24h: Dict[str, Any], mark_info: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def early_rise_prefilter(symbol: str, symbol_meta: Dict[str, Any], ticker_24h: Dict[str, Any], mark_info: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    فلتر الجيل الجديد:
+    - لا يعتمد على إقصاء حاد كما في الفلتر القديم.
+    - يستخدم درجة مرنة لرصد العملات المرشحة لحركة مبكرة.
+    - يظل خيار تعطيله متاحًا لمسح كل السوق.
+    """
     reasons: List[str] = []
 
     if symbol_meta.get("status") != "TRADING":
@@ -1732,29 +2231,50 @@ def quick_filter(symbol: str, symbol_meta: Dict[str, Any], ticker_24h: Dict[str,
     trades = safe_int(ticker_24h.get("count"))
     price_change_pct = safe_float(ticker_24h.get("priceChangePercent"))
     mark_price = safe_float(mark_info.get("markPrice"))
+    high_price = safe_float(ticker_24h.get("highPrice"))
+    low_price = safe_float(ticker_24h.get("lowPrice"))
 
     if mark_price < DYNAMIC_SETTINGS["MIN_MARK_PRICE"]:
         reasons.append("السعر الحالي غير صالح")
         return False, reasons
 
-    if quote_volume < DYNAMIC_SETTINGS["MIN_24H_QUOTE_VOLUME"]:
-        reasons.append("سيولة 24h أقل من الحد المطلوب")
+    # حدود دنيا خفيفة جدًا لمنع الضوضاء الميتة فقط
+    if quote_volume < DYNAMIC_SETTINGS["PRE_FILTER_MIN_24H_QUOTE_VOLUME"]:
+        reasons.append("سيولة ضعيفة جدًا وفق الفلتر الجديد")
+        return False, reasons
+    if trades < DYNAMIC_SETTINGS["PRE_FILTER_MIN_24H_TRADE_COUNT"]:
+        reasons.append("نشاط صفقات ضعيف جدًا وفق الفلتر الجديد")
         return False, reasons
 
-    if trades < DYNAMIC_SETTINGS["MIN_24H_TRADE_COUNT"]:
-        reasons.append("نشاط الصفقات 24h ضعيف")
+    floor = safe_float(DYNAMIC_SETTINGS.get("PRE_FILTER_PRICE_CHANGE_FLOOR"), -3.0)
+    ceil = safe_float(DYNAMIC_SETTINGS.get("PRE_FILTER_PRICE_CHANGE_CEIL"), 35.0)
+    intraday_range_pct = ((high_price - low_price) / low_price * 100.0) if low_price > 0 else 0.0
+
+    # درجة مرنة: نعطي وزنًا للسيولة/النشاط/التذبذب/الحركة بدل الرفض القاسي
+    volume_score = clamp(math.log10(max(quote_volume, 1.0)) / 8.0, 0.0, 1.0)
+    trades_score = clamp(math.log10(max(float(trades), 1.0)) / 5.0, 0.0, 1.0)
+    range_score = clamp(intraday_range_pct / 12.0, 0.0, 1.0)
+    trend_score = 0.5
+    if price_change_pct < floor:
+        trend_score = 0.05
+    elif price_change_pct > ceil:
+        trend_score = 0.65
+    else:
+        trend_score = clamp((price_change_pct - floor) / max(1e-9, (ceil - floor)), 0.0, 1.0)
+    prefilter_score = round((0.34 * volume_score) + (0.28 * trades_score) + (0.22 * range_score) + (0.16 * trend_score), 4)
+
+    threshold = safe_float(DYNAMIC_SETTINGS.get("PRE_FILTER_SCORE_THRESHOLD"), 0.35)
+    if prefilter_score < threshold:
+        reasons.append(f"درجة الفلتر الجديد منخفضة ({prefilter_score:.3f} < {threshold:.3f})")
         return False, reasons
 
-    if price_change_pct < DYNAMIC_SETTINGS["MIN_24H_PRICE_CHANGE_PCT"]:
-        reasons.append("الحركة اليومية ما زالت خاملة")
-        return False, reasons
-
-    if price_change_pct > DYNAMIC_SETTINGS["MAX_24H_PRICE_CHANGE_PCT"]:
-        reasons.append("الحركة اليومية متأخرة بصريًا جدًا")
-        return False, reasons
-
-    reasons.append("اجتاز التصفية السريعة")
+    reasons.append(f"اجتاز الفلتر الجديد | score={prefilter_score:.3f}")
     return True, reasons
+
+
+# توافق خلفي للاسم القديم
+def quick_filter(symbol: str, symbol_meta: Dict[str, Any], ticker_24h: Dict[str, Any], mark_info: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    return early_rise_prefilter(symbol, symbol_meta, ticker_24h, mark_info)
 
 
 def universe_filter_for_full_scan(symbol: str, symbol_meta: Dict[str, Any], mark_info: Dict[str, Any]) -> Tuple[bool, List[str]]:
@@ -3447,9 +3967,17 @@ def build_reference_market_features(
         "ratio_alignment": ratio_alignment,
         "ratio_conflict": ratio_conflict,
         "extreme_engine": extreme_engine,
+        "ratio_extreme_profile": safe_dict_from_api(extreme_engine.get("profiles")),
+        "ratio_inflection_profile": safe_dict_from_api(extreme_engine.get("inflection")),
         "asset_local_memory": asset_local_memory,
         "asset_memory_profile": asset_memory_profile,
         "asset_memory_context": asset_memory_context,
+        "leader_evidence": {},
+        "acceptance_evidence": {},
+        "failure_evidence": {},
+        "flow_quality_profile": {},
+        "oi_context_profile": {},
+        "hypothesis_inputs": {},
         "multi_tf": multi_tf,
         "tf_5m": tf_5m,
         "tf_15m": tf_15m,
@@ -4085,6 +4613,16 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         and not long_rollover_active
     )
 
+    structural_acceptance = (
+        not price_late
+        and (price_reaccept_proxy or higher_low_bias or (breakout_touched and ret_1 > -0.05))
+        and oi_not_collapsing
+        and (oi_supportive or ratio_supportive or trade_activity_alive)
+        and not upper_failure_active
+        and not long_rollover_active
+        and not features.get("one_bar_spike", False)
+    )
+
     if strict_acceptance:
         accepted = True
         acceptance_reason = "قبول صارم: إغلاق واختراق مثبت مع دعم OI والتدفق والنشاط"
@@ -4108,6 +4646,10 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
     elif early_regime_partial:
         partial = True
         acceptance_reason = "قبول جزئي نظامي: النظام البنيوي داعم لكن القبول السعري ما زال في طور الاكتمال"
+        diagnostics.append(acceptance_reason)
+    elif structural_acceptance:
+        accepted = True
+        acceptance_reason = "قبول بنيوي بصري: السعر حافظ على منطقة الاستعادة مع قيعان متحسنة دون إشارات فخ بارزة"
         diagnostics.append(acceptance_reason)
     elif (
         ignition_like
@@ -4136,6 +4678,9 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         "partial": partial,
         "state": "yes" if accepted else ("partial" if partial else "no"),
         "acceptance_reason": acceptance_reason,
+        "strict_acceptance": strict_acceptance,
+        "regime_acceptance": regime_anchor_strength >= 1,
+        "structural_acceptance": structural_acceptance,
         "diagnostics": diagnostics,
     }
 
@@ -4648,8 +5193,6 @@ def detect_failed_rebuild_after_flush(features: Dict[str, Any]) -> Dict[str, Any
 
 def derive_regime_trigger_execution_patterns(
     features: Dict[str, Any],
-    family_info: Dict[str, Any],
-    stage_info: Dict[str, Any],
     acceptance: Dict[str, Any],
     failure: Dict[str, Any],
     decision_ctx: Dict[str, Any],
@@ -4660,7 +5203,6 @@ def derive_regime_trigger_execution_patterns(
     counterflow_pattern = features.get("counterflow_pattern", {}) or {}
     post_flush_name = decision_ctx.get("post_flush_pattern_name")
     final_bucket = decision_ctx.get("final_bucket", "Discovered but not actionable")
-    stage = decision_ctx.get("stage", stage_info.get("stage", "WATCH"))
     actionable_now = decision_ctx.get("actionable_now", False)
 
     regime_pattern = "NEUTRAL_REGIME"
@@ -4701,404 +5243,29 @@ def derive_regime_trigger_execution_patterns(
         trigger_pattern = "BREAKOUT_ACCEPT_TRIGGER"
     elif features.get("breakout_touched", False):
         trigger_pattern = "BREAKOUT_IGNITION_TRIGGER"
-    elif stage in {"PREPARE", "ARMED"}:
+    elif features.get("build_up_seed", False) and acceptance.get("state") in {"no", "partial"}:
         trigger_pattern = "PREPARE_TO_ARMED_TRIGGER"
 
     execution_pattern = "OBSERVE_ONLY"
     if actionable_now:
         execution_pattern = "ACTIONABLE_EXECUTION"
-    elif final_bucket == "Late":
+    elif bool(features.get("price_late", False)):
         execution_pattern = "LATE_EXECUTION_BLOCK"
-    elif final_bucket == "Failed":
+    elif failure.get("early_failure", False):
         execution_pattern = "FAILED_EXECUTION_BLOCK"
     elif acceptance.get("state") == "no":
         execution_pattern = "NO_ACCEPTANCE_BLOCK"
     elif failure.get("continuation_state") in {"weak", "no"}:
         execution_pattern = "WEAK_CONTINUATION_BLOCK"
-    elif stage == "ARMED":
+    elif features.get("breakout_touched", False):
         execution_pattern = "ARMED_WAIT_FOR_CONFIRMATION"
-    elif stage == "PREPARE":
+    elif features.get("build_up_seed", False):
         execution_pattern = "PREPARE_WAIT_FOR_TRIGGER"
 
     return {
         "regime_pattern": regime_pattern,
         "trigger_pattern": trigger_pattern,
         "execution_pattern": execution_pattern,
-    }
-
-
-def build_final_decision(
-    symbol: str,
-    features: Dict[str, Any],
-    family_info: Dict[str, Any],
-    stage_info: Dict[str, Any],
-    oi_info: Dict[str, Any],
-    acceptance: Dict[str, Any],
-    failure: Dict[str, Any],
-) -> Dict[str, Any]:
-    diagnostics: List[str] = []
-    family = family_info["family"]
-    oi_state = oi_info["oi_state"]
-    gap = features.get("position_account_gap", {})
-    counterflow_pattern = features.get("counterflow_pattern", {})
-    ratio_alignment = features.get("ratio_alignment", {})
-    ratio_conflict = features.get("ratio_conflict", {})
-    extreme_engine = features.get("extreme_engine", {})
-    extreme_patterns = extreme_engine.get("patterns", {})
-
-    preignite_states = {"premove buildup", "buildup expansion", "squeeze_buildup"}
-    discovery_state = "غير مكتشفة بنيويًا"
-    discovery_reason = ""
-    if family is not None and oi_state in preignite_states and not features["price_late"]:
-        discovery_state = "مكتشفة مبكرًا"
-        discovery_reason = "family + OI build-up + السعر ليس late"
-        diagnostics.append("مرحلة التهيؤ متحققة")
-    elif family is not None:
-        discovery_state = "مكتشفة"
-        discovery_reason = f"family = {family}"
-        diagnostics.append(discovery_reason)
-
-    oi_supportive = oi_state in {"premove buildup", "buildup expansion", "squeeze_buildup", "squeeze_post_covering"}
-    if oi_state == "squeeze_covering":
-        oi_supportive = features.get("short_crowding", False) and not failure["early_failure"]
-        if oi_supportive:
-            diagnostics.append("تم اعتبار squeeze_covering داعمًا")
-
-    if features.get("oi_delta_3", 0.0) >= EXECUTION_RULES["min_oi_increase_for_support"]:
-        oi_supportive = True
-        diagnostics.append("oi_delta_3 موجب (زيادة) تم اعتباره داعمًا")
-    if counterflow_pattern.get("active", False) and counterflow_pattern.get("explosive_oi", False):
-        oi_supportive = True
-        diagnostics.append("تم اعتماد OI كداعم بسبب بصمة counterflow squeeze المتفجرة")
-    if oi_state == "price up OI flat" and not counterflow_pattern.get("active", False):
-        oi_supportive = False
-        diagnostics.append("PRICE_UP_OI_FLAT بقيت مريبة ولم تُعتمد كدعم OI")
-
-    ignition_hit = features["breakout_touched"] or features["ret_3"] >= EXECUTION_RULES["ignition_return_5m_pct"]
-    ratio_supportive = ratio_alignment.get("overall_supportive", False) or ratio_alignment.get("higher_tf_supportive", False)
-    ratio_conflicted = ratio_alignment.get("overall_conflict", False) or ratio_conflict.get("state") == "conflicted"
-    ignition_flow_ok = features["trade_expansion_last"] >= EXECUTION_RULES["min_trade_expansion"] and (ratio_supportive or not ratio_conflicted or counterflow_pattern.get("active", False))
-
-    stage = stage_info.get("stage", "WATCH")
-    stage_reason = stage_info.get("stage_reason", "")
-    if features["price_late"] and (ignition_hit or acceptance["state"] != "no"):
-        stage = "LATE"
-        stage_reason = "الاشتعال/القبول جاء بعد امتداد سعري"
-        diagnostics.append(stage_reason)
-    elif ignition_hit and ignition_flow_ok and oi_supportive:
-        stage = "TRIGGERED" if acceptance["state"] == "yes" else "ARMED"
-        stage_reason = "breakout/ret3 + trade expansion + OI supportive"
-        if counterflow_pattern.get("active", False):
-            stage_reason += " + counterflow squeeze context"
-        if acceptance["state"] == "yes":
-            stage_reason += " + قبول مؤكد"
-        diagnostics.append("مرحلة الاشتعال متحققة: " + stage_reason)
-    elif family is not None and oi_state in preignite_states and not features["price_late"]:
-        stage = "PREPARE"
-        stage_reason = "4h/1h يظهران تراكمًا أو build-up دون قبول كامل"
-        diagnostics.append(stage_reason)
-    elif family is not None:
-        stage = "WATCH"
-        stage_reason = "family موجودة لكن لم تصل إلى مرحلة الاشتعال"
-        diagnostics.append(stage_reason)
-
-    acceptance_state = acceptance["state"]
-    acceptance_reason = acceptance.get("acceptance_reason", "")
-    continuation_state = failure["continuation_state"]
-    continuation_reason = failure.get("failure_reason", "") if continuation_state != "yes" else "استمرار جيد (OI/gap يدعم)"
-
-    promotion_reason = ""
-    if (
-        stage == "ARMED"
-        and counterflow_pattern.get("armed_ready", False)
-        and features.get("close_above_breakout", False)
-        and ignition_flow_ok
-        and oi_supportive
-        and not features.get("price_late", False)
-        and not failure.get("early_failure", False)
-        and acceptance.get("state") in {"yes", "partial"}
-    ):
-        stage = "TRIGGERED"
-        stage_reason = "تمت ترقية الحالة من ARMED إلى TRIGGERED بسبب بصمة MAGMA-like counterflow squeeze"
-        acceptance_state = "yes"
-        acceptance_reason = acceptance_reason or "ترقية قبول استثنائية بسبب counterflow squeeze قوي"
-        continuation_state = "yes" if continuation_state != "no" else "weak"
-        continuation_reason = "استمرار مرن مدعوم ببصمة counterflow"
-        promotion_reason = "armed_exception_promoted_by_counterflow_squeeze"
-        diagnostics.append(stage_reason)
-
-    execution_state = "غير قابلة للتنفيذ"
-    final_bucket = "Discovered but not actionable"
-    not_actionable_reason = ""
-
-    actionable_now = all([
-        stage == "TRIGGERED",
-        acceptance_state == "yes",
-        continuation_state in ({"yes", "weak"} if counterflow_pattern.get("active", False) else {"yes"}),
-        oi_supportive,
-        not features["price_late"],
-        not failure["early_failure"],
-        (not ratio_conflicted or counterflow_pattern.get("active", False)),
-    ])
-
-    if actionable_now:
-        execution_state = "قابلة للتنفيذ الآن"
-        final_bucket = "Actionable now"
-        diagnostics.append("تحققت شجرة القرار كاملة حتى مرحلة الاستمرار")
-        if not promotion_reason:
-            promotion_reason = f"stage={stage}, acceptance={acceptance_state}, continuation={continuation_state}, oi_supportive={oi_supportive}"
-    elif stage == "LATE" or features["price_late"]:
-        execution_state = "متأخرة"
-        final_bucket = "Late"
-        not_actionable_reason = "الحركة متأخرة (price_late)"
-        diagnostics.append("تم تصنيفها Late لأن الجزء الأنظف غالبًا مضى")
-    elif family is None or failure["early_failure"]:
-        execution_state = "فاشلة"
-        final_bucket = "Failed"
-        not_actionable_reason = failure.get("failure_reason") or "لا بنية صعودية أو فشل مبكر"
-        diagnostics.append("تم رفضها لأن البنية غير مفهومة أو لأن الفشل المبكر ظهر بوضوح")
-    else:
-        reasons = []
-        if stage != "TRIGGERED":
-            reasons.append(f"المرحلة {stage}")
-        if acceptance_state != "yes":
-            reasons.append(f"القبول {acceptance_state}")
-        if continuation_state != "yes":
-            reasons.append(f"الاستمرار {continuation_state}")
-        if not oi_supportive:
-            reasons.append("OI غير داعم")
-        if ratio_conflicted and not counterflow_pattern.get("active", False):
-            reasons.append("ratios متعدد الفريمات متعارضة")
-        if features["price_late"]:
-            reasons.append("السعر متأخر")
-        if failure["early_failure"]:
-            reasons.append("فشل مبكر")
-        not_actionable_reason = " | ".join(reasons) if reasons else "لا يوجد"
-        diagnostics.append("البصمة موجودة لكن لحظة التنفيذ الحالية ليست نظيفة بما يكفي")
-
-    precomputed_post_flush = features.get("precomputed_post_flush_patterns", {}) or {}
-    relief_bounce = precomputed_post_flush.get("relief_bounce") or detect_relief_bounce_after_flush(features)
-    bullish_rebuild = precomputed_post_flush.get("bullish_rebuild") or detect_bullish_rebuild_after_flush(features)
-    failed_rebuild = precomputed_post_flush.get("failed_rebuild") or detect_failed_rebuild_after_flush(features)
-
-    post_flush_pattern_name = None
-    post_flush_pattern = None
-    if bullish_rebuild.get("active"):
-        post_flush_pattern_name = "BULLISH_REBUILD_AFTER_FLUSH"
-        post_flush_pattern = bullish_rebuild
-        diagnostics.append("تم اكتشاف Bullish Rebuild After Flush")
-        diagnostics.extend(bullish_rebuild.get("diagnostics", [])[:2])
-        if bullish_rebuild.get("score", 0) >= POST_FLUSH_PATTERN_RULES["bullish_min_score"]:
-            final_bucket = "Actionable now"
-            execution_state = "قابلة للتنفيذ الآن"
-            actionable_now = True
-            acceptance_state = "yes"
-            continuation_state = "yes"
-            continuation_reason = "استمرار جيد بعد rebuild post-flush"
-            not_actionable_reason = ""
-            promotion_reason = promotion_reason or "bullish_rebuild_after_flush_promoted"
-        else:
-            final_bucket = "Discovered but not actionable"
-            execution_state = "غير قابلة للتنفيذ"
-            actionable_now = False
-            not_actionable_reason = "إعادة البناء بعد flush موجودة لكنها لم تكتمل بما يكفي"
-    elif failed_rebuild.get("active"):
-        post_flush_pattern_name = "FAILED_REBUILD_AFTER_FLUSH"
-        post_flush_pattern = failed_rebuild
-        diagnostics.append("تم اكتشاف Failed Rebuild After Flush")
-        diagnostics.extend(failed_rebuild.get("diagnostics", [])[:2])
-        final_bucket = "Failed"
-        execution_state = "فاشلة"
-        actionable_now = False
-        continuation_state = "no"
-        continuation_reason = "فشل rebuild بعد flush"
-        not_actionable_reason = "محاولة إعادة البناء بعد flush فشلت سعريًا وبنيويًا"
-    elif relief_bounce.get("active"):
-        post_flush_pattern_name = "RELIEF_BOUNCE_AFTER_FLUSH"
-        post_flush_pattern = relief_bounce
-        diagnostics.append("تم اكتشاف Relief Bounce After Flush")
-        diagnostics.extend(relief_bounce.get("diagnostics", [])[:2])
-        if final_bucket == "Actionable now":
-            final_bucket = "Discovered but not actionable"
-            execution_state = "غير قابلة للتنفيذ"
-            actionable_now = False
-        if not not_actionable_reason or final_bucket == "Discovered but not actionable":
-            not_actionable_reason = "الارتداد الحالي relief bounce بعد flush وليس bullish rebuild clean"
-
-    lower_extreme_squeeze = extreme_patterns.get("lower_extreme_squeeze", {})
-    upper_extreme_bullish = extreme_patterns.get("upper_extreme_bullish_expansion", {})
-    upper_extreme_failure = extreme_patterns.get("upper_extreme_failure", {})
-    long_crowding_rollover = extreme_patterns.get("long_crowding_rollover", {})
-    oi_counter_positioning = extreme_patterns.get("oi_expansion_without_bullish_confirmation", {})
-    squeeze_probability = safe_float(extreme_engine.get("squeeze_probability"), 0.0)
-    flush_probability = safe_float(extreme_engine.get("flush_probability"), 0.0)
-
-    if lower_extreme_squeeze.get("active", False):
-        diagnostics.append(f"lower-extreme squeeze probability={squeeze_probability:.1f}")
-    if upper_extreme_bullish.get("active", False):
-        diagnostics.append(f"upper-extreme bullish expansion probability={squeeze_probability:.1f}")
-
-    if bullish_rebuild.get("active") is False and not failure.get("early_failure", False) and not features.get("price_late", False):
-        if lower_extreme_squeeze.get("active", False) and not relief_bounce.get("active", False):
-            if final_bucket == "Discovered but not actionable" and stage in {"ARMED", "TRIGGERED"} and acceptance_state in {"partial", "yes"} and oi_supportive and squeeze_probability >= 55 and not ratio_conflicted:
-                final_bucket = "Actionable now"
-                execution_state = "قابلة للتنفيذ الآن"
-                actionable_now = True
-                continuation_state = "yes" if continuation_state == "yes" else "weak"
-                continuation_reason = "استمرار مرن بسبب lower-extreme squeeze"
-                not_actionable_reason = ""
-                promotion_reason = promotion_reason or "lower_extreme_squeeze_promoted"
-                diagnostics.append("تمت ترقية الحالة بسبب lower-extreme squeeze regime")
-        elif upper_extreme_bullish.get("active", False):
-            if final_bucket == "Discovered but not actionable" and stage == "TRIGGERED" and acceptance_state == "yes" and oi_supportive and squeeze_probability >= 52 and not ratio_conflicted:
-                final_bucket = "Actionable now"
-                execution_state = "قابلة للتنفيذ الآن"
-                actionable_now = True
-                continuation_state = "yes" if continuation_state != "no" else "weak"
-                continuation_reason = "استمرار جيد بسبب upper-extreme bullish expansion"
-                not_actionable_reason = ""
-                promotion_reason = promotion_reason or "upper_extreme_bullish_expansion_promoted"
-                diagnostics.append("تمت ترقية الحالة بسبب upper-extreme bullish expansion")
-
-    if upper_extreme_failure.get("active", False) or long_crowding_rollover.get("active", False) or oi_counter_positioning.get("active", False):
-        bearish_reasons = []
-        if upper_extreme_failure.get("active", False):
-            bearish_reasons.append("Upper-Extreme failure")
-        if long_crowding_rollover.get("active", False):
-            bearish_reasons.append("Long Crowding Rollover")
-        if oi_counter_positioning.get("active", False):
-            bearish_reasons.append("OI expansion without bullish confirmation")
-        diagnostics.append(" | ".join(bearish_reasons) + f" | flush_probability={flush_probability:.1f}")
-        if flush_probability >= 68 or failed_rebuild.get("active", False):
-            final_bucket = "Failed"
-            execution_state = "فاشلة"
-            actionable_now = False
-            continuation_state = "no"
-            continuation_reason = "ضعف/flush بعد upper extreme أو rebuild فاشل"
-            not_actionable_reason = "خطر flush/rollover مرتفع بعد upper extreme أو ضعف القبول"
-        else:
-            if final_bucket == "Actionable now":
-                final_bucket = "Discovered but not actionable"
-                execution_state = "غير قابلة للتنفيذ"
-                actionable_now = False
-            if not not_actionable_reason:
-                not_actionable_reason = "السياق يميل إلى flush risk / long crowding rollover رغم الارتداد الحالي"
-
-    if ratio_supportive:
-        diagnostics.append("ratios متعدد الفريمات داعمة للقرار")
-    if ratio_conflicted and not counterflow_pattern.get("active", False):
-        diagnostics.append("ratios متعدد الفريمات تضغط ضد القرار")
-
-    triplet = derive_regime_trigger_execution_patterns(
-        features=features,
-        family_info=family_info,
-        stage_info=stage_info,
-        acceptance=acceptance,
-        failure=failure,
-        decision_ctx={
-            "stage": stage,
-            "final_bucket": final_bucket,
-            "actionable_now": actionable_now,
-            "post_flush_pattern_name": post_flush_pattern_name,
-        },
-    )
-
-    decision_reason = "; ".join(diagnostics[-5:]) if diagnostics else "لا يوجد"
-    return {
-        "symbol": symbol,
-        "family": family,
-        "stage": stage,
-        "oi_state": oi_state,
-        "discovery_state": discovery_state,
-        "execution_state": execution_state,
-        "final_bucket": final_bucket,
-        "actionable_now": actionable_now,
-        "acceptance_state": acceptance_state,
-        "continuation_state": continuation_state,
-        "failure": failure,
-        "decision_reason": decision_reason,
-        "oi_supportive": oi_supportive,
-        "position_account_gap": gap,
-        "oi_dynamics": oi_info,
-        "ratio_alignment": ratio_alignment,
-        "ratio_conflict": ratio_conflict,
-        "extreme_engine": extreme_engine,
-        "discovery_reason": discovery_reason,
-        "stage_reason": stage_reason,
-        "acceptance_reason": acceptance_reason,
-        "continuation_reason": continuation_reason,
-        "promotion_reason": promotion_reason if actionable_now else "",
-        "not_actionable_reason": not_actionable_reason,
-        "counterflow_pattern": counterflow_pattern,
-        "relief_bounce_after_flush": relief_bounce,
-        "bullish_rebuild_after_flush": bullish_rebuild,
-        "failed_rebuild_after_flush": failed_rebuild,
-        "post_flush_pattern_name": post_flush_pattern_name,
-        "post_flush_pattern": post_flush_pattern or {},
-        "regime_pattern": triplet["regime_pattern"],
-        "trigger_pattern": triplet["trigger_pattern"],
-        "execution_pattern": triplet["execution_pattern"],
-        "diagnostics": diagnostics,
-    }
-
-
-def analyze_symbol_legacy_material_provider(
-    client: BinanceFuturesPublicClient,
-    symbol: str,
-    symbol_meta: Dict[str, Any],
-    ticker_24h: Dict[str, Any],
-    mark_info: Dict[str, Any],
-) -> Dict[str, Any]:
-    """مزود المواد الخام القديم: يبني الخصائص والقراءات الأولية فقط.
-    يبقى موجودًا للتوافق الرجعي واستخراج المواد الخام البنيوية، لكنه لم يعد مركز القرار النهائي.
-    """
-    features = build_reference_market_features(client, symbol, symbol_meta, ticker_24h, mark_info)
-    if not features.get("ok"):
-        return {
-            "ok": False,
-            "symbol": symbol,
-            "error": features.get("error", "unknown_error"),
-            "diagnostics": features.get("diagnostics", []),
-            "features": features,
-        }
-
-    family_info = resolve_primary_family_signal(features)
-    stage_info = classify_signal_stage_from_reference(features, family_info)
-    oi_info = classify_oi_state(features)
-    features["oi_dynamics"] = oi_info
-    features["squeeze_flags"] = {
-        "setup": oi_info.get("squeeze_setup", {}).get("active", False),
-        "ignition": oi_info.get("squeeze_ignition", {}).get("active", False),
-        "continuation": oi_info.get("squeeze_continuation", {}).get("active", False),
-    }
-    features["precomputed_post_flush_patterns"] = {
-        "relief_bounce": detect_relief_bounce_after_flush(features),
-        "bullish_rebuild": detect_bullish_rebuild_after_flush(features),
-        "failed_rebuild": detect_failed_rebuild_after_flush(features),
-    }
-
-    acceptance = detect_acceptance_state(features)
-    failure = detect_failure_continuation(features, acceptance, oi_info)
-    legacy_decision = build_final_decision(
-        symbol=symbol,
-        features=features,
-        family_info=family_info,
-        stage_info=stage_info,
-        oi_info=oi_info,
-        acceptance=acceptance,
-        failure=failure,
-    )
-
-    return {
-        "ok": True,
-        "symbol": symbol,
-        "features": features,
-        "family_info": family_info,
-        "stage_info": stage_info,
-        "oi_info": oi_info,
-        "acceptance": acceptance,
-        "failure": failure,
-        "legacy_decision": legacy_decision,
     }
 
 
@@ -5111,23 +5278,22 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
     oi_info = safe_dict_from_api(raw_materials.get("oi_info"))
     acceptance = safe_dict_from_api(raw_materials.get("acceptance"))
     failure = safe_dict_from_api(raw_materials.get("failure"))
-    legacy_decision = safe_dict_from_api(raw_materials.get("legacy_decision"))
-
+    triplet = safe_dict_from_api(raw_materials.get("triplet"))
     result = {
         "symbol": symbol,
         "analysis_source": "structural_orchestrator",
         "analysis_center": "structural_casefile",
-        # مواد خام بنيوية / توافق رجعي
-        "family": legacy_decision.get("family", family_info.get("family")),
-        "stage": legacy_decision.get("stage", stage_info.get("stage", "WATCH")),
-        "oi_state": legacy_decision.get("oi_state", oi_info.get("oi_state", "neutral")),
-        "discovery_state": legacy_decision.get("discovery_state", "غير مكتشفة بنيويًا"),
-        "execution_state": legacy_decision.get("execution_state", "غير قابلة للتنفيذ"),
-        "final_bucket": legacy_decision.get("final_bucket", "Discovered but not actionable"),
-        "actionable_now": legacy_decision.get("actionable_now", False),
-        "acceptance_state": legacy_decision.get("acceptance_state", acceptance.get("state", "no")),
-        "continuation_state": legacy_decision.get("continuation_state", failure.get("continuation_state", "no")),
-        "decisive_factor": family_info.get("decisive_factor", "لا يوجد عامل حاسم بعد"),
+        # مواد خام بنيوية فقط (بدون حاكمية Legacy)
+        "family": None,
+        "stage": None,
+        "oi_state": oi_info.get("oi_state", "neutral"),
+        "discovery_state": "مكتشفة بنيويًا" if family_info.get("family") else "غير مكتشفة بنيويًا",
+        "execution_state": "قيد الحسم البنيوي",
+        "final_bucket": "Discovered but not actionable",
+        "actionable_now": False,
+        "acceptance_state": acceptance.get("state", "no"),
+        "continuation_state": failure.get("continuation_state", "no"),
+        "decisive_factor": "لا يوجد عامل حاسم بنيوي قبل تركيب الأطروحة",
         "funding_context": features.get("funding_context", "unknown"),
         "basis_context": features.get("basis_context", "missing"),
         "failure_risk": failure.get("risk_level", "منخفض"),
@@ -5141,63 +5307,73 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
         "zscores": features.get("zscores", {}),
         "oi_dynamics": oi_info,
         "counterflow_pattern": features.get("counterflow_pattern", {}),
-        "relief_bounce_after_flush": legacy_decision.get("relief_bounce_after_flush", {}),
-        "bullish_rebuild_after_flush": legacy_decision.get("bullish_rebuild_after_flush", {}),
-        "failed_rebuild_after_flush": legacy_decision.get("failed_rebuild_after_flush", {}),
-        "post_flush_pattern_name": legacy_decision.get("post_flush_pattern_name"),
-        "post_flush_pattern": legacy_decision.get("post_flush_pattern", {}),
-        "family_scores": family_info.get("family_scores", {}),
-        "family_reasons": family_info.get("family_reasons", {}),
-        "family_diagnostics": family_info.get("diagnostics", []),
-        "stage_diagnostics": stage_info.get("diagnostics", []),
+        "relief_bounce_after_flush": {},
+        "bullish_rebuild_after_flush": {},
+        "failed_rebuild_after_flush": {},
+        "post_flush_pattern_name": None,
+        "post_flush_pattern": {},
+        "family_scores": {},
+        "family_reasons": {},
+        "family_diagnostics": [],
+        "stage_diagnostics": [],
         "oi_diagnostics": oi_info.get("diagnostics", []),
         "acceptance_diagnostics": acceptance.get("diagnostics", []),
         "failure_diagnostics": failure.get("diagnostics", []),
-        "decision_diagnostics": legacy_decision.get("diagnostics", []),
-        "decision_reason": legacy_decision.get("decision_reason", "لا يوجد"),
-        "discovery_reason": legacy_decision.get("discovery_reason", ""),
-        "stage_reason": legacy_decision.get("stage_reason", stage_info.get("stage_reason", "")),
-        "acceptance_reason": legacy_decision.get("acceptance_reason", acceptance.get("acceptance_reason", "")),
-        "continuation_reason": legacy_decision.get("continuation_reason", failure.get("failure_reason", "")),
-        "promotion_reason": legacy_decision.get("promotion_reason", ""),
-        "not_actionable_reason": legacy_decision.get("not_actionable_reason", ""),
-        "regime_pattern": legacy_decision.get("regime_pattern", "NEUTRAL_REGIME"),
-        "trigger_pattern": legacy_decision.get("trigger_pattern", "NO_TRIGGER"),
-        "execution_pattern": legacy_decision.get("execution_pattern", "OBSERVE_ONLY"),
-        "ratio_alignment": legacy_decision.get("ratio_alignment", features.get("ratio_alignment", {})),
-        "ratio_conflict": legacy_decision.get("ratio_conflict", features.get("ratio_conflict", {})),
-        "extreme_engine": legacy_decision.get("extreme_engine", features.get("extreme_engine", {})),
+        "decision_diagnostics": [],
+        "decision_reason": "قرار أولي قيد الحسم عبر Structural Thesis وExecution Verdict",
+        "discovery_reason": "",
+        "stage_reason": "",
+        "acceptance_reason": acceptance.get("acceptance_reason", ""),
+        "continuation_reason": failure.get("failure_reason", ""),
+        "promotion_reason": "",
+        "not_actionable_reason": "",
+        "regime_pattern": triplet.get("regime_pattern", "NEUTRAL_REGIME"),
+        "trigger_pattern": triplet.get("trigger_pattern", "NO_TRIGGER"),
+        "execution_pattern": triplet.get("execution_pattern", "OBSERVE_ONLY"),
+        "ratio_alignment": features.get("ratio_alignment", {}),
+        "ratio_conflict": features.get("ratio_conflict", {}),
+        "extreme_engine": features.get("extreme_engine", {}),
         "asset_memory_profile": features.get("asset_memory_profile", {}),
         "asset_memory_context": features.get("asset_memory_context", {}),
-        "legacy_materials": {
+        "leader_type": None,
+        "leader_reason": "",
+        "primary_hypothesis": None,
+        "alternative_hypotheses": [],
+        "hypothesis_scores": {},
+        "confidence_score": 0.0,
+        "uncertainty_score": 0.0,
+        "conflict_score": 0.0,
+        "market_regime_v2": {"state": "transitional", "confidence": 0.5, "volatility_state": "normal"},
+        "actor_intent": {"state": "balanced_wait", "confidence": 0.5},
+        "breakout_quality_score": 0.0,
+        "early_rise_index": {"score": 0.0, "state": "no_edge"},
+        "entry_window_state": "avoid_or_wait",
+        "invalidation_reason": "",
+        "next_failure_mode": "",
+        "causal_chain": [],
+        "closest_case_match": None,
+        "closest_case_score": 0.0,
+        "state_transition": None,
+        "state_transition_reason": "",
+        "decision_trace": {},
+        "structural_materials": {
             "family_info": family_info,
             "stage_info": stage_info,
             "oi_info": oi_info,
             "acceptance": acceptance,
             "failure": failure,
-        },
-        "legacy_decision_snapshot": {
-            "family": legacy_decision.get("family", family_info.get("family")),
-            "stage": legacy_decision.get("stage", stage_info.get("stage", "WATCH")),
-            "execution_state": legacy_decision.get("execution_state"),
-            "final_bucket": legacy_decision.get("final_bucket"),
-            "actionable_now": legacy_decision.get("actionable_now"),
-            "not_actionable_reason": legacy_decision.get("not_actionable_reason"),
-            "decision_reason": legacy_decision.get("decision_reason"),
+            "family_scores": family_info.get("family_scores", {}),
+            "family_reasons": family_info.get("family_reasons", {}),
+            "family_diagnostics": family_info.get("diagnostics", []),
+            "stage_diagnostics": stage_info.get("diagnostics", []),
         },
         "diagnostics": (
             features.get("diagnostics", [])
-            + family_info.get("diagnostics", [])
-            + stage_info.get("diagnostics", [])
             + oi_info.get("diagnostics", [])
             + acceptance.get("diagnostics", [])
             + failure.get("diagnostics", [])
-            + legacy_decision.get("relief_bounce_after_flush", {}).get("diagnostics", [])
-            + legacy_decision.get("bullish_rebuild_after_flush", {}).get("diagnostics", [])
-            + (legacy_decision.get("extreme_engine", {}) or {}).get("diagnostics", [])
-            + legacy_decision.get("ratio_conflict", {}).get("diagnostics", [])
-            + legacy_decision.get("failed_rebuild_after_flush", {}).get("diagnostics", [])
-            + legacy_decision.get("diagnostics", [])
+            + (features.get("extreme_engine", {}) or {}).get("diagnostics", [])
+            + safe_dict_from_api(features.get("ratio_conflict")).get("diagnostics", [])
         ),
     }
     return result
@@ -5215,16 +5391,15 @@ def analyze_symbol_structural(
     قضية بنيوية -> فرضية -> مراجعة مضادة -> قرار تنفيذ.
     """
     try:
-        raw_materials = analyze_symbol_legacy_material_provider(client, symbol, symbol_meta, ticker_24h, mark_info)
-        if not raw_materials.get("ok"):
-            features = safe_dict_from_api(raw_materials.get("features"))
+        features = build_reference_market_features(client, symbol, symbol_meta, ticker_24h, mark_info)
+        if not features.get("ok"):
             return {
                 "symbol": symbol,
                 "analysis_source": "structural_orchestrator",
                 "analysis_center": "structural_casefile",
-                "error": raw_materials.get("error", "unknown_error"),
+                "error": features.get("error", "unknown_error"),
                 "family": None,
-                "stage": "WATCH",
+                "stage": None,
                 "oi_state": "neutral",
                 "discovery_state": "غير مكتشفة بنيويًا",
                 "execution_state": "فاشلة",
@@ -5241,13 +5416,101 @@ def analyze_symbol_structural(
                 "trigger_pattern": "NO_TRIGGER",
                 "execution_pattern": "FAILED_EXECUTION_BLOCK",
                 "failure": {"failure_reason": "تعذر بناء الخصائص المرجعية"},
-                "diagnostics": raw_materials.get("diagnostics", []),
+                "diagnostics": features.get("diagnostics", []),
                 "failure_risk": "مرتفع",
                 "failure_reasons": ["نقص بيانات أو تعطل endpoint"],
                 "importance_score": 0.0,
             }
 
+        family_info = resolve_primary_family_signal(features)
+        stage_info = classify_signal_stage_from_reference(features, family_info)
+        oi_info = classify_oi_state(features)
+        features["oi_dynamics"] = oi_info
+        features["squeeze_flags"] = {
+            "setup": oi_info.get("squeeze_setup", {}).get("active", False),
+            "ignition": oi_info.get("squeeze_ignition", {}).get("active", False),
+            "continuation": oi_info.get("squeeze_continuation", {}).get("active", False),
+        }
+        acceptance = detect_acceptance_state(features)
+        failure = detect_failure_continuation(features, acceptance, oi_info)
+        triplet = derive_regime_trigger_execution_patterns(
+            features=features,
+            acceptance=acceptance,
+            failure=failure,
+            decision_ctx={
+                "final_bucket": "Discovered but not actionable",
+                "actionable_now": False,
+                "post_flush_pattern_name": None,
+            },
+        )
+        raw_materials = {
+            "symbol": symbol,
+            "features": features,
+            "family_info": family_info,
+            "stage_info": stage_info,
+            "oi_info": oi_info,
+            "acceptance": acceptance,
+            "failure": failure,
+            "triplet": triplet,
+        }
+
         result = build_result_from_raw_materials(raw_materials)
+        features = safe_dict_from_api(result.get("market_features"))
+
+        asset_memory = load_asset_memory(symbol)
+        features["asset_memory_profile"] = build_asset_behavior_profile(symbol, features, asset_memory)
+        features["ratio_extreme_profile"] = build_ratio_extreme_profile(features, features["asset_memory_profile"])
+        features["ratio_inflection_profile"] = detect_extreme_inflection(features["ratio_extreme_profile"], features)
+
+        leader_info = determine_leader_type(features)
+        result["leader_type"] = leader_info.get("leader_type")
+        result["leader_reason"] = build_leader_reason(features, leader_info)
+        result["leader_evidence"] = safe_dict_from_api(leader_info.get("leader_scores"))
+
+        hypothesis_scores = build_hypothesis_scores(
+            features,
+            {
+                "regime_pattern": result.get("regime_pattern"),
+                "trigger_pattern": result.get("trigger_pattern"),
+                "execution_pattern": result.get("execution_pattern"),
+            },
+            leader_info,
+        )
+        ranked_hypothesis = rank_hypotheses(hypothesis_scores)
+        selected_hypothesis = select_primary_hypothesis(ranked_hypothesis)
+        result["hypothesis_scores"] = hypothesis_scores
+        result["primary_hypothesis"] = selected_hypothesis.get("primary_hypothesis")
+        result["alternative_hypotheses"] = selected_hypothesis.get("alternative_hypotheses", [])
+        result["hypothesis_inputs"] = {
+            "leader_type": leader_info.get("leader_type"),
+            "regime_pattern": result.get("regime_pattern"),
+            "trigger_pattern": result.get("trigger_pattern"),
+        }
+
+        result["confidence_score"] = compute_confidence_score(features, result)
+        result["uncertainty_score"] = compute_uncertainty_score(features, result)
+        result["conflict_score"] = compute_conflict_score(features, result)
+        result["market_regime_v2"] = classify_market_regime_v2(features, load_asset_memory(symbol))
+        result["actor_intent"] = classify_actor_intent(features)
+        result["breakout_quality_score"] = compute_breakout_quality_score(features, result)
+        result["early_rise_index"] = build_early_rise_index(features, result)
+        result["entry_window_state"] = derive_entry_window_state(result)
+        result["invalidation_reason"] = build_invalidation_reason(features, result)
+        result["next_failure_mode"] = build_next_failure_mode(features, result)
+        result["causal_chain"] = build_causal_chain(features, result)
+
+        prev_state = load_previous_symbol_state(symbol)
+        transition = detect_state_transition(prev_state, result)
+        result["state_transition"] = transition.get("state_transition")
+        result["state_transition_reason"] = transition.get("reason", "")
+
+        case_match = match_closest_case(build_case_vector(features, result), load_case_library())
+        result["closest_case_match"] = case_match.get("case_name")
+        result["closest_case_score"] = safe_float(case_match.get("score"), 0.0)
+        result = apply_v2_decision_gate(result, features)
+        result["entry_window_state"] = derive_entry_window_state(result)
+        result["market_features"] = features
+
         asset_local_memory = safe_dict_from_api((result.get("market_features") or {}).get("asset_local_memory"))
         result["state_transition_context"] = build_asset_state_transition_context(asset_local_memory, result)
         result["case_similarity_context"] = build_asset_case_similarity_context(asset_local_memory, result.get("market_features") or {}, result)
@@ -5257,13 +5520,34 @@ def analyze_symbol_structural(
         result = apply_behavior_profile_influence(result)
         result.update(build_arabic_output_fields(result))
         result = attach_structural_casefile(result)
+        result["cvd_explanatory_context"] = build_cvd_explanatory_context(result)
         result = apply_structural_center(result)
+        result = enrich_result_v2_fields(result)
         result["importance_score"] = compute_importance_score(result)
         if isinstance(result.get("structural_case"), dict):
             result["structural_case"]["importance_score"] = result["importance_score"]
+
+        # إعادة حساب الانتقال/التشابه بعد اكتمال القرار البنيوي النهائي
+        final_transition = detect_state_transition(prev_state, result)
+        result["state_transition"] = final_transition.get("state_transition")
+        result["state_transition_reason"] = final_transition.get("reason", "")
+        asset_local_memory_latest = load_asset_memory(symbol)
+        result["state_transition_context"] = build_asset_state_transition_context(asset_local_memory_latest, result)
+        result["case_similarity_context"] = build_asset_case_similarity_context(asset_local_memory_latest, result.get("market_features") or {}, result)
+        final_case_match = match_closest_case(build_case_vector(result.get("market_features") or {}, result), load_case_library())
+        result["closest_case_match"] = final_case_match.get("case_name")
+        result["closest_case_score"] = safe_float(final_case_match.get("score"), 0.0)
+
         result.update(build_arabic_output_fields(result))
+        result["decision_trace"] = build_decision_trace(result)
+        conformance_audit = run_structural_conformance_audit(result)
+        result["structural_conformance_audit"] = conformance_audit
+        if not conformance_audit.get("passed", False):
+            result.setdefault("diagnostics", [])
+            result["diagnostics"].append(f"STRUCTURAL_AUDIT_FAIL: {conformance_audit.get('summary_ar', '')}")
         result["liquidation_absorption_proxy"] = detect_liquidation_absorption_proxy(result.get("market_features") or {}, result)
-        update_asset_local_memory(symbol, result.get("market_features") or {}, result)
+        save_current_symbol_state(symbol, result)
+        update_asset_memory(symbol, result.get("market_features") or {}, result)
         return result
 
     except Exception as exc:
@@ -5273,7 +5557,7 @@ def analyze_symbol_structural(
             "analysis_center": "structural_casefile",
             "error": str(exc),
             "family": None,
-            "stage": "WATCH",
+            "stage": None,
             "oi_state": "neutral",
             "discovery_state": "غير مكتشفة بنيويًا",
             "execution_state": "فاشلة",
@@ -5325,6 +5609,7 @@ def prepare_candidates(
     filtered: List[Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, Any], float]] = []
     skipped_counter = defaultdict(int)
     full_scan_mode = bool(DYNAMIC_SETTINGS.get("FULL_UNIVERSE_SCAN_ENABLED", False))
+    prefilter_enabled = bool(DYNAMIC_SETTINGS.get("ENABLE_PRE_FILTER", True))
 
     for symbol, symbol_meta in symbol_universe.items():
         ticker_24h = ticker_map.get(symbol)
@@ -5333,35 +5618,45 @@ def prepare_candidates(
             skipped_counter["missing_market_snapshot"] += 1
             continue
 
-        if full_scan_mode:
+        if full_scan_mode or not prefilter_enabled:
             passed, reasons = universe_filter_for_full_scan(symbol, symbol_meta, mark_info)
             if not passed:
                 skipped_counter[reasons[0] if reasons else "universe_filter_reject"] += 1
                 continue
         else:
-            passed, reasons = quick_filter(symbol, symbol_meta, ticker_24h, mark_info)
+            passed, reasons = early_rise_prefilter(symbol, symbol_meta, ticker_24h, mark_info)
             if not passed:
-                skipped_counter[reasons[0] if reasons else "quick_filter_reject"] += 1
+                skipped_counter[reasons[0] if reasons else "prefilter_reject"] += 1
                 continue
 
-        score_hint = safe_float(ticker_24h.get("quoteVolume"))
+        # ترتيب المرشحين: سيولة + مدى + تغير، بدون إقصاء قاسٍ لحالات التحول المبكر
+        score_hint = (
+            (0.60 * safe_float(ticker_24h.get("quoteVolume")))
+            + (0.25 * safe_float(ticker_24h.get("count")))
+            + (0.15 * abs(safe_float(ticker_24h.get("priceChangePercent"))))
+        )
         filtered.append((symbol, symbol_meta, ticker_24h, mark_info, score_hint))
 
     filtered.sort(key=lambda item: item[4], reverse=True)
 
-    if full_scan_mode:
+    if full_scan_mode or not prefilter_enabled:
         final_candidates = filtered
     else:
-        filtered = filtered[: DYNAMIC_SETTINGS["TOP_N_BY_24H_VOLUME"]]
-        # نقتطع عددًا أصغر للتحليل العميق حتى لا نرهق البيئة المحدودة
-        final_candidates = filtered[: DYNAMIC_SETTINGS["MAX_CANDIDATES_AFTER_FILTER"]]
+        if bool(DYNAMIC_SETTINGS.get("APPLY_CANDIDATE_CAP_AFTER_FILTER", True)):
+            filtered = filtered[: DYNAMIC_SETTINGS["TOP_N_BY_24H_VOLUME"]]
+            # نقتطع عددًا أصغر للتحليل العميق حتى لا نرهق البيئة المحدودة
+            final_candidates = filtered[: DYNAMIC_SETTINGS["MAX_CANDIDATES_AFTER_FILTER"]]
+        else:
+            final_candidates = filtered
 
     return [(s, sm, t, m) for s, sm, t, m, _ in final_candidates], {
         "universe_size": len(symbol_universe),
         "snapshot_tickers": len(ticker_map),
         "snapshot_mark": len(mark_map),
         "full_scan_mode": full_scan_mode,
-        "quick_filter_passed": len(filtered),
+        "prefilter_enabled": prefilter_enabled,
+        "quick_filter_passed": len(filtered),  # backward-compat naming
+        "prefilter_passed": len(filtered),
         "deep_candidates": len(final_candidates),
         "skipped_counter": dict(skipped_counter),
     }
@@ -5548,6 +5843,30 @@ ARABIC_POST_FLUSH_LABELS: Dict[str, str] = {
     "FAILED_REBUILD_AFTER_FLUSH": "فشل إعادة البناء بعد التفريغ",
 }
 
+ARABIC_MARKET_REGIME_V2_LABELS: Dict[str, str] = {
+    "shock_event": "حدث صادم/اندفاع مفاجئ",
+    "trend_expansion": "تمدد اتجاهي داعم",
+    "range_conflict": "نطاق متعارض",
+    "squeeze_coil": "انضغاط قبل انفراج",
+    "transitional": "مرحلة انتقالية",
+}
+
+ARABIC_ACTOR_INTENT_LABELS: Dict[str, str] = {
+    "new_longs_building": "بناء مراكز شراء جديدة",
+    "short_covering": "تغطية بيع (Short Covering)",
+    "new_shorts_building": "بناء مراكز بيع جديدة",
+    "long_unwinding": "تفكيك مراكز شراء",
+    "position_led_accumulation": "تجميع تقوده المراكز",
+    "balanced_wait": "توازن/انتظار",
+}
+
+ARABIC_ENTRY_WINDOW_LABELS: Dict[str, str] = {
+    "trigger_confirmed": "نافذة دخول مؤكدة",
+    "await_trigger": "ترقّب الزناد",
+    "setup_building": "تهيئة مبكرة قيد البناء",
+    "avoid_or_wait": "تجنب/انتظار",
+}
+
 
 def translate_label(value: Any, mapping: Dict[str, str], default: str = "غير معروف") -> str:
     if value is None:
@@ -5564,16 +5883,6 @@ def derive_leader_type(result: Dict[str, Any]) -> str:
     counterflow_pattern = result.get("counterflow_pattern") or {}
     if counterflow_pattern.get("active", False):
         return "counterflow_led"
-
-    family = result.get("family")
-    if family == "POSITION_LED_SQUEEZE_BUILDUP":
-        return "position_led"
-    if family in {"ACCOUNT_LED_ACCUMULATION", "ACCOUNT_LED_CONSENSUS_BULLISH_EXPANSION"}:
-        return "account_led"
-    if family == "CONSENSUS_BULLISH_EXPANSION":
-        return "consensus_led"
-    if family == "FLOW_LIQUIDITY_VACUUM_BREAKOUT":
-        return "flow_led"
 
     features = result.get("market_features") or {}
     ratio_alignment = result.get("ratio_alignment") or features.get("ratio_alignment") or {}
@@ -5605,7 +5914,7 @@ def derive_leader_type_ar(result: Dict[str, Any]) -> str:
     return mapping.get(leader_type, "قيادة غير محسومة بعد")
 
 
-def build_hypothesis_scores(result: Dict[str, Any]) -> Dict[str, float]:
+def _build_hypothesis_scores_legacy(result: Dict[str, Any]) -> Dict[str, float]:
     scores: Dict[str, float] = {
         "bullish_rebuild_after_flush": 0.0,
         "relief_bounce_after_flush": 0.0,
@@ -5664,17 +5973,6 @@ def build_hypothesis_scores(result: Dict[str, Any]) -> Dict[str, float]:
     if (result.get("counterflow_pattern") or {}).get("active", False):
         scores["counterflow_short_squeeze_expansion"] += 0.55
         scores["counterflow_short_squeeze_expansion"] += min(safe_float((result.get("counterflow_pattern") or {}).get("score"), 0.0) / 16.0, 0.18)
-
-    family = result.get("family")
-    if family == "POSITION_LED_SQUEEZE_BUILDUP":
-        scores["position_led_buildup"] += 0.52
-    elif family == "ACCOUNT_LED_ACCUMULATION":
-        scores["account_led_accumulation"] += 0.52
-    elif family == "CONSENSUS_BULLISH_EXPANSION":
-        scores["consensus_bullish_expansion"] += 0.54
-    elif family == "ACCOUNT_LED_CONSENSUS_BULLISH_EXPANSION":
-        scores["account_led_accumulation"] += 0.26
-        scores["consensus_bullish_expansion"] += 0.24
 
     if leader_type == "position_led":
         scores["position_led_buildup"] += 0.12
@@ -6780,6 +7078,75 @@ def attach_structural_casefile(result: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def rank_hypotheses(scores: Dict[str, float]) -> List[Tuple[str, float]]:
+    return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def select_primary_hypothesis(ranked: List[Tuple[str, float]]) -> Dict[str, Any]:
+    if not ranked:
+        return {"primary_hypothesis": "undetermined", "alternative_hypotheses": []}
+    return {
+        "primary_hypothesis": ranked[0][0],
+        "alternative_hypotheses": [name for name, score in ranked[1:4] if score >= 0.18],
+    }
+
+
+def build_leader_reason(features: Dict[str, Any], leader_info: Dict[str, Any]) -> str:
+    leader_type = _safe_state_text(leader_info.get("leader_type"), "undetermined")
+    strength = safe_float(leader_info.get("strength"), 0.0)
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    oi_supportive = bool(features.get("oi_buildup_supported", False)) or safe_float(features.get("oi_delta_3"), 0.0) > 0.0
+    flow_supported = bool(features.get("flow_supported", False))
+    return (
+        f"leader={leader_type} | strength={strength:.2f} | "
+        f"ratio_supportive={ratio_alignment.get('overall_supportive', False)} | "
+        f"oi_supportive={oi_supportive} | flow_supported={flow_supported}"
+    )
+
+
+def enrich_result_v2_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(result)
+    features = safe_dict_from_api(result.get("market_features"))
+    leadership_model = safe_dict_from_api(result.get("leadership_model"))
+    case_similarity = safe_dict_from_api(result.get("case_similarity_context"))
+    state_transition = safe_dict_from_api(result.get("state_transition_context"))
+    thesis = safe_dict_from_api(result.get("structural_thesis"))
+
+    primary_raw, alternatives_raw, hypothesis_scores = derive_primary_hypothesis(result)
+    ranked = rank_hypotheses(hypothesis_scores)
+    selected = select_primary_hypothesis(ranked)
+
+    result["leader_type"] = _safe_state_text(leadership_model.get("leader_type"), derive_leader_type(result))
+    result["leader_reason"] = build_leader_reason(features, leadership_model)
+    result["primary_hypothesis"] = selected.get("primary_hypothesis", primary_raw)
+    result["alternative_hypotheses"] = selected.get("alternative_hypotheses", alternatives_raw)
+    result["hypothesis_scores"] = hypothesis_scores
+    result["confidence_score"] = derive_confidence_score(result)
+    result["uncertainty_score"] = derive_uncertainty_score(result)
+    result["conflict_score"] = derive_conflict_score(result)
+    causal_text = build_causal_chain_ar(result)
+    result["causal_chain"] = [causal_text] if causal_text else []
+    result["invalidation_reason"] = _safe_state_text(result.get("invalidation_reason"), derive_invalidation_reason_ar(result))
+    result["next_failure_mode"] = _safe_state_text(result.get("next_failure_mode"), derive_next_failure_mode_ar(result))
+    result["state_transition"] = state_transition.get("transition_key")
+    result["state_transition_reason"] = state_transition.get("transition_ar", "")
+
+    top_cases = safe_list_from_api(case_similarity.get("top_cases"))
+    if top_cases:
+        first = safe_dict_from_api(top_cases[0])
+        result["closest_case_match"] = first.get("primary_hypothesis") or first.get("primary_hypothesis_ar")
+        result["closest_case_score"] = safe_float(first.get("similarity"), 0.0)
+    else:
+        result["closest_case_match"] = None
+        result["closest_case_score"] = 0.0
+
+    result["hypothesis_inputs"] = {
+        "top_thesis_score": safe_float(thesis.get("top_score"), 0.0),
+        "thesis_quality": _safe_state_text(thesis.get("thesis_quality"), "unknown"),
+    }
+    return result
+
+
 def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     primary_ar, alternatives_ar = derive_primary_hypothesis_ar(result)
     primary_raw, alternatives_raw, hypothesis_scores = derive_primary_hypothesis(result)
@@ -6787,6 +7154,10 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     uncertainty_score = derive_uncertainty_score(result)
     confidence_score = derive_confidence_score(result)
     leader_type_raw = derive_leader_type(result)
+    market_regime_v2_state = _safe_state_text(safe_dict_from_api(result.get("market_regime_v2")).get("state"), "transitional")
+    actor_intent_state = _safe_state_text(safe_dict_from_api(result.get("actor_intent")).get("state"), "balanced_wait")
+    entry_window_state = _safe_state_text(result.get("entry_window_state"), "avoid_or_wait")
+    early_rise = safe_dict_from_api(result.get("early_rise_index"))
     return {
         "family_ar": translate_label(result.get("family"), ARABIC_FAMILY_LABELS, "غير محسومة"),
         "stage_ar": translate_label(result.get("stage"), ARABIC_STAGE_LABELS, "غير معروفة"),
@@ -6820,12 +7191,23 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         "flip_condition_ar": safe_dict_from_api(result.get("adversarial_review")).get("flip_condition", "لا يوجد شرط قلب واضح بعد."),
         "structural_execution_state_ar": safe_dict_from_api(result.get("execution_verdict")).get("execution_state_ar", "غير محسوم"),
         "structural_execution_reason_ar": safe_dict_from_api(result.get("execution_verdict")).get("reason_ar", "لا يوجد تفسير تنفيذي مستقل بعد."),
+        "cvd_explanatory_ar": safe_dict_from_api(result.get("cvd_explanatory_context")).get("summary_ar", "CVD تفسيري ومحايد في الحالة الحالية."),
         "asset_memory_context_ar": safe_dict_from_api(result.get("asset_memory_context")).get("summary", "لا توجد ذاكرة محلية كافية لهذا الأصل بعد."),
         "asset_change_state_ar": safe_dict_from_api(result.get("asset_memory_context")).get("change_state_ar", "لا توجد ذاكرة محلية كافية لهذا الأصل بعد."),
         "state_transition_ar": safe_dict_from_api(result.get("state_transition_context")).get("transition_ar", "لا توجد انتقالات حالة محفوظة لهذا الأصل بعد."),
         "case_similarity_ar": safe_dict_from_api(result.get("case_similarity_context")).get("summary_ar", "لا توجد حالات مرجعية مشابهة محفوظة لهذا الأصل بعد."),
         "behavior_profile_ar": safe_dict_from_api(result.get("behavior_profile_context")).get("summary_ar", "لا توجد بعد ذاكرة سلوكية محلية كافية لهذا الأصل."),
         "behavior_fit_ar": safe_dict_from_api(result.get("behavior_profile_context")).get("fit_ar", "طبع الأصل ما زال قيد البناء."),
+        "market_regime_v2_ar": translate_label(market_regime_v2_state, ARABIC_MARKET_REGIME_V2_LABELS, "مرحلة انتقالية"),
+        "actor_intent_ar": translate_label(actor_intent_state, ARABIC_ACTOR_INTENT_LABELS, "نية غير محسومة"),
+        "entry_window_state_ar": translate_label(entry_window_state, ARABIC_ENTRY_WINDOW_LABELS, "تجنب/انتظار"),
+        "early_rise_score": safe_float(early_rise.get("score"), 0.0),
+        "early_rise_state_ar": translate_label(_safe_state_text(early_rise.get("state"), "no_edge"), {
+            "actionable_setup": "جاهزية تنفيذية مرتفعة",
+            "trigger_watch": "ترقب زناد قريب",
+            "early_watch": "مراقبة مبكرة",
+            "no_edge": "لا أفضلية واضحة",
+        }, "لا أفضلية واضحة"),
     }
 
 
@@ -6836,112 +7218,69 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
 
 def print_symbol_result(result: Dict[str, Any]) -> None:
     view = build_arabic_output_fields(result)
-    features = safe_dict_from_api(result.get("market_features"))
-    structural_case = safe_dict_from_api(result.get("structural_case"))
-    structural_thesis = safe_dict_from_api(result.get("structural_thesis"))
-    adversarial_review = safe_dict_from_api(result.get("adversarial_review"))
     execution_verdict = safe_dict_from_api(result.get("execution_verdict"))
-    pre_rise_signature = safe_dict_from_api(result.get("pre_rise_signature"))
-    acceptance_lifecycle = safe_dict_from_api(result.get("acceptance_lifecycle"))
-    short_pressure = safe_dict_from_api(result.get("short_pressure_transition"))
-    post_flush = safe_dict_from_api(result.get("post_flush_structures"))
-    crowding_regime = safe_dict_from_api(result.get("crowding_regime") or features.get("crowding_regime"))
-    extreme_engine = safe_dict_from_api(result.get("extreme_engine") or features.get("extreme_engine"))
-    ratio_alignment = safe_dict_from_api(result.get("ratio_alignment") or features.get("ratio_alignment"))
-
     structural_state = _safe_state_text(result.get("structural_execution_state"), execution_verdict.get("execution_state", "unknown"))
     structural_state_ar = view.get("structural_execution_state_ar", "غير محسوم")
     actionable_now = structural_state == "actionable_now"
-    magma_pattern = bool((features.get("counterflow_pattern") or {}).get("active", False))
+    symbol_text = _safe_state_text(result.get("symbol"), "UNKNOWN")
+    symbol_text = colorize_text(symbol_text, "green") if actionable_now else symbol_text
+    state_text = colorize_text(structural_state_ar, "green") if actionable_now else structural_state_ar
 
-    if magma_pattern and OUTPUT_SETTINGS.get("HIGHLIGHT_MAGMA_IN_RED", True):
-        header_symbol = colorize_text(_safe_state_text(result.get("symbol"), "UNKNOWN"), "red")
-        state_text = colorize_text(structural_state_ar, "red")
-    else:
-        header_symbol = colorize_text(_safe_state_text(result.get("symbol"), "UNKNOWN"), "green") if actionable_now else _safe_state_text(result.get("symbol"), "UNKNOWN")
-        state_text = colorize_text(structural_state_ar, "green") if actionable_now else structural_state_ar
+    alternatives = view.get("alternative_hypotheses_ar") or []
+    closest_case = result.get("closest_case_match") or "لا توجد حالة قريبة محفوظة بعد"
+    closest_score = format_num(result.get("closest_case_score"), 2)
+    decision_trace = safe_dict_from_api(result.get("decision_trace"))
 
     print(STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
-    print(f"الرمز: {header_symbol}")
-    print(f"قرار التنفيذ البنيوي: {state_text}")
-    print(f"درجة الأهمية: {format_num(result.get('importance_score'), 2)} | ترجيح الفرضية: {format_num(structural_thesis.get('top_score', 0.0), 2)} | عدم اليقين: {format_num(view.get('uncertainty_score'), 2)} | التعارض: {format_num(view.get('conflict_score'), 2)}")
-    if execution_verdict.get("reason_ar"):
-        print(f"سبب القرار: {execution_verdict.get('reason_ar')}")
+    print("الملخص")
+    print(f"- الرمز: {symbol_text}")
+    print(f"- الأهمية: {format_num(result.get('importance_score'), 2)}")
+    print(f"- السلة النهائية: {view.get('final_bucket_ar', result.get('final_bucket', 'غير معروف'))}")
+    print(f"- القرار التنفيذي: {state_text}")
 
-    print("\nملف القضية البنيوية:")
-    print(f"- النظام البنيوي: {structural_case.get('regime_pattern_ar', view.get('regime_pattern_ar', 'غير معروف'))}")
-    print(f"- نوع القيادة: {structural_case.get('leader_type_ar', view.get('leader_type_ar', 'غير معروف'))}")
-    print(f"- دور OI: {structural_case.get('oi_role_ar', 'غير معروف')}")
-    print(f"- جودة التدفق: {structural_case.get('flow_quality_ar', 'غير معروف')}")
-    print(f"- حكم السعر: {structural_case.get('price_verdict_ar', 'غير معروف')}")
+    print("\nالقراءة البنيوية")
+    print(f"- النظام: {view.get('regime_pattern_ar', 'غير معروف')}")
+    print(f"- نظام السوق V2: {view.get('market_regime_v2_ar', 'مرحلة انتقالية')}")
+    print(f"- الزناد: {view.get('trigger_pattern_ar', 'غير معروف')}")
+    print(f"- حالة التنفيذ: {view.get('execution_pattern_ar', 'غير معروف')}")
+    print(f"- القيادة: {view.get('leader_type_ar', 'غير معروف')}")
+    print(f"- نية المشاركين: {view.get('actor_intent_ar', 'نية غير محسومة')}")
+    print(f"- نافذة الدخول: {view.get('entry_window_state_ar', 'تجنب/انتظار')}")
+    print(f"- نظام الازدحام: {view.get('crowding_regime_ar', 'غير معروف')}")
+    print(f"- الفرضية الرئيسية: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
+    print(f"- الفرضيات البديلة: {', '.join(alternatives) if alternatives else 'لا توجد بدائل قريبة'}")
+
+    print("\nتسلسل البحث")
+    print(f"- السياق: {decision_trace.get('context', view.get('regime_pattern_ar', 'غير معروف'))}")
+    print(f"- بيئة السوق: {decision_trace.get('regime_v2', view.get('market_regime_v2_ar', 'مرحلة انتقالية'))}")
+    print(f"- القيادة: {decision_trace.get('leadership', view.get('leader_type_ar', 'غير معروف'))}")
+    print(f"- نية الطرف الغالب: {decision_trace.get('actor_intent', view.get('actor_intent_ar', 'نية غير محسومة'))}")
+    print(f"- علاقة OI: {decision_trace.get('oi_relation', view.get('oi_state_ar', 'غير معروف'))}")
+    print(f"- التدفق: {decision_trace.get('flow', _safe_state_text(result.get('flow_quality'), 'غير محسوم'))}")
+    print(f"- الزناد: {decision_trace.get('trigger', view.get('trigger_pattern_ar', 'غير معروف'))}")
+    print(f"- القبول: {decision_trace.get('acceptance', _safe_state_text(result.get('acceptance_reason'), 'غير محسوم'))}")
+    print(f"- الفرضية: {decision_trace.get('hypothesis', view.get('primary_hypothesis_ar', 'غير محسومة'))}")
+    print(f"- القرار: {decision_trace.get('decision', state_text)}")
+    print(f"- نافذة التنفيذ: {decision_trace.get('entry_window', view.get('entry_window_state_ar', 'تجنب/انتظار'))}")
+    print(f"- الإبطال: {decision_trace.get('invalidation', view.get('invalidation_reason_ar', 'لا يوجد إبطال محدد بعد'))}")
+
+    print("\nلماذا")
     print(f"- السلسلة السببية: {view.get('causal_chain_ar', 'لا توجد سلسلة سببية جاهزة بعد')}")
-    print(f"- شرط الإبطال: {view.get('invalidation_reason_ar', 'لا يوجد شرط إبطال واضح بعد')}")
-    print(f"- الخطر التالي المرجح: {view.get('next_failure_mode_ar', 'لا يوجد توصيف واضح للخطر التالي بعد')}")
+    print(f"- دور CVD: {view.get('cvd_explanatory_ar', 'CVD تفسيري ومحايد في الحالة الحالية.')}")
+    print(f"- سبب القبول: {_safe_state_text(result.get('acceptance_reason'), 'غير متاح')}")
+    print(f"- سبب الاستمرار: {_safe_state_text(result.get('continuation_reason'), 'غير متاح')}")
 
-    print("\nالأطروحة البنيوية:")
-    print(f"- الفرضية الأقوى: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
-    alternatives = view.get('alternative_hypotheses_ar') or []
-    print(f"- البديل الأقرب: {alternatives[0] if alternatives else 'لا يوجد بديل قريب واضح'}")
-    print(f"- جودة الأطروحة: {structural_thesis.get('thesis_quality_ar', 'غير محسومة')}")
-    if structural_thesis.get("summary_ar"):
-        print(f"- الملخص البنيوي: {structural_thesis.get('summary_ar')}")
+    print("\nالمخاطر")
+    print(f"- مؤشر بداية الارتفاع المبكر: {format_num(view.get('early_rise_score'), 2)} ({view.get('early_rise_state_ar', 'لا أفضلية واضحة')})")
+    print(f"- الثقة: {format_num(view.get('confidence_score'), 2)}")
+    print(f"- عدم اليقين: {format_num(view.get('uncertainty_score'), 2)}")
+    print(f"- التعارض: {format_num(view.get('conflict_score'), 2)}")
+    print(f"- سبب الإبطال: {view.get('invalidation_reason_ar', 'لا يوجد إبطال محدد بعد')}")
+    print(f"- نمط الفشل التالي: {view.get('next_failure_mode_ar', 'غير محدد بعد')}")
 
-    print("\nالمراجعة المضادة:")
-    print(f"- اعتراض محامي الشيطان: {adversarial_review.get('main_risk_ar', 'لا يوجد اعتراض بارز')}")
-    print(f"- نوع الفخ المحتمل: {adversarial_review.get('trap_type_ar', 'لا يوجد فخ واضح')}")
-    print(f"- شرط قلب الحكم: {adversarial_review.get('flip_condition', 'لا يوجد شرط قلب واضح')}")
-
-    print("\nمخرجات التعديلات الأخيرة:")
-    if pre_rise_signature:
-        print(f"- البصمة المبكرة: {_safe_state_text(pre_rise_signature.get('state'), 'غير محسومة')} | الثقة={format_num(pre_rise_signature.get('confidence'), 2)}")
-    if acceptance_lifecycle:
-        print(f"- دورة القبول: {_safe_state_text(acceptance_lifecycle.get('acceptance_quality'), 'غير معروفة')} | الهيكل={_safe_state_text(acceptance_lifecycle.get('post_breakout_structure'), 'غير معروف')} | الحكم={_safe_state_text(acceptance_lifecycle.get('verdict'), 'غير معروف')}")
-    if short_pressure:
-        print(f"- ضغط الشورت/التغطية: {_safe_state_text(short_pressure.get('pressure_state'), 'غير محسوم')} | المرحلة={_safe_state_text(short_pressure.get('phase'), 'غير معروفة')} | قابلية الاستمرار={_safe_state_text(short_pressure.get('continuation_potential'), 'غير معروفة')}")
-    if post_flush.get("active", False):
-        print(f"- بنية ما بعد الـ Flush: {_safe_state_text(post_flush.get('pattern'), 'غير معروفة')} | الثقة={format_num(post_flush.get('confidence'), 2)}")
-    if crowding_regime:
-        print(f"- نظام الازدحام الثلاثي: {view.get('crowding_regime_ar', 'غير معروف')} | الحالات الزمنية={crowding_regime.get('tf_states', {})}")
-    if ratio_alignment:
-        print(f"- توافق النسب عبر الفريمات: overall_supportive={ratio_alignment.get('overall_supportive', False)} | higher_tf_supportive={ratio_alignment.get('higher_tf_supportive', False)} | overall_conflict={ratio_alignment.get('overall_conflict', False)}")
-    if extreme_engine:
-        higher_regime = translate_label(extreme_engine.get('higher_regime'), {
-            'upper_extreme': 'تطرف علوي',
-            'lower_extreme': 'تطرف سفلي',
-            'mixed': 'تطرفات مختلطة',
-            'neutral': 'محايد',
-        }, 'غير محسوم')
-        print(f"- محرك التطرف والانعطاف: الأعلى={higher_regime} | squeeze_probability={format_num(extreme_engine.get('squeeze_probability'), 1)} | flush_probability={format_num(extreme_engine.get('flush_probability'), 1)}")
-
-    print("\nسياق الأصل من ذاكرته المحلية:")
-    print(f"- {view.get('asset_memory_context_ar', 'لا توجد ذاكرة محلية كافية لهذا الأصل بعد.')}")
-    print("حالة الأصل مقارنة بذاكرته المحلية:")
-    print(f"- {view.get('asset_change_state_ar', 'لا توجد ذاكرة محلية كافية لهذا الأصل بعد.')}")
-    print("الانتقال الحالي مقارنة بآخر حالة محفوظة:")
-    print(f"- {view.get('state_transition_ar', 'لا توجد انتقالات حالة محفوظة لهذا الأصل بعد.')}")
-    print("أقرب الحالات المرجعية المشابهة لهذا الأصل:")
-    print(f"- {view.get('case_similarity_ar', 'لا توجد حالات مرجعية مشابهة محفوظة لهذا الأصل بعد.')}")
-    print("الطبع السلوكي التاريخي لهذا الأصل:")
-    print(f"- {view.get('behavior_profile_ar', 'لا توجد بعد ذاكرة سلوكية محلية كافية لهذا الأصل.')}")
-    print("مدى انسجام الحالة الحالية مع طبع الأصل:")
-    print(f"- {view.get('behavior_fit_ar', 'طبع الأصل ما زال قيد البناء.')}")
-
-    market_context = safe_dict_from_api(result.get("market_context"))
-    cross_asset = safe_dict_from_api(result.get("cross_asset_similarity_context"))
-    liq = safe_dict_from_api(result.get("liquidation_absorption_proxy"))
-    if liq:
-        print("\nقراءة السيولة/التصفية التقريبية:")
-        print(f"- {liq.get('state_ar', 'غير متاحة')}")
-        if liq.get("summary_ar"):
-            print(f"- {liq.get('summary_ar')}")
-    if market_context.get("available", False):
-        print("\nسياق السوق العام:")
-        print(f"- {market_context.get('market_regime_ar', 'غير متاح')}")
-        if market_context.get("summary_ar"):
-            print(f"- {market_context.get('summary_ar', '')}")
-    if cross_asset.get("available", False):
-        print("\nأقرب حالات مشابهة من أصول أخرى:")
-        print(f"- {cross_asset.get('summary_ar', 'غير متاح')}")
+    print("\nالذاكرة")
+    print(f"- أقرب حالة: {closest_case} (الدرجة={closest_score})")
+    print(f"- الانتقال من الحالة السابقة: {_safe_state_text(result.get('state_transition_reason'), view.get('state_transition_ar', 'غير متاح'))}")
 
 def print_cycle_report(report: Dict[str, Any]) -> None:
     print("\n" + STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
@@ -6955,7 +7294,8 @@ def print_cycle_report(report: Dict[str, Any]) -> None:
     print(f"- Snapshot ticker24h: {prep['snapshot_tickers']}")
     print(f"- Snapshot mark price: {prep['snapshot_mark']}")
     print(f"- وضع الفحص الشامل: {'مفعّل' if prep.get('full_scan_mode') else 'غير مفعّل'}")
-    print(f"- مجتازة للتصفية/الكون: {prep['quick_filter_passed']}")
+    print(f"- الفلتر الجديد (مسبق): {'مفعّل' if prep.get('prefilter_enabled', True) else 'معطّل'}")
+    print(f"- مجتازة للفلتر/الكون: {prep.get('prefilter_passed', prep.get('quick_filter_passed', 0))}")
     print(f"- رموز التحليل العميق الفعلية: {prep['deep_candidates']}")
 
     print("\nالملخص البنيوي للدورة:")
