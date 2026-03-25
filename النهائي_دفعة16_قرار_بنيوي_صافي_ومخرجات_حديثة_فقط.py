@@ -68,17 +68,17 @@ STATIC_SETTINGS: Dict[str, Any] = {
 # ============================================================
 
 DYNAMIC_SETTINGS: Dict[str, Any] = {
-    "SCAN_LOOP_ENABLED": False,
-    "SCAN_LOOP_INTERVAL_SEC": 120,
+    "SCAN_LOOP_ENABLED": True,
+    "SCAN_LOOP_INTERVAL_SEC": 60,
     "FULL_UNIVERSE_SCAN_ENABLED": False,
     "ENABLE_PRE_FILTER": True,  # عند التعطيل: مسح كل السوق (USDT-M perpetual النشط)
-    "PRE_FILTER_SCORE_THRESHOLD": 0.35,
-    "PRE_FILTER_MIN_24H_QUOTE_VOLUME": 500_000.0,
-    "PRE_FILTER_MIN_24H_TRADE_COUNT": 250,
+    "PRE_FILTER_SCORE_THRESHOLD": 0.36,
+    "PRE_FILTER_MIN_24H_QUOTE_VOLUME": 200_000.0,
+    "PRE_FILTER_MIN_24H_TRADE_COUNT": 120,
     "PRE_FILTER_PRICE_CHANGE_FLOOR": -3.0,   # لا نقصي الحركة السالبة بالكامل (لرصد التحول المبكر)
     "PRE_FILTER_PRICE_CHANGE_CEIL": 35.0,    # سقف واسع لتجنب رفض الانفجارات المبكرة
-    "DAILY_RISE_FILTER_ENABLED": True,
-    "DAILY_RISE_MIN_PCT": 2.5,  # فلتر اليوم: امسح العملات التي ارتفعت نسبة قابلة للتخصيص
+    "DAILY_RISE_FILTER_ENABLED": False,
+    "DAILY_RISE_MIN_PCT": 0.8,  # خفضناها لالتقاط التحركات المبكرة قبل الانفجار
     "SCAN_MIN_MARK_PRICE": 0.00001,
     "ENABLE_ADAPTIVE_TRAINING_MODEL": True,
     "ADAPTIVE_MODEL_LEARNING_RATE": 0.04,
@@ -110,6 +110,8 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "FUNDING_LIMIT": 6,
     "BASIS_LIMIT": 18,
     "MAX_WORKERS": 6,
+    "CANDIDATE_TOP_N": 400,
+    "NEAR_MISS_TOP_N": 10,
     "CYCLE_CACHE_TTL_SEC": 60,
     "LONGER_CACHE_TTL_SEC": 600,
     "DEBUG_HTTP_ERRORS": False,
@@ -131,6 +133,7 @@ DYNAMIC_SETTINGS: Dict[str, Any] = {
     "ASSET_CASE_SIMILARITY_TOP_K": 3,
     "ASSET_TRANSITION_MEMORY_MAX": 120,
     "ASSET_BEHAVIOR_MIN_CASES": 18,
+    "ACCEPTANCE_MIN_TRIGGER_COUNT": 2,
 }
 
 
@@ -200,7 +203,7 @@ EXECUTION_RULES: Dict[str, Any] = {
 
     # --- Flow / Activity ---
     "strong_taker_buy_ratio": 0.56,
-    "persistent_taker_buy_ratio": 0.53,
+    "persistent_taker_buy_ratio": 0.51,
     "min_trade_expansion": 1.35,
     "min_volume_expansion": 1.35,
     "min_trade_activity_hold": 1.10,
@@ -660,7 +663,10 @@ def filter_and_sort_results_for_output(results: List[Dict[str, Any]]) -> List[Di
         )
         filtered = [
             row for row in filtered
-            if _safe_state_text(row.get("structural_execution_state"), "unknown") in allowed
+            if _safe_state_text(
+                row.get("structural_execution_state"),
+                _safe_state_text(row.get("execution_decision"), "unknown"),
+            ) in allowed
         ]
 
     if OUTPUT_SETTINGS.get("PRINT_MAGMA_PATTERN_ONLY", False):
@@ -672,8 +678,12 @@ def filter_and_sort_results_for_output(results: List[Dict[str, Any]]) -> List[Di
     sort_asc = OUTPUT_SETTINGS.get("SORT_BY_IMPORTANCE_ASC", True)
     filtered.sort(
         key=lambda r: (
-            STRUCTURAL_EXECUTION_ORDER.get(_safe_state_text(r.get("structural_execution_state"), "failed"), 99),
+            STRUCTURAL_EXECUTION_ORDER.get(
+                _safe_state_text(r.get("structural_execution_state"), _safe_state_text(r.get("execution_decision"), "failed")),
+                99,
+            ),
             safe_float(r.get("importance_score"), 0.0),
+            -safe_float(safe_dict_from_api(r.get("early_warning")).get("score"), 0.0),
             r.get("symbol", ""),
         ),
         reverse=False if sort_asc else False,
@@ -5137,6 +5147,35 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         and not features.get("one_bar_spike", False)
     )
 
+    trigger_count = 0
+    trigger_count += int(bool(ignition_like))
+    trigger_count += int(bool(price_reaccept_proxy or hold_confirmed))
+    trigger_count += int(bool(oi_not_collapsing and (oi_supportive or gap_supportive)))
+    trigger_count += int(bool(flow_supported or buy_pressure_persistent or trade_activity_alive))
+    trigger_count += int(bool(not price_late))
+
+    hard_reject_reasons: List[str] = []
+    oi_delta_3 = safe_float(features.get("oi_delta_3"), 0.0)
+    oi_percentile = safe_float(features.get("oi_percentile"), 0.0)
+    if not oi_supportive and oi_delta_3 <= 0:
+        hard_reject_reasons.append("oi build too weak")
+    if oi_percentile > 0 and oi_percentile < 0.35:
+        hard_reject_reasons.append("oi percentile too weak")
+    if not ignition_like:
+        hard_reject_reasons.append("price has not started moving")
+    if breakout_touched and not (close_above or hold_confirmed or price_reaccept_proxy):
+        hard_reject_reasons.append("price confirmation missing")
+    if not (breakout_touched or close_above or hold_confirmed):
+        hard_reject_reasons.append("price breakout missing")
+    if breakout_touched and ret_1 <= 0.03 and ret_3 <= 0.10:
+        hard_reject_reasons.append("price breakout too weak")
+    if features["trade_expansion_last"] < EXECUTION_RULES["min_trade_activity_hold"]:
+        hard_reject_reasons.append("trade expansion weak")
+    if features["recent_buy_ratio"] < (EXECUTION_RULES["persistent_taker_buy_ratio"] - 0.01):
+        hard_reject_reasons.append("taker flow too weak")
+    if ret_1 <= 0 and ret_3 <= 0 and not higher_low_bias:
+        hard_reject_reasons.append("no upward impulse yet")
+
     if strict_acceptance:
         accepted = True
         acceptance_reason = "قبول صارم: إغلاق واختراق مثبت مع دعم OI والتدفق والنشاط"
@@ -5187,6 +5226,29 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         acceptance_reason = "القبول موجود جزئيًا لكن تعارض الفريمات يمنع اعتباره قبولًا كاملًا"
         diagnostics.append(acceptance_reason)
 
+    account_lead = safe_float((features.get("position_account_gap", {}) or {}).get("account_lead"), 0.0)
+    flow_tolerance_setup = flow_supported or (buy_pressure_persistent and breakout_touched)
+    tolerant_pattern = (
+        counterflow_active
+        or bool(bullish_rebuild.get("active", False))
+        or lower_extreme_regime_acceptance
+        or account_lead >= FAMILY_RULES["ACCOUNT_LED_ACCUMULATION"]["account_lead_min"]
+        or flow_tolerance_setup
+    )
+    min_trigger_count_base = safe_int(DYNAMIC_SETTINGS.get("ACCEPTANCE_MIN_TRIGGER_COUNT", 3), 3)
+    min_trigger_count = max(2, min_trigger_count_base - 1) if tolerant_pattern else min_trigger_count_base
+    hard_reject_block = len(hard_reject_reasons) >= (2 if tolerant_pattern else 1)
+
+    if accepted and (trigger_count < min_trigger_count or hard_reject_block):
+        accepted = False
+        partial = True if trigger_count >= max(1, min_trigger_count - 1) else partial
+        if hard_reject_block and hard_reject_reasons:
+            diagnostics.append("hard reject: " + " | ".join(hard_reject_reasons[:3]))
+        if trigger_count < min_trigger_count:
+            diagnostics.append(f"عدد المحفزات غير كافٍ ({trigger_count} < {min_trigger_count})")
+        if not acceptance_reason:
+            acceptance_reason = "قبول جزئي: البنية موجودة لكن لم تكتمل شروط العبور الصلب"
+
     return {
         "accepted": accepted,
         "partial": partial,
@@ -5195,6 +5257,8 @@ def detect_acceptance_state(features: Dict[str, Any]) -> Dict[str, Any]:
         "strict_acceptance": strict_acceptance,
         "regime_acceptance": regime_anchor_strength >= 1,
         "structural_acceptance": structural_acceptance,
+        "trigger_count": trigger_count,
+        "hard_reject_reasons": hard_reject_reasons,
         "diagnostics": diagnostics,
     }
 
@@ -5291,6 +5355,309 @@ def detect_failure_continuation(features: Dict[str, Any], acceptance: Dict[str, 
         "failure_reason": failure_reason,
         "diagnostics": diagnostics,
     }
+
+
+def evaluate_pre_rise_market_decision_tree(
+    features: Dict[str, Any],
+    family_info: Dict[str, Any],
+    stage_info: Dict[str, Any],
+    oi_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    تطبيق شجرة قرار السوق قبل الارتفاع (المستوى البنيوي للسوق).
+    المخرجات تُستخدم كتفسير مستقل ولا تكسر المنطق القديم.
+    """
+    funding_context = _safe_state_text(features.get("funding_context"), "unknown")
+    basis_context = _safe_state_text(features.get("basis_context"), "missing")
+    ratio_alignment = safe_dict_from_api(features.get("ratio_alignment"))
+    gap = safe_dict_from_api(features.get("position_account_gap"))
+    crowding = safe_dict_from_api(features.get("crowding_regime"))
+    extreme_engine = safe_dict_from_api(features.get("extreme_engine"))
+    extreme_patterns = safe_dict_from_api(extreme_engine.get("patterns"))
+
+    ret_1 = safe_float(features.get("ret_1"), 0.0)
+    ret_3 = safe_float(features.get("ret_3"), 0.0)
+    price_late = bool(features.get("price_late", False))
+    breakout_touched = bool(features.get("breakout_touched", False))
+    close_above_breakout = bool(features.get("close_above_breakout", False))
+    higher_low_bias = bool(features.get("higher_low_bias", False))
+    follow_through = bool(features.get("follow_through_bias", False))
+
+    oi_delta_1 = safe_float(features.get("oi_delta_1"), 0.0)
+    oi_delta_3 = safe_float(features.get("oi_delta_3"), 0.0)
+    oi_up_ratio = safe_float(features.get("oi_up_ratio"), 0.0)
+    oi_supportive = bool(features.get("oi_buildup_supported", False) or oi_delta_3 >= EXECUTION_RULES["min_oi_increase_for_support"] or oi_up_ratio >= 0.58)
+
+    buy_ratio = safe_float(features.get("recent_buy_ratio"), 0.0)
+    trade_exp = safe_float(features.get("trade_expansion_last"), 0.0)
+    vol_exp = safe_float(features.get("vol_expansion_last"), 0.0)
+    flow_spike = (
+        buy_ratio >= max(0.58, EXECUTION_RULES["strong_taker_buy_ratio"])
+        and trade_exp >= EXECUTION_RULES["min_trade_expansion"]
+        and vol_exp >= EXECUTION_RULES["min_volume_expansion"]
+    )
+
+    pos_lead = safe_float(gap.get("position_lead"), 0.0)
+    acc_lead = safe_float(gap.get("account_lead"), 0.0)
+    ratio_last = safe_float(safe_dict_from_api(features.get("ratio_features")).get("last"), 1.0)
+    divergence = abs(pos_lead - acc_lead) >= 0.025 and ((pos_lead > 0 and acc_lead <= 0) or (acc_lead > 0 and pos_lead <= 0))
+    consensus = (
+        pos_lead > 0
+        and acc_lead > 0
+        and ratio_last >= 1.0
+        and bool(ratio_alignment.get("overall_supportive", False))
+    )
+
+    lower_extreme_active = bool(safe_dict_from_api(extreme_patterns.get("lower_extreme_squeeze")).get("active", False))
+    upper_bullish_active = bool(safe_dict_from_api(extreme_patterns.get("upper_extreme_bullish_expansion")).get("active", False))
+    upper_failure_active = bool(safe_dict_from_api(extreme_patterns.get("upper_extreme_failure")).get("active", False))
+    long_rollover_active = bool(safe_dict_from_api(extreme_patterns.get("long_crowding_rollover")).get("active", False))
+    extreme_cluster = sum([lower_extreme_active, upper_bullish_active, upper_failure_active, long_rollover_active]) >= 2
+    persistence = (
+        bool(safe_dict_from_api(extreme_engine.get("persistence")).get("active", False))
+        or safe_float(extreme_engine.get("squeeze_probability"), 0.0) >= 55
+    )
+
+    multi_tf = safe_dict_from_api(features.get("multi_tf"))
+    tf_4h = safe_dict_from_api(multi_tf.get("4h"))
+    tf_1d_like = safe_dict_from_api(multi_tf.get("4h"))  # fallback: لا يوجد 1D مباشر في البنية الحالية
+    higher_tf_support = (
+        safe_float(tf_4h.get("ret_3"), 0.0) > -0.2
+        and safe_float(tf_1d_like.get("ret_6"), safe_float(tf_1d_like.get("ret_3"), 0.0)) > -0.4
+    )
+    lower_tf_trigger = breakout_touched or close_above_breakout or flow_spike
+    mtf_agreement = higher_tf_support and lower_tf_trigger
+
+    crowd_state = _safe_state_text(crowding.get("state"), "neutral_regime")
+    higher_tf_regime = "MIXED"
+    if lower_extreme_active or crowd_state in {"crowded_short_regime", "micro_crowded_short_regime"}:
+        higher_tf_regime = "LOWER_EXTREME"
+    elif upper_bullish_active or upper_failure_active or crowd_state in {"crowded_long_regime", "micro_crowded_long_regime"}:
+        higher_tf_regime = "UPPER_EXTREME"
+
+    price_rejecting_down = higher_low_bias or close_above_breakout or (ret_3 > -0.25 and ret_1 > -0.12)
+    funding_supportive = funding_context in {"funding quiet", "funding negative improving", "non-crowded"}
+    basis_supportive = basis_context in {"neutral", "supportive"}
+    overcrowded_late = (funding_context in {"crowded long side", "funding hostile"} and price_late) or upper_failure_active or long_rollover_active
+
+    final_case = "NO_SIGNAL_EARLY_WEAK"
+    if overcrowded_late:
+        final_case = "UPPER_OVERCROWDED_LATE"
+    elif flow_spike and lower_tf_trigger and (oi_supportive or oi_delta_1 > 0):
+        final_case = "FLOW_LIQUIDITY_VACUUM_BREAKOUT"
+    elif consensus and oi_supportive and not price_late:
+        final_case = "CONSENSUS_BULLISH_EXPANSION"
+    elif higher_tf_regime in {"LOWER_EXTREME", "MIXED"} and acc_lead >= FAMILY_RULES["ACCOUNT_LED_ACCUMULATION"]["account_lead_min"] and oi_supportive and price_rejecting_down:
+        final_case = "ACCOUNT_LED_ACCUMULATION"
+    elif higher_tf_regime in {"LOWER_EXTREME", "MIXED"} and pos_lead >= FAMILY_RULES["POSITION_LED_SQUEEZE_BUILDUP"]["position_lead_min"] and oi_supportive and (lower_extreme_active or divergence or price_rejecting_down):
+        final_case = "POSITION_LED_SQUEEZE_BUILDUP"
+
+    supporting_contexts: List[str] = []
+    if funding_context == "funding quiet":
+        supporting_contexts.append("FUNDING_QUIET_REGIME")
+    if funding_context == "funding negative improving":
+        supporting_contexts.append("FUNDING_NEGATIVE_IMPROVING")
+    if basis_supportive:
+        supporting_contexts.append("BASIS_NEUTRAL_SUPPORT")
+    if lower_extreme_active:
+        supporting_contexts.append("CROWDED_SHORT_SQUEEZE")
+    if mtf_agreement:
+        supporting_contexts.append("MULTI_TIMEFRAME_AGREEMENT")
+
+    summary_ar = (
+        f"regime={higher_tf_regime} | pre-move={ 'نعم' if price_rejecting_down else 'لا' } | funding={funding_context} | "
+        f"OI داعم={ 'نعم' if oi_supportive else 'لا' } | divergence={ 'نعم' if divergence else 'لا' } | "
+        f"consensus={ 'نعم' if consensus else 'لا' } | flow_spike={ 'نعم' if flow_spike else 'لا' } | "
+        f"MTF={ 'نعم' if mtf_agreement else 'لا' } => {final_case}"
+    )
+
+    return {
+        "final_case": final_case,
+        "summary_ar": summary_ar,
+        "supporting_contexts": supporting_contexts,
+        "roots": {
+            "price_rejecting_down": price_rejecting_down,
+            "funding_supportive": funding_supportive,
+            "basis_supportive": basis_supportive,
+            "oi_supportive": oi_supportive,
+            "relative_extreme": lower_extreme_active or upper_bullish_active or upper_failure_active,
+            "persistence": persistence,
+            "extreme_cluster": extreme_cluster,
+            "position_led": pos_lead > acc_lead and pos_lead > 0,
+            "account_led": acc_lead > pos_lead and acc_lead > 0,
+            "consensus": consensus,
+            "flow_led": flow_spike,
+            "divergence": divergence,
+            "mtf_agreement": mtf_agreement,
+            "overcrowded_late": overcrowded_late,
+            "higher_tf_regime": higher_tf_regime,
+        },
+        "legacy_family": _safe_state_text(family_info.get("family"), "UNKNOWN"),
+        "legacy_stage": _safe_state_text(stage_info.get("stage"), "WATCH"),
+        "legacy_oi_state": _safe_state_text(oi_info.get("state"), "neutral"),
+    }
+
+
+def build_scanner_acceptance_tree_report(report: Dict[str, Any], near_misses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    شجرة قرار قبول/رفض السكanner (المستوى البرمجي).
+    """
+    prep = safe_dict_from_api(report.get("prep_stats"))
+    summary = safe_dict_from_api(report.get("summary"))
+    top_n = safe_int(prep.get("candidate_top_n"), safe_int(DYNAMIC_SETTINGS.get("CANDIDATE_TOP_N", 200), 200))
+    threshold = safe_float(DYNAMIC_SETTINGS.get("PRE_FILTER_SCORE_THRESHOLD"), 0.35)
+    accepted_now = safe_int(summary.get("decision::Actionable now"), 0)
+    discovered = safe_int(summary.get("decision::Discovered but not actionable"), 0)
+    hard_reject_seen = 0
+    for row in near_misses[:5]:
+        hard_reject_seen += len(safe_list_from_api(safe_dict_from_api(row.get("acceptance")).get("hard_reject_reasons")))
+
+    lines = [
+        f"Root A (Universe): top={top_n} | deep_candidates={safe_int(prep.get('deep_candidates'), 0)}",
+        f"Root B (Threshold): PRE_FILTER_SCORE_THRESHOLD={threshold:.2f}",
+        f"Root C (Trigger gate): ACCEPTANCE_MIN_TRIGGER_COUNT={safe_int(DYNAMIC_SETTINGS.get('ACCEPTANCE_MIN_TRIGGER_COUNT', 3), 3)}",
+        f"Root G (Near-miss): near_miss_count={len(near_misses)} | hard_reject_hits(top5)={hard_reject_seen}",
+    ]
+    state = "healthy"
+    if accepted_now == 0 and near_misses:
+        state = "zero_with_near_miss"
+    elif accepted_now == 0 and not near_misses and discovered == 0:
+        state = "over_filtered_or_no_signal"
+
+    return {
+        "state": state,
+        "accepted_now": accepted_now,
+        "discovered": discovered,
+        "summary_lines": lines,
+    }
+
+
+def build_unified_decision_tree(
+    features: Dict[str, Any],
+    acceptance: Dict[str, Any],
+    failure: Dict[str, Any],
+    market_tree: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    شجرة القرار الموحدة (من البداية إلى النهاية) وفق التسلسل:
+    regime -> inflection/trigger -> OI -> leader -> flow -> acceptance -> execution decision
+    """
+    roots = safe_dict_from_api(market_tree.get("roots"))
+    case_name = _safe_state_text(market_tree.get("final_case"), "NO_SIGNAL_EARLY_WEAK")
+    acceptance_state = _safe_state_text(acceptance.get("state"), "no")
+    continuation_state = _safe_state_text(failure.get("continuation_state"), "weak")
+    early_failure = bool(failure.get("early_failure", False))
+    price_late = bool(features.get("price_late", False))
+
+    pos_lead = safe_float((features.get("position_account_gap", {}) or {}).get("position_lead"), 0.0)
+    acc_lead = safe_float((features.get("position_account_gap", {}) or {}).get("account_lead"), 0.0)
+    flow_spike = bool(roots.get("flow_led", False))
+    consensus = bool(roots.get("consensus", False))
+
+    leader = "mixed"
+    if flow_spike:
+        leader = "flow"
+    elif pos_lead > acc_lead and pos_lead > 0:
+        leader = "position"
+    elif acc_lead > pos_lead and acc_lead > 0:
+        leader = "account"
+    elif consensus:
+        leader = "consensus"
+
+    oi_supportive = bool(roots.get("oi_supportive", False))
+    trigger_present = bool(features.get("breakout_touched") or features.get("close_above_breakout") or features.get("higher_low_bias") or flow_spike)
+
+    if case_name in {"UPPER_OVERCROWDED_LATE"} or price_late:
+        execution_decision = "Late"
+    elif early_failure or acceptance_state == "no" and continuation_state == "no" and case_name in {
+        "UPPER_OVERCROWDED_LATE",
+        "NO_SIGNAL_EARLY_WEAK",
+    }:
+        execution_decision = "Failed"
+    elif acceptance_state in {"yes", "partial"} and trigger_present and oi_supportive and not early_failure and not price_late:
+        execution_decision = "Actionable now" if acceptance_state == "yes" else "Discovered but not actionable"
+    else:
+        execution_decision = "Discovered but not actionable"
+
+    family_map = {
+        "POSITION_LED_SQUEEZE_BUILDUP": "POSITION_LED_SQUEEZE_BUILDUP",
+        "ACCOUNT_LED_ACCUMULATION": "ACCOUNT_LED_ACCUMULATION",
+        "CONSENSUS_BULLISH_EXPANSION": "CONSENSUS_BULLISH_EXPANSION",
+        "FLOW_LIQUIDITY_VACUUM_BREAKOUT": "FLOW_LIQUIDITY_VACUUM_BREAKOUT",
+        "NO_SIGNAL_EARLY_WEAK": None,
+        "UPPER_OVERCROWDED_LATE": None,
+    }
+
+    return {
+        "sequence": [
+            {"step": "regime", "value": _safe_state_text(roots.get("higher_tf_regime"), "MIXED")},
+            {"step": "inflection_trigger", "value": "yes" if trigger_present else "no"},
+            {"step": "oi_relation", "value": "supportive" if oi_supportive else "weak_or_flat"},
+            {"step": "leader", "value": leader},
+            {"step": "flow_type", "value": "spike_or_expansion" if flow_spike else "normal_or_weak"},
+            {"step": "price_acceptance", "value": acceptance_state},
+            {"step": "execution_decision", "value": execution_decision},
+        ],
+        "case_name": case_name,
+        "mapped_family": family_map.get(case_name),
+        "execution_decision": execution_decision,
+        "summary_ar": _safe_state_text(market_tree.get("summary_ar"), ""),
+    }
+
+
+def build_early_warning_layer(
+    features: Dict[str, Any],
+    market_tree: Dict[str, Any],
+    acceptance: Dict[str, Any],
+) -> Dict[str, Any]:
+    """طبقة إنذار مبكر مستقلة عن قرار التنفيذ المحافظ."""
+    roots = safe_dict_from_api(market_tree.get("roots"))
+    case_name = _safe_state_text(market_tree.get("final_case"), "NO_SIGNAL_EARLY_WEAK")
+    acceptance_state = _safe_state_text(acceptance.get("state"), "no")
+    trigger_count = safe_int(acceptance.get("trigger_count"), 0)
+
+    oi_delta_3 = safe_float(features.get("oi_delta_3"), 0.0)
+    buy_ratio = safe_float(features.get("recent_buy_ratio"), 0.0)
+    trade_exp = safe_float(features.get("trade_expansion_last"), 0.0)
+    flow_supported = buy_ratio >= EXECUTION_RULES["persistent_taker_buy_ratio"] and trade_exp >= EXECUTION_RULES["min_trade_activity_hold"]
+    price_started = bool(features.get("breakout_touched") or features.get("higher_low_bias") or safe_float(features.get("ret_3"), 0.0) > 0.15)
+    oi_supportive = bool(roots.get("oi_supportive", False) or oi_delta_3 >= EXECUTION_RULES["oi_buildup_pct"])
+
+    pre_rise_case = case_name in {
+        "POSITION_LED_SQUEEZE_BUILDUP",
+        "ACCOUNT_LED_ACCUMULATION",
+        "FLOW_LIQUIDITY_VACUUM_BREAKOUT",
+        "CONSENSUS_BULLISH_EXPANSION",
+    }
+    score = (
+        (35.0 if pre_rise_case else 0.0)
+        + (20.0 if oi_supportive else 0.0)
+        + (18.0 if price_started else 0.0)
+        + (12.0 if flow_supported else 0.0)
+        + min(trigger_count * 4.0, 12.0)
+        + (8.0 if acceptance_state in {"partial", "yes"} else 0.0)
+    )
+    score = round(clamp(score, 0.0, 100.0), 2)
+
+    if score >= 70:
+        state = "EARLY_WARNING_HIGH"
+    elif score >= 55:
+        state = "EARLY_WARNING_MEDIUM"
+    elif score >= 42:
+        state = "EARLY_WARNING_LOW"
+    else:
+        state = "NO_EARLY_WARNING"
+
+    return {
+        "state": state,
+        "score": score,
+        "case": case_name,
+        "price_started": price_started,
+        "oi_supportive": oi_supportive,
+        "flow_supported": flow_supported,
+        "trigger_count": trigger_count,
+    }
+
 
 def detect_relief_bounce_after_flush(features: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -5792,6 +6159,8 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
     oi_info = safe_dict_from_api(raw_materials.get("oi_info"))
     acceptance = safe_dict_from_api(raw_materials.get("acceptance"))
     failure = safe_dict_from_api(raw_materials.get("failure"))
+    market_tree = safe_dict_from_api(raw_materials.get("market_tree"))
+    unified_tree = safe_dict_from_api(raw_materials.get("unified_tree"))
     triplet = safe_dict_from_api(raw_materials.get("triplet"))
     result = {
         "symbol": symbol,
@@ -5870,6 +6239,8 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
         "state_transition": None,
         "state_transition_reason": "",
         "decision_trace": {},
+        "market_decision_tree": market_tree,
+        "unified_decision_tree": unified_tree,
         "raw_decision": {},
         "legacy_bucket": None,
         "pre_structural_verdict": {},
@@ -5879,6 +6250,8 @@ def build_result_from_raw_materials(raw_materials: Dict[str, Any]) -> Dict[str, 
             "oi_info": oi_info,
             "acceptance": acceptance,
             "failure": failure,
+            "market_tree": market_tree,
+            "unified_tree": unified_tree,
             "family_scores": family_info.get("family_scores", {}),
             "family_reasons": family_info.get("family_reasons", {}),
             "family_diagnostics": family_info.get("diagnostics", []),
@@ -5950,6 +6323,9 @@ def analyze_symbol_structural(
         }
         acceptance = detect_acceptance_state(features)
         failure = detect_failure_continuation(features, acceptance, oi_info)
+        market_tree = evaluate_pre_rise_market_decision_tree(features, family_info, stage_info, oi_info)
+        unified_tree = build_unified_decision_tree(features, acceptance, failure, market_tree)
+        early_warning = build_early_warning_layer(features, market_tree, acceptance)
         triplet = derive_regime_trigger_execution_patterns(
             features=features,
             acceptance=acceptance,
@@ -5968,6 +6344,9 @@ def analyze_symbol_structural(
             "oi_info": oi_info,
             "acceptance": acceptance,
             "failure": failure,
+            "market_tree": market_tree,
+            "unified_tree": unified_tree,
+            "early_warning": early_warning,
             "triplet": triplet,
         }
 
@@ -6011,6 +6390,20 @@ def analyze_symbol_structural(
             },
             leader_info,
         )
+        market_tree_case = _safe_state_text(market_tree.get("final_case"), "")
+        tree_to_hypothesis = {
+            "POSITION_LED_SQUEEZE_BUILDUP": "position_led_buildup",
+            "ACCOUNT_LED_ACCUMULATION": "account_led_accumulation",
+            "CONSENSUS_BULLISH_EXPANSION": "consensus_bullish_expansion",
+            "UPPER_OVERCROWDED_LATE": "late_blowoff",
+        }
+        mapped_hyp = tree_to_hypothesis.get(market_tree_case)
+        if mapped_hyp and mapped_hyp in hypothesis_scores:
+            hypothesis_scores[mapped_hyp] = safe_float(hypothesis_scores.get(mapped_hyp), 0.0) + 0.10
+        if market_tree_case == "FLOW_LIQUIDITY_VACUUM_BREAKOUT":
+            for key in ("lower_extreme_short_squeeze_up", "upper_extreme_bullish_expansion"):
+                if key in hypothesis_scores:
+                    hypothesis_scores[key] = safe_float(hypothesis_scores.get(key), 0.0) + 0.06
         ranked_hypothesis = rank_hypotheses(hypothesis_scores)
         selected_hypothesis = select_primary_hypothesis(ranked_hypothesis)
         result["hypothesis_scores"] = hypothesis_scores
@@ -6021,20 +6414,33 @@ def analyze_symbol_structural(
             "regime_pattern": result.get("regime_pattern"),
             "trigger_pattern": result.get("trigger_pattern"),
         }
+        result["market_decision_tree"] = market_tree
+        result["unified_decision_tree"] = unified_tree
+        result["early_warning"] = early_warning
+        unified_decision = _safe_state_text(unified_tree.get("execution_decision"), "Discovered but not actionable")
+        unified_family = unified_tree.get("mapped_family")
+        if unified_family:
+            result["family"] = unified_family
+        if unified_decision == "Actionable now":
+            result["final_bucket"] = "Actionable now"
+            result["actionable_now"] = True
+        elif unified_decision == "Late":
+            result["final_bucket"] = "Late"
+            result["actionable_now"] = False
+        elif unified_decision == "Failed":
+            result["final_bucket"] = "Failed"
+            result["actionable_now"] = False
+        else:
+            result["final_bucket"] = "Discovered but not actionable"
+            result["actionable_now"] = False
+        result["decision_reason"] = _safe_state_text(unified_tree.get("summary_ar"), result.get("decision_reason", ""))
+        result["early_warning_state"] = _safe_state_text(early_warning.get("state"), "NO_EARLY_WARNING")
+        result["early_warning_score"] = safe_float(early_warning.get("score"), 0.0)
 
-        # المرحلة 5) build_hypotheses
-        result = apply_v2_decision_gate(result, features)
+        # المرحلة 5) post-analysis enrichment (بدون تغيير قرار الشجرة الموحدة النهائي)
         result = apply_behavior_profile_influence(result)
         result = attach_structural_casefile(result)
         result["cvd_explanatory_context"] = build_cvd_explanatory_context(result)
-        pre_center_check = verify_pre_center_protected_fields(pre_center_baseline, build_pre_structural_verdict(result))
-        result["pre_center_integrity"] = pre_center_check
-        if not pre_center_check.get("passed", False):
-            result.setdefault("diagnostics", [])
-            result["diagnostics"].append(f"PRE_CENTER_INTEGRITY_FAIL: {pre_center_check.get('summary_ar', '')}")
-
-        # المرحلة 6) build_execution_verdict (المركز الوحيد للحكم النهائي)
-        result = apply_structural_center(result)
         result = enrich_result_v2_fields(result)
         result["entry_window_state"] = derive_entry_window_state(result)
         result["importance_score"] = compute_importance_score(result)
@@ -6061,7 +6467,7 @@ def analyze_symbol_structural(
         result["missing_signatures"] = rise_analysis.get("missing_signatures", [])
         result["projection_ar"] = rise_analysis.get("projection_ar", "محايد")
         result["timeframe_rise_signatures"] = detect_timeframe_rise_signatures(result.get("market_features") or {})
-        result = apply_uncertainty_abstain_policy(result)
+        # intentionally disabled: uncertainty abstain can suppress early pre-rise detection
 
         # المرحلة 7) render_output
         result.update(build_arabic_output_fields(result))
@@ -6168,8 +6574,11 @@ def prepare_candidates(
         filtered.append((symbol, symbol_meta, ticker_24h, mark_info, score_hint))
 
     filtered.sort(key=lambda item: item[4], reverse=True)
-
-    final_candidates = filtered
+    top_n = safe_int(DYNAMIC_SETTINGS.get("CANDIDATE_TOP_N", 200), 200)
+    if top_n > 0:
+        final_candidates = filtered[:top_n]
+    else:
+        final_candidates = filtered
 
     return [(s, sm, t, m) for s, sm, t, m, _ in final_candidates], {
         "universe_size": len(symbol_universe),
@@ -6180,6 +6589,7 @@ def prepare_candidates(
         "quick_filter_passed": len(filtered),  # backward-compat naming
         "prefilter_passed": len(filtered),
         "deep_candidates": len(final_candidates),
+        "candidate_top_n": top_n,
         "skipped_counter": dict(skipped_counter),
     }
 
@@ -6219,15 +6629,16 @@ def scan_once(client: BinanceFuturesPublicClient) -> Dict[str, Any]:
                 "top_cases": [],
             }
         )
-        row = apply_market_context_influence(row)
-        row = apply_structural_center(row)
         row.update(build_arabic_output_fields(row))
         enhanced_results.append(row)
         update_global_case_library(row)
 
     enhanced_results.sort(
         key=lambda r: (
-            STRUCTURAL_EXECUTION_ORDER.get(_safe_state_text(r.get("structural_execution_state"), "failed"), 99),
+            {"Actionable now": 0, "Discovered but not actionable": 1, "Late": 2, "Failed": 3}.get(
+                _safe_state_text(r.get("execution_decision"), _safe_state_text(r.get("final_bucket"), "Failed")),
+                9,
+            ),
             -safe_float(r.get("importance_score"), 0.0),
             -safe_float((r.get("market_features") or {}).get("vol_expansion_last"), 0.0),
             -safe_float((r.get("market_features") or {}).get("trade_expansion_last"), 0.0),
@@ -6236,12 +6647,10 @@ def scan_once(client: BinanceFuturesPublicClient) -> Dict[str, Any]:
 
     summary = defaultdict(int)
     for row in enhanced_results:
-        summary[f"structural::{row.get('structural_execution_state', 'unknown')}"] += 1
-        if OUTPUT_SETTINGS.get("SHOW_LEGACY_SUMMARY", False):
-            summary[row.get("final_bucket", "Failed")] += 1
-            summary[f"stage::{row.get('stage', 'WATCH')}"] += 1
-            if row.get("family"):
-                summary[f"family::{row['family']}"] += 1
+        decision = _safe_state_text(row.get("execution_decision"), _safe_state_text(row.get("final_bucket"), "Failed"))
+        summary[f"decision::{decision}"] += 1
+        ew_state = _safe_state_text(safe_dict_from_api(row.get("early_warning")).get("state"), "NO_EARLY_WARNING")
+        summary[f"early::{ew_state}"] += 1
 
     printed_results = filter_and_sort_results_for_output(enhanced_results)
 
@@ -6387,6 +6796,15 @@ ARABIC_ENTRY_WINDOW_LABELS: Dict[str, str] = {
     "await_trigger": "ترقّب الزناد",
     "setup_building": "تهيئة مبكرة قيد البناء",
     "avoid_or_wait": "تجنب/انتظار",
+}
+
+ARABIC_MARKET_TREE_CASES: Dict[str, str] = {
+    "POSITION_LED_SQUEEZE_BUILDUP": "الحالة A — بناء ضغط صاعد تقوده المراكز",
+    "ACCOUNT_LED_ACCUMULATION": "الحالة B — تراكم صاعد تقوده الحسابات",
+    "CONSENSUS_BULLISH_EXPANSION": "الحالة C — توسع صاعد توافقي",
+    "FLOW_LIQUIDITY_VACUUM_BREAKOUT": "الحالة D — اختراق تدفقي مع فراغ سيولة",
+    "NO_SIGNAL_EARLY_WEAK": "الحالة E — لا إشارة/مبكر/ضعيف",
+    "UPPER_OVERCROWDED_LATE": "الحالة F — ازدحام علوي/تأخر",
 }
 
 
@@ -7681,6 +8099,8 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     entry_window_state = _safe_state_text(result.get("entry_window_state"), "avoid_or_wait")
     early_rise = safe_dict_from_api(result.get("early_rise_index"))
     adaptive_model = safe_dict_from_api(result.get("adaptive_signal_model"))
+    market_tree = safe_dict_from_api(result.get("market_decision_tree"))
+    market_tree_case = _safe_state_text(market_tree.get("final_case"), "NO_SIGNAL_EARLY_WEAK")
     return {
         "family_ar": translate_label(result.get("family"), ARABIC_FAMILY_LABELS, "غير محسومة"),
         "stage_ar": translate_label(result.get("stage"), ARABIC_STAGE_LABELS, "غير معروفة"),
@@ -7724,6 +8144,10 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         "market_regime_v2_ar": translate_label(market_regime_v2_state, ARABIC_MARKET_REGIME_V2_LABELS, "مرحلة انتقالية"),
         "actor_intent_ar": translate_label(actor_intent_state, ARABIC_ACTOR_INTENT_LABELS, "نية غير محسومة"),
         "entry_window_state_ar": translate_label(entry_window_state, ARABIC_ENTRY_WINDOW_LABELS, "تجنب/انتظار"),
+        "market_tree_case": market_tree_case,
+        "market_tree_case_ar": translate_label(market_tree_case, ARABIC_MARKET_TREE_CASES, "شجرة السوق غير محسومة"),
+        "market_tree_summary_ar": _safe_state_text(market_tree.get("summary_ar"), "لم تُحتسب شجرة قرار السوق في هذه الدورة."),
+        "market_tree_supports_ar": safe_list_from_api(market_tree.get("supporting_contexts")),
         "early_rise_score": safe_float(early_rise.get("score"), 0.0),
         "early_rise_state_ar": translate_label(_safe_state_text(early_rise.get("state"), "no_edge"), {
             "actionable_setup": "جاهزية تنفيذية مرتفعة",
@@ -7749,76 +8173,47 @@ def build_arabic_output_fields(result: Dict[str, Any]) -> Dict[str, Any]:
 
 def print_symbol_result(result: Dict[str, Any]) -> None:
     view = build_arabic_output_fields(result)
-    execution_verdict = safe_dict_from_api(result.get("execution_verdict"))
-    structural_state = _safe_state_text(result.get("structural_execution_state"), execution_verdict.get("execution_state", "unknown"))
-    structural_state_ar = view.get("structural_execution_state_ar", "غير محسوم")
-    actionable_now = structural_state == "actionable_now"
+    unified_tree = safe_dict_from_api(result.get("unified_decision_tree"))
+    early_warning = safe_dict_from_api(result.get("early_warning"))
+    decision = _safe_state_text(unified_tree.get("execution_decision"), result.get("final_bucket", "Discovered but not actionable"))
     symbol_text = _safe_state_text(result.get("symbol"), "UNKNOWN")
-    symbol_text = colorize_text(symbol_text, "green") if actionable_now else symbol_text
-    state_text = colorize_text(structural_state_ar, "green") if actionable_now else structural_state_ar
-
-    alternatives = view.get("alternative_hypotheses_ar") or []
-    closest_case = result.get("closest_case_match") or "لا توجد حالة قريبة محفوظة بعد"
-    closest_score = format_num(result.get("closest_case_score"), 2)
-    decision_trace = safe_dict_from_api(result.get("decision_trace"))
-
+    if decision == "Actionable now":
+        symbol_text = colorize_text(symbol_text, "green")
     print(STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
-    print("الملخص")
+    print("شجرة القرار الموحدة")
+    print(f"- التصنيف النهائي: {view.get('market_tree_case_ar', 'غير محسوم')}")
+    print(f"- القرار التنفيذي: {decision}")
+    print(f"- الإنذار المبكر: {_safe_state_text(early_warning.get('state'), 'NO_EARLY_WARNING')} | score={format_num(early_warning.get('score'), 1)}")
     print(f"- الرمز: {symbol_text}")
-    print(f"- الأهمية: {format_num(result.get('importance_score'), 2)}")
-    print(f"- السلة النهائية: {view.get('final_bucket_ar', result.get('final_bucket', 'غير معروف'))}")
-    print(f"- القرار التنفيذي: {state_text}")
+    print(f"- خلاصة السوق: {view.get('market_tree_summary_ar', 'غير متاح')}")
+    supports = safe_list_from_api(view.get("market_tree_supports_ar"))
+    print(f"- السياقات الداعمة: {', '.join(supports) if supports else 'لا يوجد سياق داعم مميز'}")
+    sequence = safe_list_from_api(unified_tree.get("sequence"))
+    if sequence:
+        print("- التسلسل الإجباري:")
+        for item in sequence:
+            d = safe_dict_from_api(item)
+            print(f"  • {d.get('step', '?')}: {d.get('value', '?')}")
 
-    features = safe_dict_from_api(result.get("market_features"))
-    multi_tf = safe_dict_from_api(features.get("multi_tf"))
-    tf_4h = safe_dict_from_api(multi_tf.get("4h"))
-    tf_1h = safe_dict_from_api(multi_tf.get("1h"))
-    acceptance_reason = _safe_state_text(result.get("acceptance_reason"), "غير متاح")
-    continuation_reason = _safe_state_text(result.get("continuation_reason"), "غير متاح")
-    not_actionable_reason = _safe_state_text(result.get("not_actionable_reason"), "")
 
-    print("\nتقرير المحلل")
-    print("1) الخلفية")
-    print(f"- regime: {view.get('regime_pattern_ar', 'غير معروف')} | market v2: {view.get('market_regime_v2_ar', 'مرحلة انتقالية')}")
-    print(f"- higher TF (4h/1h): 4h ret3={format_num(tf_4h.get('ret_3'), 3)} , 1h ret3={format_num(tf_1h.get('ret_3'), 3)}")
-    print(f"- lower TF trigger (15m/5m): {view.get('trigger_pattern_ar', 'غير معروف')} | acceptance={acceptance_reason}")
+def build_near_miss_rows(results: List[Dict[str, Any]], limit: int = 10) -> List[Dict[str, Any]]:
+    if not results:
+        return []
+    ranked: List[Dict[str, Any]] = []
+    for row in results:
+        state = _safe_state_text(row.get("execution_decision"), _safe_state_text(row.get("final_bucket"), "Failed"))
+        if state == "Actionable now":
+            continue
+        ranked.append(row)
+    ranked.sort(
+        key=lambda r: (
+            -safe_float(r.get("importance_score"), 0.0),
+            -safe_float(safe_dict_from_api(r.get("structural_thesis")).get("top_score"), 0.0),
+            r.get("symbol", ""),
+        )
+    )
+    return ranked[:max(1, limit)]
 
-    print("2) القيادة")
-    print(f"- القيادة: {view.get('leader_type_ar', 'غير معروف')} | نية المشاركين: {view.get('actor_intent_ar', 'نية غير محسومة')}")
-    print(f"- نوع الانكشاف (OI role): {decision_trace.get('oi_relation', view.get('oi_state_ar', 'غير معروف'))}")
-    print(f"- flow quality: {decision_trace.get('flow', _safe_state_text(result.get('flow_quality'), 'غير محسوم'))}")
-
-    print("3) حكم السعر")
-    print(f"- breakout/acceptance/failure: {view.get('trigger_pattern_ar', 'غير معروف')} / {acceptance_reason} / {continuation_reason}")
-    print(f"- الفرضية الرئيسية: {view.get('primary_hypothesis_ar', 'غير محسومة')}")
-    print(f"- البديل الأقرب: {', '.join(alternatives) if alternatives else 'لا توجد بدائل قريبة'}")
-    print(f"- سبب الإبطال: {view.get('invalidation_reason_ar', 'لا يوجد إبطال محدد بعد')}")
-
-    print("4) قرار التنفيذ")
-    print(f"- قرار التنفيذ: {state_text}")
-    print(f"- سبب عدم التنفيذ: {not_actionable_reason if not_actionable_reason else 'لا يوجد (أو الحالة قابلة للتنفيذ)'}")
-    print(f"- نمط الفشل التالي: {view.get('next_failure_mode_ar', 'غير محدد بعد')}")
-
-    print("5) سياق داعم")
-    print(f"- السلسلة السببية: {view.get('causal_chain_ar', 'لا توجد سلسلة سببية جاهزة بعد')}")
-    print(f"- دور CVD: {view.get('cvd_explanatory_ar', 'CVD تفسيري ومحايد في الحالة الحالية.')}")
-    print(f"- مؤشر بداية الارتفاع المبكر: {format_num(view.get('early_rise_score'), 2)} ({view.get('early_rise_state_ar', 'لا أفضلية واضحة')})")
-    print(f"- النموذج التكيفي (تعلم محلي): prob={format_num(view.get('adaptive_model_prob'), 3)} | score={format_num(view.get('adaptive_model_score'), 3)} | seen={safe_int(view.get('adaptive_model_seen'), 0)}")
-    print(f"- أسباب الارتفاع المكتشفة: {', '.join(view.get('rise_reasons_ar', [])) if view.get('rise_reasons_ar') else 'لا توجد بصمة صعود مكتملة'}")
-    print(f"- البصمات الموجودة في الكود: {', '.join(view.get('known_signatures', [])) if view.get('known_signatures') else 'لا يوجد'}")
-    print(f"- البصمات المطلوب إضافتها: {', '.join(view.get('missing_signatures', [])) if view.get('missing_signatures') else 'لا يوجد'}")
-    print(f"- التوقع الاتجاهي: {view.get('projection_ar', 'محايد')}")
-    tf_signatures = safe_list_from_api(view.get("timeframe_rise_signatures"))
-    if tf_signatures:
-        print("- بصمات الارتفاع حسب الفريم (أخضر):")
-        for sig in tf_signatures:
-            sig_d = safe_dict_from_api(sig)
-            msg = f"  • {sig_d.get('timeframe', '?')} => {sig_d.get('reason_ar', 'بصمة صعود')}"
-            print(colorize_text(msg, "green"))
-    else:
-        print("- بصمات الارتفاع حسب الفريم: لا يوجد تطابق صاعد واضح حاليًا.")
-    print(f"- أقرب حالة: {closest_case} (الدرجة={closest_score})")
-    print(f"- الانتقال من الحالة السابقة: {_safe_state_text(result.get('state_transition_reason'), view.get('state_transition_ar', 'غير متاح'))}")
 
 def print_cycle_report(report: Dict[str, Any]) -> None:
     print("\n" + STATIC_SETTINGS["PRINT_HORIZONTAL_LINE"])
@@ -7835,19 +8230,19 @@ def print_cycle_report(report: Dict[str, Any]) -> None:
     print(f"- الفلتر الجديد (مسبق): {'مفعّل' if prep.get('prefilter_enabled', True) else 'معطّل'}")
     print(f"- مجتازة للفلتر/الكون: {prep.get('prefilter_passed', prep.get('quick_filter_passed', 0))}")
     print(f"- رموز التحليل العميق الفعلية: {prep['deep_candidates']}")
+    print(f"- حد المرشحين الأعلى المطبق: {prep.get('candidate_top_n', 'غير محدد')}")
 
     print("\nالملخص البنيوي للدورة:")
     summary = report["summary"]
     printed_results = report.get("printed_results", [])
     magma_only = OUTPUT_SETTINGS.get("PRINT_MAGMA_PATTERN_ONLY", False)
-    print(f"- actionable_now: {summary.get('structural::actionable_now', 0)}")
-    print(f"- watch_for_acceptance: {summary.get('structural::watch_for_acceptance', 0)}")
-    print(f"- watch_for_rebuild: {summary.get('structural::watch_for_rebuild', 0)}")
-    print(f"- discovered_not_actionable: {summary.get('structural::discovered_not_actionable', 0)}")
-    print(f"- no_trade_flow_trap: {summary.get('structural::no_trade_flow_trap', 0)}")
-    print(f"- no_trade_structural_conflict: {summary.get('structural::no_trade_structural_conflict', 0)}")
-    print(f"- late: {summary.get('structural::late', 0)}")
-    print(f"- failed: {summary.get('structural::failed', 0)}")
+    print(f"- Actionable now: {summary.get('decision::Actionable now', 0)}")
+    print(f"- Discovered but not actionable: {summary.get('decision::Discovered but not actionable', 0)}")
+    print(f"- Late: {summary.get('decision::Late', 0)}")
+    print(f"- Failed: {summary.get('decision::Failed', 0)}")
+    print(f"- Early warning high: {summary.get('early::EARLY_WARNING_HIGH', 0)}")
+    print(f"- Early warning medium: {summary.get('early::EARLY_WARNING_MEDIUM', 0)}")
+    print(f"- Early warning low: {summary.get('early::EARLY_WARNING_LOW', 0)}")
 
     if OUTPUT_SETTINGS.get("SHOW_LEGACY_SUMMARY", False):
         print("\nملخص التصنيف القديم (للمقارنة فقط):")
@@ -7871,8 +8266,27 @@ def print_cycle_report(report: Dict[str, Any]) -> None:
         title = "\nالتقارير البنيوية المهمة المطبوعة:"
     print(title)
 
+    near_n = safe_int(DYNAMIC_SETTINGS.get("NEAR_MISS_TOP_N", 10), 10)
+    near_misses = build_near_miss_rows(report.get("results", []), near_n)
+
     if not printed_results:
         print("- لا توجد نتائج مطابقة للفلتر الحالي في هذه الدورة")
+        if near_misses:
+            print(f"- أقرب الحالات (Near Misses) أعلى {len(near_misses)}:")
+            for row in near_misses:
+                symbol = _safe_state_text(row.get("symbol"), "UNKNOWN")
+                imp = format_num(row.get("importance_score"), 2)
+                exec_state = _safe_state_text(row.get("execution_decision"), _safe_state_text(row.get("final_bucket"), "Failed"))
+                acceptance = safe_dict_from_api(row.get("acceptance"))
+                trigger_count = safe_int(acceptance.get("trigger_count"), 0)
+                hard_rejects = safe_list_from_api(acceptance.get("hard_reject_reasons"))
+                reject_text = ", ".join(hard_rejects[:2]) if hard_rejects else "لا يوجد hard reject صريح"
+                print(f"  • {symbol} | importance={imp} | state={exec_state} | triggers={trigger_count} | hard_reject={reject_text}")
+    scanner_tree = build_scanner_acceptance_tree_report(report, near_misses)
+    print("\nشجرة قرار القبول البرمجي:")
+    print(f"- الحالة العامة: {scanner_tree.get('state', 'unknown')}")
+    for line in safe_list_from_api(scanner_tree.get("summary_lines")):
+        print(f"- {line}")
     for row in printed_results:
         print_symbol_result(row)
 
