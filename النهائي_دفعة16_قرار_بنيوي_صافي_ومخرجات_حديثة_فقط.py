@@ -46,6 +46,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ============================================================
+# 0) Analysis Mode (Research Framework)
+# ============================================================
+ANALYSIS_MODE = "multi"  # "single" or "multi"
+PRIMARY_TIMEFRAME = "5m"  # used only when ANALYSIS_MODE == "single"
+MULTI_TF_PREPARATION = "1h"
+MULTI_TF_IGNITION = "15m"
+MULTI_TF_ACCEPTANCE = "5m"
+
 
 # ============================================================
 # 1) الإعدادات الثابتة
@@ -5715,6 +5724,173 @@ def persist_memory(symbol: str, result: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 
+def _resolve_tf_snapshot(features: Dict[str, Any], timeframe: str) -> Dict[str, Any]:
+    return safe_dict_from_api(safe_dict_from_api(features.get("multi_tf")).get(timeframe))
+
+
+def detect_preparation_structure(features: Dict[str, Any], timeframe: str) -> Dict[str, Any]:
+    tf = _resolve_tf_snapshot(features, timeframe)
+    oi_expanding = safe_float(tf.get("oi_delta_3"), 0.0) > 0
+    pos_lead = safe_float(features.get("position_lead_strength"), 0.0)
+    acc_lead = safe_float(features.get("account_lead_strength"), 0.0)
+    leadership_type = "Contradictory Structure"
+    if pos_lead >= 0.02 and acc_lead < 0.02:
+        leadership_type = "Position-Led Build-Up"
+    elif acc_lead >= 0.03 and pos_lead < 0.02:
+        leadership_type = "Account-Led Expansion"
+    elif pos_lead >= 0.02 and acc_lead >= 0.02:
+        leadership_type = "Consensus Expansion"
+    structure_phase = "structure_invalid"
+    if tf.get("accumulation", False) or oi_expanding:
+        structure_phase = "preparation"
+    if tf.get("ignition", False):
+        structure_phase = "ignition"
+    return {
+        "structure_phase": structure_phase,
+        "leadership_type": leadership_type,
+        "oi_state": "exposure_expanding" if oi_expanding else "flat_or_contracting",
+    }
+
+
+def detect_acceptance(features: Dict[str, Any], timeframe: str) -> Dict[str, Any]:
+    tf = _resolve_tf_snapshot(features, timeframe)
+    close_above = bool(tf.get("close_above_breakout", features.get("close_above_breakout", False)))
+    hold = bool(tf.get("hold_above_breakout", features.get("hold_above_breakout", False)))
+    continuation = bool(features.get("follow_through_bias", False))
+    if close_above and hold and continuation:
+        state = "accepted_breakout"
+    elif close_above and not hold:
+        state = "impulse_only_no_acceptance"
+    elif close_above and hold:
+        state = "hold_without_continuation"
+    else:
+        state = "no_acceptance"
+    return {
+        "breakout_acceptance_state": state,
+        "close_above": close_above,
+        "hold": hold,
+        "continuation": continuation,
+    }
+
+
+def detect_squeeze_phase(features: Dict[str, Any], acceptance: Dict[str, Any]) -> Dict[str, Any]:
+    funding = safe_float(features.get("funding_current"), 0.0)
+    short_crowding = bool(features.get("short_crowding", False))
+    ignition_flow = safe_float(features.get("recent_buy_ratio"), 0.0) >= EXECUTION_RULES["strong_taker_buy_ratio"]
+    sustained_flow = (
+        safe_float(features.get("trade_expansion_3"), 0.0) >= EXECUTION_RULES["min_trade_expansion"]
+        and safe_float(features.get("vol_expansion_3"), 0.0) >= EXECUTION_RULES["min_volume_expansion"]
+    )
+    pre_vulnerability = short_crowding or funding <= EXECUTION_RULES["funding_squeeze_negative_pct"]
+    if pre_vulnerability and ignition_flow and sustained_flow and acceptance.get("breakout_acceptance_state") == "accepted_breakout":
+        squeeze_state = "post_squeeze_expansion"
+    elif pre_vulnerability and ignition_flow and not sustained_flow:
+        squeeze_state = "squeeze_ignition_without_follow_through"
+    elif pre_vulnerability:
+        squeeze_state = "pre_squeeze_vulnerability"
+    else:
+        squeeze_state = "no_squeeze_structure"
+    return {"squeeze_state": squeeze_state, "ignition_flow": ignition_flow, "sustained_flow": sustained_flow}
+
+
+def classify_structure(prep: Dict[str, Any], acceptance: Dict[str, Any], squeeze: Dict[str, Any], features: Dict[str, Any]) -> Tuple[str, str, float]:
+    sustained_flow = squeeze.get("sustained_flow", False)
+    ignition_flow = squeeze.get("ignition_flow", False)
+    if acceptance["breakout_acceptance_state"] == "accepted_breakout":
+        if squeeze["squeeze_state"] == "post_squeeze_expansion":
+            return "Real Short Squeeze", "sustained_flow", 0.84
+        return "Accepted Breakout", "sustained_flow" if sustained_flow else "structure", 0.78
+    if ignition_flow and not sustained_flow:
+        return "Flow Spike Failure", "flow_spike", 0.70
+    if prep["leadership_type"] == "Position-Led Build-Up" and prep["structure_phase"] in {"preparation", "ignition"}:
+        return "Position-Led Expansion", "leadership", 0.73
+    if prep["leadership_type"] == "Account-Led Expansion" and prep["structure_phase"] in {"preparation", "ignition"}:
+        return "Account-Led Expansion", "breadth", 0.66
+    if safe_float(features.get("ret_3"), 0.0) > 0 and prep["oi_state"] == "flat_or_contracting":
+        return "Short Covering Only", "oi_non_expansion", 0.63
+    return "Fake Breakout", "acceptance_failure", 0.58
+
+
+def analyze_symbol_structural_classifier(
+    client: BinanceFuturesPublicClient,
+    symbol: str,
+    symbol_meta: Dict[str, Any],
+    ticker_24h: Dict[str, Any],
+    mark_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        features = build_reference_market_features(client, symbol, symbol_meta, ticker_24h, mark_info)
+        if not features.get("ok"):
+            return {
+                "symbol": symbol,
+                "timeframe_mode": ANALYSIS_MODE,
+                "structure_phase": "error",
+                "leadership_type": "Unknown",
+                "oi_state": "unknown",
+                "flow_state": "unknown",
+                "breakout_acceptance_state": "unknown",
+                "squeeze_state": "unknown",
+                "final_structural_classification": "Fake Breakout",
+                "confidence_score": 0.0,
+                "error": features.get("error", "feature_build_failed"),
+            }
+
+        if ANALYSIS_MODE == "single":
+            prep_tf, ign_tf, acc_tf = PRIMARY_TIMEFRAME, PRIMARY_TIMEFRAME, PRIMARY_TIMEFRAME
+        else:
+            prep_tf, ign_tf, acc_tf = MULTI_TF_PREPARATION, MULTI_TF_IGNITION, MULTI_TF_ACCEPTANCE
+
+        prep = detect_preparation_structure(features, prep_tf)
+        ign = _resolve_tf_snapshot(features, ign_tf)
+        acceptance = detect_acceptance(features, acc_tf)
+        squeeze = detect_squeeze_phase(features, acceptance)
+
+        flow_state = "neutral_flow"
+        if squeeze.get("ignition_flow") and squeeze.get("sustained_flow"):
+            flow_state = "sustained_flow"
+        elif squeeze.get("ignition_flow"):
+            flow_state = "ignition_without_follow_through"
+        elif safe_float(ign.get("ret_3"), 0.0) > 0 and prep["structure_phase"] == "structure_invalid":
+            flow_state = "flow_strong_but_structurally_weak_move"
+
+        final_classification, confidence_driver, confidence = classify_structure(prep, acceptance, squeeze, features)
+        if final_classification == "Position-Led Expansion" and prep["structure_phase"] == "preparation":
+            final_classification = "Genuine Early Bullish Structure"
+
+        return {
+            "symbol": symbol,
+            "timeframe_mode": ANALYSIS_MODE,
+            "structure_phase": prep["structure_phase"],
+            "leadership_type": prep["leadership_type"],
+            "oi_state": prep["oi_state"],
+            "flow_state": flow_state,
+            "breakout_acceptance_state": acceptance["breakout_acceptance_state"],
+            "squeeze_state": squeeze["squeeze_state"],
+            "final_structural_classification": final_classification,
+            "confidence_score": round(confidence, 2),
+            "confidence_driver": confidence_driver,
+            "funding_context": features.get("funding_context", "unknown"),
+            "risk_flags": features.get("funding_notes", []),
+        }
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "timeframe_mode": ANALYSIS_MODE,
+            "structure_phase": "error",
+            "leadership_type": "Unknown",
+            "oi_state": "unknown",
+            "flow_state": "unknown",
+            "breakout_acceptance_state": "unknown",
+            "squeeze_state": "unknown",
+            "final_structural_classification": "Fake Breakout",
+            "confidence_score": 0.0,
+            "error": str(exc),
+        }
+
+
+analyze_symbol = analyze_symbol_structural_classifier
+
+
 def prepare_candidates(
     client: BinanceFuturesPublicClient,
 ) -> Tuple[List[Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]], Dict[str, Any]]:
@@ -5726,58 +5902,30 @@ def prepare_candidates(
     ticker_map = {row.get("symbol"): row for row in all_tickers if isinstance(row, dict) and row.get("symbol")}
     mark_map = {row.get("symbol"): row for row in all_mark if isinstance(row, dict) and row.get("symbol")}
 
-    filtered: List[Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, Any], float]] = []
+    candidates: List[Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = []
     skipped_counter = defaultdict(int)
-    full_scan_mode = bool(DYNAMIC_SETTINGS.get("FULL_UNIVERSE_SCAN_ENABLED", False))
-    prefilter_enabled = bool(DYNAMIC_SETTINGS.get("ENABLE_PRE_FILTER", True))
-
     for symbol, symbol_meta in symbol_universe.items():
         ticker_24h = ticker_map.get(symbol)
         mark_info = mark_map.get(symbol)
         if not ticker_24h or not mark_info:
             skipped_counter["missing_market_snapshot"] += 1
             continue
+        passed, reasons = universe_filter_for_full_scan(symbol, symbol_meta, mark_info)
+        if not passed:
+            skipped_counter[reasons[0] if reasons else "universe_filter_reject"] += 1
+            continue
+        candidates.append((symbol, symbol_meta, ticker_24h, mark_info))
 
-        if full_scan_mode or not prefilter_enabled:
-            passed, reasons = universe_filter_for_full_scan(symbol, symbol_meta, mark_info)
-            if not passed:
-                skipped_counter[reasons[0] if reasons else "universe_filter_reject"] += 1
-                continue
-        else:
-            passed, reasons = early_rise_prefilter(symbol, symbol_meta, ticker_24h, mark_info)
-            if not passed:
-                skipped_counter[reasons[0] if reasons else "prefilter_reject"] += 1
-                continue
-
-        # ترتيب المرشحين: سيولة + مدى + تغير، بدون إقصاء قاسٍ لحالات التحول المبكر
-        score_hint = (
-            (0.60 * safe_float(ticker_24h.get("quoteVolume")))
-            + (0.25 * safe_float(ticker_24h.get("count")))
-            + (0.15 * abs(safe_float(ticker_24h.get("priceChangePercent"))))
-        )
-        filtered.append((symbol, symbol_meta, ticker_24h, mark_info, score_hint))
-
-    filtered.sort(key=lambda item: item[4], reverse=True)
-
-    if full_scan_mode or not prefilter_enabled:
-        final_candidates = filtered
-    else:
-        if bool(DYNAMIC_SETTINGS.get("APPLY_CANDIDATE_CAP_AFTER_FILTER", True)):
-            filtered = filtered[: DYNAMIC_SETTINGS["TOP_N_BY_24H_VOLUME"]]
-            # نقتطع عددًا أصغر للتحليل العميق حتى لا نرهق البيئة المحدودة
-            final_candidates = filtered[: DYNAMIC_SETTINGS["MAX_CANDIDATES_AFTER_FILTER"]]
-        else:
-            final_candidates = filtered
-
-    return [(s, sm, t, m) for s, sm, t, m, _ in final_candidates], {
+    candidates.sort(key=lambda item: item[0])
+    return candidates, {
         "universe_size": len(symbol_universe),
         "snapshot_tickers": len(ticker_map),
         "snapshot_mark": len(mark_map),
-        "full_scan_mode": full_scan_mode,
-        "prefilter_enabled": prefilter_enabled,
-        "quick_filter_passed": len(filtered),  # backward-compat naming
-        "prefilter_passed": len(filtered),
-        "deep_candidates": len(final_candidates),
+        "full_scan_mode": True,
+        "prefilter_enabled": False,
+        "quick_filter_passed": len(candidates),
+        "prefilter_passed": len(candidates),
+        "deep_candidates": len(candidates),
         "skipped_counter": dict(skipped_counter),
     }
 
@@ -5801,56 +5949,28 @@ def scan_once(client: BinanceFuturesPublicClient) -> Dict[str, Any]:
         for symbol, symbol_meta, ticker_24h, mark_info in candidates:
             results.append(analyze_symbol(client, symbol, symbol_meta, ticker_24h, mark_info))
 
-    market_context = build_market_regime_context(client)
-
-    enhanced_results: List[Dict[str, Any]] = []
-    for row in results:
-        row = dict(row)
-        row["importance_score"] = compute_importance_score(row)
-        row["market_context"] = market_context
-        features = safe_dict_from_api(row.get("market_features"))
-        row["cross_asset_similarity_context"] = (
-            build_cross_asset_similarity_context(features, row)
-            if features else {
-                "available": False,
-                "summary_ar": "لا يمكن بناء تشابه عرضي لأن features غير متاحة.",
-                "top_cases": [],
-            }
-        )
-        row = apply_market_context_influence(row)
-        row = apply_structural_center(row)
-        row.update(build_arabic_output_fields(row))
-        enhanced_results.append(row)
-        update_global_case_library(row)
-
-    enhanced_results.sort(
+    results.sort(
         key=lambda r: (
-            STRUCTURAL_EXECUTION_ORDER.get(_safe_state_text(r.get("structural_execution_state"), "failed"), 99),
-            -safe_float(r.get("importance_score"), 0.0),
-            -safe_float((r.get("market_features") or {}).get("vol_expansion_last"), 0.0),
-            -safe_float((r.get("market_features") or {}).get("trade_expansion_last"), 0.0),
+            -safe_float(r.get("confidence_score"), 0.0),
+            _safe_state_text(r.get("final_structural_classification"), "Unknown"),
+            r.get("symbol", ""),
         )
     )
 
     summary = defaultdict(int)
-    for row in enhanced_results:
-        summary[f"structural::{row.get('structural_execution_state', 'unknown')}"] += 1
-        if OUTPUT_SETTINGS.get("SHOW_LEGACY_SUMMARY", False):
-            summary[row.get("final_bucket", "Failed")] += 1
-            summary[f"stage::{row.get('stage', 'WATCH')}"] += 1
-            if row.get("family"):
-                summary[f"family::{row['family']}"] += 1
-
-    printed_results = filter_and_sort_results_for_output(enhanced_results)
+    for row in results:
+        summary[f"class::{row.get('final_structural_classification', 'Unknown')}"] += 1
+        summary[f"phase::{row.get('structure_phase', 'unknown')}"] += 1
+        summary[f"squeeze::{row.get('squeeze_state', 'unknown')}"] += 1
 
     return {
         "started_at": cycle_started,
         "finished_at": utc_now_iso(),
         "prep_stats": prep_stats,
         "summary": dict(summary),
-        "results": enhanced_results,
-        "printed_results": printed_results,
-        "market_context": market_context,
+        "results": results,
+        "printed_results": results,
+        "market_context": {},
     }
 
 
